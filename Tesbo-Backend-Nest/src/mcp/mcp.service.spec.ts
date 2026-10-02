@@ -3140,6 +3140,117 @@ describe("McpService", () => {
     });
   });
 
+
+  describe("Phase 6 continuous QA automation MCP tools", () => {
+    function makeQaAutomation() {
+      return {
+        listSchedules: jest.fn().mockResolvedValue([{ id: "schedule-1", name: "Nightly", scheduleType: "daily" }]),
+        createSchedule: jest.fn().mockResolvedValue({ id: "schedule-1", name: "Nightly" }),
+        updateSchedule: jest.fn().mockResolvedValue({ id: "schedule-1", enabled: false }),
+        deleteSchedule: jest.fn().mockResolvedValue({ ok: true, id: "schedule-1" }),
+        triggerManual: jest.fn().mockResolvedValue({ id: "auto-run-1", status: "queued" }),
+        listRuns: jest.fn().mockResolvedValue([{ id: "auto-run-1", status: "running" }]),
+        getRun: jest.fn().mockResolvedValue({ id: "auto-run-1", status: "running", shards: [] }),
+        listAlerts: jest.fn().mockResolvedValue([{ id: "alert-1", severity: "high" }]),
+        acknowledgeAlert: jest.fn().mockResolvedValue({ id: "alert-1", status: "acknowledged" }),
+        dashboard: jest.fn().mockResolvedValue({ counts: { active: 1 }, queue: { waiting: 0 } })
+      };
+    }
+
+    it("exposes continuous-QA operations but not worker claim/heartbeat/complete controls", async () => {
+      const { db } = makeDb();
+      const svc = new McpService(makeLegacy(), db, makeQaAutomation() as any);
+      const listed: any = await svc.handleRequest(rpc("tools/list"), principal(), "proj-1");
+      const names = listed.result.tools.map((tool: any) => tool.name);
+      expect(names).toEqual(expect.arrayContaining([
+        "list_qa_automation_schedules",
+        "create_qa_automation_schedule",
+        "trigger_continuous_qa",
+        "list_qa_automation_runs",
+        "list_qa_automation_alerts",
+        "get_qa_operations_dashboard"
+      ]));
+      expect(names).not.toContain("claim_qa_automation_shard");
+      expect(names).not.toContain("heartbeat_qa_automation_shard");
+      expect(names).not.toContain("complete_qa_automation_shard");
+      expect(names).not.toContain("certify_release");
+    });
+
+    it("allows read-only QA Operations inspection and blocks schedule creation without write scope", async () => {
+      const { db } = makeDb();
+      const qa = makeQaAutomation();
+      const svc = new McpService(makeLegacy(), db, qa as any);
+      const ro = principal({ userId: "user-7", scopes: ["read"] });
+      const dashboard: any = await svc.handleRequest(
+        rpc("tools/call", { name: "get_qa_operations_dashboard", arguments: {} }),
+        ro,
+        "proj-1"
+      );
+      const denied: any = await svc.handleRequest(
+        rpc("tools/call", { name: "create_qa_automation_schedule", arguments: { name: "Nightly", scheduleType: "daily" } }),
+        ro,
+        "proj-1"
+      );
+      expect(dashboard.result.isError).toBe(false);
+      expect(qa.dashboard).toHaveBeenCalledWith("user-7", "proj-1");
+      expect(denied.error.code).toBe(RpcCode.ScopeDenied);
+      expect(qa.createSchedule).not.toHaveBeenCalled();
+    });
+
+    it("creates schedules and triggers continuous QA as the token user", async () => {
+      const { db } = makeDb();
+      const qa = makeQaAutomation();
+      const svc = new McpService(makeLegacy(), db, qa as any);
+      const rw = principal({ userId: "user-7" });
+      const created: any = await svc.handleRequest(
+        rpc("tools/call", {
+          name: "create_qa_automation_schedule",
+          arguments: { name: "On deploy", scheduleType: "event", eventType: "build_deployed", desiredShards: 4 }
+        }),
+        rw,
+        "proj-1"
+      );
+      const triggered: any = await svc.handleRequest(
+        rpc("tools/call", { name: "trigger_continuous_qa", arguments: { buildId: "build-1" } }),
+        rw,
+        "proj-1"
+      );
+      expect(created.result.isError).toBe(false);
+      expect(triggered.result.isError).toBe(false);
+      expect(qa.createSchedule).toHaveBeenCalledWith(
+        "user-7",
+        "proj-1",
+        expect.objectContaining({ name: "On deploy", scheduleType: "event", eventType: "build_deployed", desiredShards: 4 })
+      );
+      expect(qa.triggerManual).toHaveBeenCalledWith(
+        "user-7",
+        "proj-1",
+        expect.objectContaining({ buildId: "build-1", triggerSource: "mcp" })
+      );
+    });
+
+    it("reads and acknowledges automation alerts through the scoped Phase-6 service", async () => {
+      const { db } = makeDb();
+      const qa = makeQaAutomation();
+      const svc = new McpService(makeLegacy(), db, qa as any);
+      const rw = principal({ userId: "user-7" });
+      const list: any = await svc.handleRequest(
+        rpc("tools/call", { name: "list_qa_automation_alerts", arguments: {} }),
+        rw,
+        "proj-1"
+      );
+      const ack: any = await svc.handleRequest(
+        rpc("tools/call", { name: "acknowledge_qa_automation_alert", arguments: { alertId: "alert-1" } }),
+        rw,
+        "proj-1"
+      );
+      expect(list.result.isError).toBe(false);
+      expect(ack.result.isError).toBe(false);
+      expect(qa.listAlerts).toHaveBeenCalledWith("user-7", "proj-1", "open");
+      expect(qa.acknowledgeAlert).toHaveBeenCalledWith("user-7", "proj-1", "alert-1");
+    });
+  });
+
   describe("argument validation & error mapping", () => {
     it("rejects create_testcase without a title", async () => {
       const { db } = makeDb({ mcpActorId: "mcp-actor-1" });

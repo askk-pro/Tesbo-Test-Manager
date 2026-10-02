@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
-import { Injectable, Logger } from "@nestjs/common";
+import { Injectable, Logger, Optional } from "@nestjs/common";
 import { DatabaseService } from "../database/database.service";
 import { LegacyService } from "../legacy/legacy.service";
+import { QaAutomationService } from "../qa-automation/qa-automation.service";
 import type { ApiTokenContext } from "../common/request.types";
 import { buildMcpTools } from "./mcp.tools";
 import {
@@ -61,7 +62,8 @@ export class McpService {
 
   constructor(
     private readonly legacy: LegacyService,
-    private readonly db: DatabaseService
+    private readonly db: DatabaseService,
+    @Optional() private readonly qaAutomation?: QaAutomationService
   ) {}
 
   /** Actor id for the well-known "tesbo-mcp" agent (V65), used to attribute token-authed writes. */
@@ -208,7 +210,8 @@ export class McpService {
       userId: principal.userId ?? null,
       scopes,
       legacy: this.legacy,
-      db: this.db
+      db: this.db,
+      qaAutomation: this.qaAutomation
     };
 
     try {

@@ -1,0 +1,9 @@
+export const QA_AUTOMATION_QUEUE = "qa-automation";
+export const QA_AUTOMATION_TICK_JOB = "qa-automation-tick";
+export const QA_AUTOMATION_RUN_JOB = "qa-automation-run";
+export const QA_AUTOMATION_WATCHDOG_JOB = "qa-automation-watchdog";
+export const QA_AUTOMATION_TICK_SCHEDULER_ID = "qa-automation-tick-v1";
+export const QA_AUTOMATION_WATCHDOG_SCHEDULER_ID = "qa-automation-watchdog-v1";
+export const QA_AUTOMATION_TICK_INTERVAL_MS = 60_000;
+export const QA_AUTOMATION_WATCHDOG_INTERVAL_MS = 5 * 60_000;
+export const QA_AUTOMATION_PROCESSOR_CONCURRENCY = 4;

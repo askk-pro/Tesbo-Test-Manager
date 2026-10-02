@@ -31,6 +31,14 @@ function requireString(args: Record<string, unknown>, key: string): string {
   return value;
 }
 
+
+function requireQaAutomation(ctx: McpToolContext) {
+  if (!ctx.qaAutomation) {
+    throw new McpError(RpcCode.ToolExecutionError, "Continuous QA automation service is unavailable");
+  }
+  return ctx.qaAutomation;
+}
+
 /**
  * "[MCP] Test case created by MCP is not adding Severity" — testcases.severity is free text with no
  * CHECK constraint, so a calling LLM that guessed "Major" from a bare `severity: string` schema had
@@ -2011,6 +2019,179 @@ export function buildMcpTools(): McpTool[] {
       },
       handler: async (args, ctx) =>
         ctx.legacy.getPhase5ReleaseDashboard(ctx.userId, ctx.projectId, requireString(args, "buildId"))
+    },
+
+    {
+      name: "list_qa_automation_schedules",
+      description:
+        "List Phase-6 continuous-QA schedules and event triggers for the token project, including next/last run and worker/retry policy. Read-only.",
+      requiredScope: "read",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      handler: async (_args, ctx) => requireQaAutomation(ctx).listSchedules(ctx.userId, ctx.projectId)
+    },
+    {
+      name: "create_qa_automation_schedule",
+      description:
+        "Create a Phase-6 continuous-QA schedule/trigger. Owner/Manager only. Supports one_time, recurring(interval), daily, or event triggers; optional repository/branch/environment filters, sharding, parallelism, retry and stuck-worker policy. Does not certify a release.",
+      requiredScope: "write",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          scheduleType: { type: "string", enum: ["one_time","recurring","daily","event"] },
+          repository: { type: "string" },
+          branchFilter: { type: "string" },
+          eventType: { type: "string", enum: ["build_registered","build_deployed","pr_updated"] },
+          timezone: { type: "string" },
+          dailyTime: { type: "string" },
+          intervalMinutes: { type: "number" },
+          runAt: { type: "string" },
+          environment: { type: "string" },
+          desiredShards: { type: "number" },
+          maxParallelism: { type: "number" },
+          retryLimit: { type: "number" },
+          retryBackoffSeconds: { type: "number" },
+          stuckAfterMinutes: { type: "number" },
+          autoPrepareCertification: { type: "boolean" },
+          enabled: { type: "boolean" }
+        },
+        required: ["name","scheduleType"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) => requireQaAutomation(ctx).createSchedule(ctx.userId, ctx.projectId, args)
+    },
+    {
+      name: "update_qa_automation_schedule",
+      description:
+        "Patch a Phase-6 continuous-QA schedule. Owner/Manager only. Required: scheduleId. Any schedule policy field may be updated.",
+      requiredScope: "write",
+      inputSchema: {
+        type: "object",
+        properties: {
+          scheduleId: { type: "string" },
+          name: { type: "string" },
+          scheduleType: { type: "string", enum: ["one_time","recurring","daily","event"] },
+          repository: { type: "string" },
+          branchFilter: { type: "string" },
+          eventType: { type: "string", enum: ["build_registered","build_deployed","pr_updated"] },
+          timezone: { type: "string" },
+          dailyTime: { type: "string" },
+          intervalMinutes: { type: "number" },
+          runAt: { type: "string" },
+          environment: { type: "string" },
+          desiredShards: { type: "number" },
+          maxParallelism: { type: "number" },
+          retryLimit: { type: "number" },
+          retryBackoffSeconds: { type: "number" },
+          stuckAfterMinutes: { type: "number" },
+          autoPrepareCertification: { type: "boolean" },
+          enabled: { type: "boolean" }
+        },
+        required: ["scheduleId"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) => {
+        const { scheduleId, ...body } = args;
+        return requireQaAutomation(ctx).updateSchedule(ctx.userId, requireString({ scheduleId }, "scheduleId"), body);
+      }
+    },
+    {
+      name: "delete_qa_automation_schedule",
+      description: "Soft-delete a Phase-6 continuous-QA schedule. Owner/Manager only. Required: scheduleId.",
+      requiredScope: "write",
+      inputSchema: {
+        type: "object",
+        properties: { scheduleId: { type: "string" } },
+        required: ["scheduleId"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) => requireQaAutomation(ctx).deleteSchedule(ctx.userId, requireString(args, "scheduleId"))
+    },
+    {
+      name: "trigger_continuous_qa",
+      description:
+        "Queue one Phase-6 continuous-QA orchestration for a registered build or configured schedule. It generates a new smart-regression plan version, creates duration-balanced RUN-n shards and waits for external workers. Required: buildId or scheduleId. Final release certification remains human-only.",
+      requiredScope: "write",
+      inputSchema: {
+        type: "object",
+        properties: {
+          buildId: { type: "string" },
+          scheduleId: { type: "string" },
+          triggerKey: { type: "string" }
+        },
+        additionalProperties: false
+      },
+      handler: async (args, ctx) => {
+        if (!(typeof args.buildId === "string" && args.buildId.trim()) &&
+            !(typeof args.scheduleId === "string" && args.scheduleId.trim())) {
+          throw new McpError(RpcCode.ToolExecutionError, "buildId or scheduleId is required");
+        }
+        return requireQaAutomation(ctx).triggerManual(ctx.userId, ctx.projectId, {
+          ...args,
+          triggerSource: "mcp"
+        });
+      }
+    },
+    {
+      name: "list_qa_automation_runs",
+      description:
+        "List recent Phase-6 continuous-QA orchestration runs with build, plan, risk and shard status counts. Optional: limit. Read-only.",
+      requiredScope: "read",
+      inputSchema: {
+        type: "object",
+        properties: { limit: { type: "number" } },
+        additionalProperties: false
+      },
+      handler: async (args, ctx) => requireQaAutomation(ctx).listRuns(ctx.userId, ctx.projectId, Number(args.limit || 100))
+    },
+    {
+      name: "get_qa_automation_run",
+      description:
+        "Get one Phase-6 continuous-QA run with its worker shards and linked normal RUN-n cycles. Required: runId. Read-only.",
+      requiredScope: "read",
+      inputSchema: {
+        type: "object",
+        properties: { runId: { type: "string" } },
+        required: ["runId"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) => requireQaAutomation(ctx).getRun(ctx.userId, ctx.projectId, requireString(args, "runId"))
+    },
+    {
+      name: "list_qa_automation_alerts",
+      description:
+        "List Phase-6 QA automation alerts/escalations. Optional status=open|acknowledged|resolved; defaults to open. Read-only.",
+      requiredScope: "read",
+      inputSchema: {
+        type: "object",
+        properties: { status: { type: "string" } },
+        additionalProperties: false
+      },
+      handler: async (args, ctx) => requireQaAutomation(ctx).listAlerts(
+        ctx.userId, ctx.projectId, typeof args.status === "string" ? args.status : "open"
+      )
+    },
+    {
+      name: "acknowledge_qa_automation_alert",
+      description: "Acknowledge one Phase-6 QA automation alert. Required: alertId.",
+      requiredScope: "write",
+      inputSchema: {
+        type: "object",
+        properties: { alertId: { type: "string" } },
+        required: ["alertId"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) => requireQaAutomation(ctx).acknowledgeAlert(
+        ctx.userId, ctx.projectId, requireString(args, "alertId")
+      )
+    },
+    {
+      name: "get_qa_operations_dashboard",
+      description:
+        "Read the Phase-6 QA Operations dashboard: active/passed/unhealthy runs, schedules, open alerts, BullMQ queue counts, 30-day trend and recent runs.",
+      requiredScope: "read",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      handler: async (_args, ctx) => requireQaAutomation(ctx).dashboard(ctx.userId, ctx.projectId)
     },
     {
       name: "decide_ticket_retest",

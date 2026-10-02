@@ -8534,6 +8534,13 @@ export class LegacyService implements OnModuleInit {
     sourceKind: "initial" | "rerun",
     auditActorId?: string | null,
     failureSignature?: string | null,
+    automationMeta?: {
+      automationRunId: string;
+      shardIndex: number;
+      shardTotal: number;
+      estimatedDurationMs: number;
+      automationAttempt: number;
+    } | null,
   ) {
     if (!testcaseIds.length) return null;
     const cycle = await this.createCycle(projectId, {
@@ -8557,8 +8564,9 @@ export class LegacyService implements OnModuleInit {
     }
     await this.db.query(
       `INSERT INTO qa_regression_plan_runs
-         (plan_id,cycle_id,environment,browser,target_type,source_kind,failure_signature,created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+         (plan_id,cycle_id,environment,browser,target_type,source_kind,failure_signature,created_by,
+          automation_run_id,shard_index,shard_total,automation_attempt,estimated_duration_ms)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
       [
         plan.id,
         cycle.id,
@@ -8568,9 +8576,95 @@ export class LegacyService implements OnModuleInit {
         sourceKind,
         failureSignature || null,
         auditActorId ?? uid,
+        automationMeta?.automationRunId || null,
+        automationMeta?.shardIndex ?? null,
+        automationMeta?.shardTotal ?? null,
+        automationMeta?.automationAttempt ?? null,
+        automationMeta?.estimatedDurationMs ?? null,
       ],
     );
     return { cycleId: cycle.id, runHumanId: cycle.humanId, testcaseCount: Number(attached.added || 0), target };
+  }
+
+  async getAutomationRegressionTargetCases(
+    userId: string | null | undefined,
+    projectId: string,
+    planId: string,
+    target: Body,
+  ) {
+    const uid = this.requireUser(userId);
+    const plan = await this.requirePhase5Plan(uid, projectId, planId);
+    const testcaseIds = await this.phase5SelectedItemsForTarget(planId, target);
+    if (!testcaseIds.length) return { plan, cases: [] };
+    const durations = await this.db.query(
+      `SELECT t.id AS testcase_id,
+              COALESCE((
+                SELECT AVG(x.duration_ms)::bigint
+                  FROM (
+                    SELECT e.duration_ms
+                      FROM cycle_items ci
+                      JOIN executions e ON e.cycle_item_id=ci.id AND e.deleted_at IS NULL
+                     WHERE ci.testcase_id=t.id
+                       AND ci.deleted_at IS NULL
+                       AND e.duration_ms IS NOT NULL
+                       AND e.duration_ms >= 0
+                     ORDER BY e.executed_at DESC NULLS LAST
+                     LIMIT 10
+                  ) x
+              ),30000)::bigint AS estimated_duration_ms
+         FROM testcases t
+        WHERE t.project_id=$1 AND t.id = ANY($2::uuid[]) AND t.deleted_at IS NULL`,
+      [projectId, testcaseIds],
+    );
+    const byId = new Map(durations.rows.map((row) => [String(row.testcase_id), Number(row.estimated_duration_ms || 30000)]));
+    return {
+      plan,
+      cases: testcaseIds.map((testcaseId) => ({
+        testcaseId,
+        estimatedDurationMs: Math.max(1000, Math.min(3600000, byId.get(testcaseId) || 30000)),
+      })),
+    };
+  }
+
+  async createAutomationRegressionShard(
+    userId: string | null | undefined,
+    projectId: string,
+    planId: string,
+    body: Body,
+    auditActorId?: string | null,
+  ) {
+    const uid = this.requireUser(userId);
+    const plan = await this.requirePhase5Plan(uid, projectId, planId);
+    if (!["DRAFT","TESTING"].includes(String(plan.status))) {
+      throw new ConflictException({ error: "Automation shards can only be created while a regression plan is DRAFT or TESTING" });
+    }
+    const target = body.target && typeof body.target === "object" ? body.target as Body : {};
+    const allowed = new Set(await this.phase5SelectedItemsForTarget(planId, target));
+    const testcaseIds = normalizeJsonArray(body.testcaseIds).map(String).filter((id) => allowed.has(id));
+    if (!testcaseIds.length) throw new BadRequestException({ error: "Automation shard has no applicable selected testcases" });
+    const automationRunId = String(body.automationRunId || "");
+    if (!isUuid(automationRunId)) throw new BadRequestException({ error: "automationRunId must be a UUID" });
+    const shardIndex = Number(body.shardIndex);
+    const shardTotal = Number(body.shardTotal);
+    const estimatedDurationMs = Math.max(0, Math.floor(Number(body.estimatedDurationMs || 0)));
+    const automationAttempt = Math.max(0, Math.min(6, Math.floor(Number(body.automationAttempt || 0))));
+    if (!Number.isInteger(shardIndex) || !Number.isInteger(shardTotal) || shardIndex < 0 || shardTotal < 1 || shardTotal > 32 || shardIndex >= shardTotal) {
+      throw new BadRequestException({ error: "Invalid shard index/total" });
+    }
+    const created = await this.phase5CreateRunForTarget(
+      uid,
+      projectId,
+      plan,
+      target,
+      testcaseIds,
+      body.sourceKind === "rerun" ? "rerun" : "initial",
+      auditActorId,
+      body.failureSignature ? String(body.failureSignature) : null,
+      { automationRunId, shardIndex, shardTotal, automationAttempt, estimatedDurationMs },
+    );
+    if (!created) throw new ConflictException({ error: "Automation shard could not create a regression run" });
+    await this.db.query("UPDATE qa_regression_plans SET status='TESTING',updated_at=now() WHERE id=$1", [planId]);
+    return created;
   }
 
   async startRegressionPlan(

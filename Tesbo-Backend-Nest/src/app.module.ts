@@ -20,6 +20,7 @@ import { CustomFieldsModule } from "./custom-fields/custom-fields.module";
 import { CustomTagsModule } from "./custom-tags/custom-tags.module";
 import { AutomationModule } from "./automation/automation.module";
 import { ZyraArchiveSweepModule } from "./zyra-archive-sweep/zyra-archive-sweep.module";
+import { QaAutomationModule } from "./qa-automation/qa-automation.module";
 
 @Module({
   imports: [
@@ -43,7 +44,8 @@ import { ZyraArchiveSweepModule } from "./zyra-archive-sweep/zyra-archive-sweep.
     CustomTagsModule,
     PlanLimitsModule,
     AutomationModule,
-    ZyraArchiveSweepModule
+    ZyraArchiveSweepModule,
+    QaAutomationModule
   ],
   // Global so every current and future mutating /api/projects/:id route is covered; the guard
   // itself no-ops on reads and on workspaces that are within their limits.

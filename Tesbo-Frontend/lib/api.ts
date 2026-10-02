@@ -5176,3 +5176,151 @@ export async function uploadExecutionEvidence(
   }
   return res.json() as Promise<{ list: ExecutionEvidence[]; total: number }>;
 }
+
+
+// ── Phase 6: Continuous QA automation / operations ─────────────────────────────
+
+export interface QaAutomationSchedule {
+  id: string;
+  projectId: string;
+  name: string;
+  enabled: boolean;
+  scheduleType: "one_time" | "recurring" | "daily" | "event";
+  repository?: string | null;
+  branchFilter?: string | null;
+  eventType?: "build_registered" | "build_deployed" | "pr_updated" | null;
+  timezone: string;
+  dailyTime?: string | null;
+  intervalMinutes?: number | null;
+  runAt?: string | null;
+  nextRunAt?: string | null;
+  lastRunAt?: string | null;
+  lastStatus?: string | null;
+  environment?: string;
+  matrix?: Array<{ environment?: string; browser?: string; targetType: "browser" | "api" | "manual" | "production-safe"; required?: boolean }>;
+  desiredShards: number;
+  maxParallelism: number;
+  retryLimit: number;
+  retryBackoffSeconds: number;
+  stuckAfterMinutes: number;
+  autoPrepareCertification: boolean;
+  notifyOn?: string[];
+}
+
+export interface QaAutomationRunSummary {
+  id: string;
+  projectId: string;
+  scheduleId?: string | null;
+  buildId?: string | null;
+  planId?: string | null;
+  triggerSource: string;
+  triggerKey: string;
+  status: string;
+  gitSha?: string | null;
+  releaseName?: string | null;
+  buildVersion?: string | null;
+  buildEnvironment?: string | null;
+  planName?: string | null;
+  riskScore?: number | null;
+  riskBand?: string | null;
+  shardTotal?: number;
+  shardsQueued?: number;
+  shardsRunning?: number;
+  shardsPassed?: number;
+  shardsFailed?: number;
+  shardsBlocked?: number;
+  shardsStuck?: number;
+  createdAt: string;
+  startedAt?: string | null;
+  completedAt?: string | null;
+}
+
+export interface QaAutomationAlert {
+  id: string;
+  projectId: string;
+  automationRunId?: string | null;
+  scheduleId?: string | null;
+  severity: "info" | "warning" | "high" | "critical";
+  alertType: string;
+  status: "open" | "acknowledged" | "resolved";
+  title: string;
+  body?: string | null;
+  details?: Record<string, unknown>;
+  createdAt: string;
+}
+
+export interface QaAutomationDashboard {
+  counts: { active?: number; passed?: number; unhealthy?: number; last24h?: number };
+  schedules: { total?: number; enabled?: number; nextRunAt?: string | null };
+  alerts: { open?: number; critical?: number; high?: number };
+  queue: { waiting?: number; active?: number; delayed?: number; failed?: number };
+  trend: Array<{ day: string; total: number; passed: number; unhealthy: number; avgDurationMs?: number | null }>;
+  recent: QaAutomationRunSummary[];
+}
+
+export async function listQaAutomationSchedules(projectId: string): Promise<QaAutomationSchedule[]> {
+  return api(`/api/projects/${projectId}/cycles/schedules`);
+}
+
+export async function createQaAutomationSchedule(
+  projectId: string,
+  data: {
+    name: string;
+    scheduleType: "one_time" | "recurring" | "daily" | "event";
+    repository?: string;
+    branchFilter?: string;
+    eventType?: "build_registered" | "build_deployed" | "pr_updated";
+    timezone?: string;
+    dailyTime?: string;
+    intervalMinutes?: number;
+    runAt?: string;
+    environment?: string;
+    desiredShards?: number;
+    maxParallelism?: number;
+    retryLimit?: number;
+    retryBackoffSeconds?: number;
+    stuckAfterMinutes?: number;
+    autoPrepareCertification?: boolean;
+    enabled?: boolean;
+  },
+): Promise<QaAutomationSchedule> {
+  return api(`/api/projects/${projectId}/cycles/schedules`, { method: "POST", body: data });
+}
+
+export async function updateQaAutomationSchedule(
+  scheduleId: string,
+  data: Partial<Omit<QaAutomationSchedule, "id" | "projectId">>,
+): Promise<QaAutomationSchedule> {
+  return api(`/api/cycles/schedules/${scheduleId}`, { method: "PATCH", body: data });
+}
+
+export async function deleteQaAutomationSchedule(scheduleId: string): Promise<void> {
+  await api(`/api/cycles/schedules/${scheduleId}`, { method: "DELETE" });
+}
+
+export async function triggerQaAutomation(
+  projectId: string,
+  data: { buildId?: string; scheduleId?: string; triggerKey?: string; triggerSource?: "manual" | "mcp" },
+): Promise<QaAutomationRunSummary> {
+  return api(`/api/projects/${projectId}/qa-automation/trigger`, { method: "POST", body: data });
+}
+
+export async function listQaAutomationRuns(projectId: string, limit = 100): Promise<QaAutomationRunSummary[]> {
+  return api(`/api/projects/${projectId}/qa-automation/runs?limit=${limit}`);
+}
+
+export async function getQaAutomationRun(projectId: string, runId: string): Promise<QaAutomationRunSummary & { shards: unknown[] }> {
+  return api(`/api/projects/${projectId}/qa-automation/runs/${runId}`);
+}
+
+export async function listQaAutomationAlerts(projectId: string, status = "open"): Promise<QaAutomationAlert[]> {
+  return api(`/api/projects/${projectId}/qa-automation/alerts?status=${encodeURIComponent(status)}`);
+}
+
+export async function acknowledgeQaAutomationAlert(projectId: string, alertId: string): Promise<QaAutomationAlert> {
+  return api(`/api/projects/${projectId}/qa-automation/alerts/${alertId}/acknowledge`, { method: "POST" });
+}
+
+export async function getQaAutomationDashboard(projectId: string): Promise<QaAutomationDashboard> {
+  return api(`/api/projects/${projectId}/qa-automation/dashboard`);
+}

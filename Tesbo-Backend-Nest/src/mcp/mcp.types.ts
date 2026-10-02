@@ -1,5 +1,6 @@
 import type { DatabaseService } from "../database/database.service";
 import type { LegacyService } from "../legacy/legacy.service";
+import type { QaAutomationService } from "../qa-automation/qa-automation.service";
 
 /**
  * Tesbo MCP — protocol types.
@@ -135,6 +136,7 @@ export interface McpToolContext {
   scopes: TokenScope[];
   legacy: LegacyService;
   db: DatabaseService;
+  qaAutomation?: QaAutomationService;
 }
 
 export interface McpTool {

@@ -16,13 +16,14 @@ async function scalar(sql, params = []) {
 async function main() {
   await client.connect();
   const projectId = randomUUID();
+  const userId = randomUUID();
 
   try {
     const migration = await scalar(
       "select count(*)::int as count, max(version)::int as max_version from schema_migrations",
     );
-    if (migration.count < 133 || migration.max_version < 133) {
-      throw new Error(`Expected migration 133; got count=${migration.count}, max=${migration.max_version}`);
+    if (migration.count < 134 || migration.max_version < 134) {
+      throw new Error(`Expected migration 134; got count=${migration.count}, max=${migration.max_version}`);
     }
 
     await client.query("BEGIN");
@@ -30,6 +31,14 @@ async function main() {
     await client.query(
       "insert into projects (id, key, name) values ($1, $2, $3)",
       [projectId, `CI${projectId.slice(0, 6)}`, "QA domain CI acceptance"],
+    );
+    await client.query(
+      "insert into users (id,email,name) values ($1,$2,$3)",
+      [userId, `qa-ci-${userId.slice(0, 8)}@example.test`, "QA CI"],
+    );
+    await client.query(
+      "insert into project_members (project_id,user_id,role) values ($1,$2,'owner')",
+      [projectId, userId],
     );
 
     await client.query(
@@ -292,6 +301,89 @@ async function main() {
       [projectId, phase5Rule.id, phase5Plan.id, tcOne.id, runOne.id, phase5Cert.id, phase5BuildTwo.id],
     );
 
+    const phase6Schedule = await scalar(
+      `insert into qa_automation_schedules
+         (project_id,name,schedule_type,enabled,repository,event_type,timezone,environment,matrix,
+          desired_shards,max_parallelism,retry_limit,retry_backoff_seconds,stuck_after_minutes,
+          auto_prepare_certification,notify_on,metadata,created_by,updated_by)
+       values ($1,'CI deploy regression','event',true,'askk-pro/qa-ci','build_deployed','UTC','staging',
+               '[{"environment":"staging","browser":"chrome","targetType":"browser","required":true}]'::jsonb,
+               2,2,1,30,30,true,'["failed","stuck","certification_changed"]'::jsonb,'{}'::jsonb,$2,$2)
+       returning id`,
+      [projectId, userId],
+    );
+    const phase6Run = await scalar(
+      `insert into qa_automation_runs
+         (project_id,schedule_id,build_id,plan_id,trigger_source,trigger_key,trigger_payload,status,
+          desired_shards,max_parallelism,retry_limit,retry_backoff_seconds,stuck_after_minutes,created_by)
+       values ($1,$2,$3,$4,'event','ci-phase6-run','{"source":"ci"}'::jsonb,'running',2,2,1,30,30,$5)
+       returning id`,
+      [projectId, phase6Schedule.id, phase5BuildTwo.id, phase5Plan.id, userId],
+    );
+    const phase6Shard = await scalar(
+      `insert into qa_automation_shards
+         (automation_run_id,project_id,plan_id,cycle_id,environment,browser,target_type,shard_index,shard_total,
+          estimated_duration_ms,testcase_ids,status,max_attempts)
+       values ($1,$2,$3,$4,'staging','chrome','browser',0,1,30000,$5::jsonb,'queued',2)
+       returning id`,
+      [phase6Run.id, projectId, phase5Plan.id, runOne.id, JSON.stringify([tcOne.id])],
+    );
+    await client.query(
+      `update qa_regression_plan_runs
+          set automation_run_id=$2,shard_index=0,shard_total=1,automation_attempt=0,estimated_duration_ms=30000
+        where plan_id=$1 and cycle_id=$3`,
+      [phase5Plan.id, phase6Run.id, runOne.id],
+    );
+    const phase6Alert = await scalar(
+      `insert into qa_automation_alerts
+         (project_id,automation_run_id,schedule_id,severity,alert_type,dedupe_key,title,body,details)
+       values ($1,$2,$3,'warning','stuck','ci-phase6-alert','CI Phase 6 alert','CI alert',
+               '{"shard":"0"}'::jsonb)
+       returning id`,
+      [projectId, phase6Run.id, phase6Schedule.id],
+    );
+    await client.query(
+      "update release_certifications set last_continuous_check_at=now() where id=$1",
+      [phase5Cert.id],
+    );
+    const phase6 = await scalar(
+      `select
+         (select count(*)::int from qa_automation_event_outbox
+           where project_id=$1 and event_type='build_registered') as build_registered_events,
+         (select count(*)::int from qa_automation_event_outbox
+           where project_id=$1 and event_type='build_deployed') as build_deployed_events,
+         (select count(*)::int from qa_automation_schedules
+           where id=$2 and schedule_type='event' and event_type='build_deployed' and desired_shards=2) as schedules,
+         (select count(*)::int from qa_automation_runs
+           where id=$3 and status='running' and trigger_source='event') as automation_runs,
+         (select count(*)::int from qa_automation_shards
+           where id=$4 and automation_run_id=$3 and status='queued' and shard_index=0 and shard_total=1
+             and estimated_duration_ms=30000 and jsonb_array_length(testcase_ids)=1) as shards,
+         (select count(*)::int from qa_automation_alerts
+           where id=$5 and status='open' and severity='warning') as alerts,
+         (select count(*)::int from qa_regression_plan_runs
+           where plan_id=$6 and cycle_id=$7 and automation_run_id=$3 and shard_index=0 and shard_total=1
+             and automation_attempt=0 and estimated_duration_ms=30000) as lineage,
+         (select count(*)::int from release_certifications
+           where id=$8 and last_continuous_check_at is not null) as continuous_cert_checks,
+         (select count(*)::int from pg_trigger
+           where tgname='qa_build_automation_event_outbox' and not tgisinternal) as outbox_trigger`,
+      [projectId, phase6Schedule.id, phase6Run.id, phase6Shard.id, phase6Alert.id, phase5Plan.id, runOne.id, phase5Cert.id],
+    );
+    if (
+      phase6.build_registered_events !== 2 ||
+      phase6.build_deployed_events !== 2 ||
+      phase6.schedules !== 1 ||
+      phase6.automation_runs !== 1 ||
+      phase6.shards !== 1 ||
+      phase6.alerts !== 1 ||
+      phase6.lineage !== 1 ||
+      phase6.continuous_cert_checks !== 1 ||
+      phase6.outbox_trigger !== 1
+    ) {
+      throw new Error(`Phase-6 continuous QA schema acceptance failed: ${JSON.stringify(phase6)}`);
+    }
+
     const comment = await scalar(
       "select count(*)::int as count from ticket_comments where project_id=$1 and source='mcp'",
       [projectId],
@@ -388,7 +480,7 @@ async function main() {
     }
 
     await client.query("ROLLBACK");
-    console.log("QA domain schema acceptance passed: migration 133, QA/TC/REQ/RUN IDs, retest lineage, step evidence, failure triage, release QA gates, change-aware regression plans, immutable certifications, deployment supersession, traceability links and sequence.");
+    console.log("QA domain schema acceptance passed: migration 134, QA/TC/REQ/RUN IDs, retest lineage, step evidence, failure triage, release QA gates, change-aware regression plans, immutable certifications, deployment supersession, continuous QA outbox/schedules/runs/shards/alerts/lineage, traceability links and sequence.");
   } catch (error) {
     try {
       await client.query("ROLLBACK");
