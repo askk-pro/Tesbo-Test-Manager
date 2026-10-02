@@ -5,6 +5,7 @@ import { StatusChip } from "@/components/ui";
 import type { ReportsInsights } from "@/lib/api";
 import { HealthGauge } from "./charts";
 import { statusTone, LoadingBlock } from "./shared";
+import { ReleaseQaGatePanel } from "./ReleaseQaGatePanel";
 
 function CoverageHeatmap({ rows }: { rows: ReportsInsights["coverageBySuite"] }) {
   const tone = (pct: number) => (pct >= 70 ? "var(--success)" : pct >= 30 ? "var(--warning)" : "var(--error)");
@@ -33,7 +34,7 @@ function CoverageHeatmap({ rows }: { rows: ReportsInsights["coverageBySuite"] })
   );
 }
 
-export function AIInsightsTab({ insights, loading }: { insights: ReportsInsights | null; loading: boolean }) {
+export function AIInsightsTab({ projectId, canApprove, insights, loading }: { projectId: string; canApprove: boolean; insights: ReportsInsights | null; loading: boolean }) {
   if (loading) return <LoadingBlock label="Loading insights…" />;
   if (!insights) return <LoadingBlock label="No data available." />;
 
@@ -44,6 +45,8 @@ export function AIInsightsTab({ insights, loading }: { insights: ReportsInsights
         <span className="rounded-full bg-[var(--ai-soft)] px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-[var(--ai-primary)]">AI</span>
       </div>
       <p className="mb-4 text-[12px] text-[var(--muted-soft)]">Automated intelligence from your execution data</p>
+
+      <ReleaseQaGatePanel projectId={projectId} canApprove={canApprove} />
 
       <div className="mb-4 grid grid-cols-1 gap-3 lg:grid-cols-[180px_1fr]">
         <div className="flex flex-col items-center justify-center rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">

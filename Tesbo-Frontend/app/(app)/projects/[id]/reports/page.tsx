@@ -91,6 +91,8 @@ export default function ReportsPage() {
   const { currentUser: auth } = useAppData();
   const { project, projectMembers: members } = useProjectData();
   const projectName = String(project.name || "");
+  const currentProjectRole = members.find((member) => member.userId === auth?.userId)?.role || "";
+  const canApproveRelease = currentProjectRole === "owner" || currentProjectRole === "manager";
   const [activeView, setActiveView] = useState<ReportView>("overview");
 
   // Header-stat lists (Runs count, Open bugs) — eager, feeds the chips visible on every tab.
@@ -442,7 +444,7 @@ export default function ReportsPage() {
             )}
             {activeView === "matrix" && <TraceabilityTab rows={matrixRows} loading={matrixLoading} search={matrixSearch} onSearchChange={setMatrixSearch} />}
             {activeView === "repository" && <RepositoryTab summary={repoSummary} loading={repoLoading} />}
-            {activeView === "insights" && <AIInsightsTab insights={insights} loading={insightsLoading} />}
+            {activeView === "insights" && <AIInsightsTab projectId={projectId} canApprove={canApproveRelease} insights={insights} loading={insightsLoading} />}
             {activeView === "trends" && <TrendsTab trends={trends} loading={trendsLoading} />}
           </div>
         </div>

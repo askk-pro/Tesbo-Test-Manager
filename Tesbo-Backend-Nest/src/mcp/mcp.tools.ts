@@ -1525,6 +1525,135 @@ export function buildMcpTools(): McpTool[] {
         )
     },
     {
+      name: "get_ticket_failure_triage",
+      description:
+        "Return governed Phase-4 failure triage for the latest (or selected) ticket retest: normalized failure signatures, execution history, flaky/deterministic classification, evidence clusters, probable subsystem/owner derived from repository assignments, and a deterministic rerun recommendation. No AI conclusion is required for these facts. Required: ticketRef. Optional: runRef.",
+      requiredScope: "read",
+      inputSchema: {
+        type: "object",
+        properties: {
+          ticketRef: { type: "string" },
+          runRef: { type: "string" }
+        },
+        required: ["ticketRef"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) =>
+        ctx.legacy.getTicketFailureTriage(
+          ctx.userId,
+          ctx.projectId,
+          requireString(args, "ticketRef"),
+          typeof args.runRef === "string" && args.runRef.trim() ? args.runRef : undefined
+        )
+    },
+    {
+      name: "analyze_ticket_failure",
+      description:
+        "Generate and persist a source-grounded AI hypothesis snapshot for a ticket failure. The model may propose hypotheses only when they cite exact evidence references supplied by the platform; deterministic flake/signature facts remain code-derived. This tool never decides release readiness or release approval. Required: ticketRef. Optional: runRef.",
+      requiredScope: "write",
+      inputSchema: {
+        type: "object",
+        properties: {
+          ticketRef: { type: "string" },
+          runRef: { type: "string" }
+        },
+        required: ["ticketRef"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) =>
+        ctx.legacy.analyzeTicketFailureWithAi(
+          ctx.userId,
+          ctx.projectId,
+          requireString(args, "ticketRef"),
+          typeof args.runRef === "string" && args.runRef.trim() ? args.runRef : undefined,
+          ctx.actorId
+        )
+    },
+    {
+      name: "list_release_qa_gate_candidates",
+      description:
+        "List release/build combinations that have test runs and can be evaluated by the Phase-4 release QA gate. Returns run counts, completed-run counts, environments and recent activity. Read-only.",
+      requiredScope: "read",
+      inputSchema: {
+        type: "object",
+        properties: {},
+        additionalProperties: false
+      },
+      handler: async (_args, ctx) => ctx.legacy.listReleaseGateCandidates(ctx.userId, ctx.projectId)
+    },
+    {
+      name: "evaluate_release_qa_gate",
+      description:
+        "Create an evidence-bound QA readiness evaluation for one release/build (optionally one environment). Hard blockers are computed from stored execution/ticket facts, not by AI. The result may be blocked or ready_for_approval. This tool does NOT approve a release; approval/rejection is intentionally available only to an authenticated human project owner/manager in the app. Required: releaseName, buildVersion. Optional: environment.",
+      requiredScope: "write",
+      inputSchema: {
+        type: "object",
+        properties: {
+          releaseName: { type: "string" },
+          buildVersion: { type: "string" },
+          environment: { type: "string" }
+        },
+        required: ["releaseName", "buildVersion"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) =>
+        ctx.legacy.evaluateReleaseQaGate(
+          ctx.userId,
+          ctx.projectId,
+          {
+            releaseName: requireString(args, "releaseName"),
+            buildVersion: requireString(args, "buildVersion"),
+            environment: typeof args.environment === "string" ? args.environment : undefined
+          },
+          ctx.actorId
+        )
+    },
+    {
+      name: "get_release_qa_gate",
+      description:
+        "Read the latest QA gate for an exact release/build/environment and check whether its evidence digest is still current. Returns effective state including needs_re_evaluation when underlying QA evidence changed. Required: releaseName, buildVersion. Optional: environment.",
+      requiredScope: "read",
+      inputSchema: {
+        type: "object",
+        properties: {
+          releaseName: { type: "string" },
+          buildVersion: { type: "string" },
+          environment: { type: "string" }
+        },
+        required: ["releaseName", "buildVersion"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) =>
+        ctx.legacy.getLatestReleaseQaGate(
+          ctx.userId,
+          ctx.projectId,
+          requireString(args, "releaseName"),
+          requireString(args, "buildVersion"),
+          typeof args.environment === "string" ? args.environment : ""
+        )
+    },
+    {
+      name: "list_release_qa_gate_history",
+      description:
+        "List recent release QA gate evaluations in the token's project. Optional filters: releaseName, buildVersion. Human approval/rejection state is included when present, but there is deliberately no MCP approval tool.",
+      requiredScope: "read",
+      inputSchema: {
+        type: "object",
+        properties: {
+          releaseName: { type: "string" },
+          buildVersion: { type: "string" }
+        },
+        additionalProperties: false
+      },
+      handler: async (args, ctx) =>
+        ctx.legacy.listReleaseQaGateHistory(
+          ctx.userId,
+          ctx.projectId,
+          typeof args.releaseName === "string" && args.releaseName.trim() ? args.releaseName : undefined,
+          typeof args.buildVersion === "string" && args.buildVersion.trim() ? args.buildVersion : undefined
+        )
+    },
+    {
       name: "decide_ticket_retest",
       description:
         "Evaluate a completed governed retest using its stored execution results. Required: ticketRef, runRef. Optional: note. The server computes Passed/Failed/Blocked; callers cannot override it. Passed closes the ticket, Failed/Blocked reopens it. Refuses incomplete runs.",

@@ -149,6 +149,26 @@ For Phase-3 mutations the token owner remains the authorization principal while 
 
 Failure intelligence is factual context, not an autonomous root-cause verdict. Clients must separate observations from hypotheses and must not treat a proposed cause as established unless evidence supports it.
 
+## Phase 4 failure triage and release QA gates
+
+Phase 4 adds governed failure-history reads and evidence-bound release readiness evaluation.
+
+### Read
+
+- `get_ticket_failure_triage` — deterministic failure signatures, recent execution history, flaky/deterministic classification, evidence clusters, probable subsystem/owner from stored assignments, and rerun guidance.
+- `list_release_qa_gate_candidates` — release/build combinations with execution history.
+- `get_release_qa_gate` — latest deterministic gate plus stale-evidence detection.
+- `list_release_qa_gate_history` — prior gate evaluations and any recorded human decisions.
+
+### Write
+
+- `analyze_ticket_failure` — persists an AI hypothesis snapshot. Hypotheses must cite exact platform-provided evidence references; unsupported citations are discarded.
+- `evaluate_release_qa_gate` — creates an evidence-bound deterministic readiness evaluation for one release/build/environment.
+
+Release readiness is computed by application rules, not by the model. AI may suggest hypotheses and reruns but cannot decide whether a release is ready.
+
+There is intentionally no MCP tool that approves or rejects a release. Final release approval/rejection is restricted to an authenticated human project owner or manager in the application. Before a human decision is accepted, the backend recomputes the evidence digest; changed evidence forces re-evaluation.
+
 ## Still reserved for later phases
 
 The following remain future operations:
@@ -156,7 +176,6 @@ The following remain future operations:
 - `create_ticket` QA-domain alias over canonical ticket creation.
 - `assign_ticket` convenience alias over `update_ticket`.
 - `generate_testcases_for_ticket` — reviewable/source-grounded candidate generation.
-- `get_release_readiness` — factual readiness evidence and blockers.
 
 ## Output and audit contract
 

@@ -34,6 +34,7 @@ import { SuitesCacheService } from "../cache/suites-cache.service";
 import { TestcasesListCacheService } from "../cache/testcases-list-cache.service";
 import { ProjectOverviewCacheService } from "../cache/project-overview-cache.service";
 import { ZYRA_TRACE_CURRENT_STEP, ZyraTurnTraceRecorder, type ZyraOnStage, type ZyraTurnTrace } from "./zyra-turn-trace";
+import { classifyExecutionHistory, clusterFailures, evaluateReleaseGate, evidenceDigest, failureSignatureFor, type FailureExecutionInput } from "./qa-failure-intelligence";
 
 type Body = Record<string, any>;
 
@@ -6940,6 +6941,691 @@ export class LegacyService implements OnModuleInit {
     };
   }
 
+  // ── Phase 4: governed failure triage, flake detection and release QA gates ────────────────
+
+  private async phase4ExecutionHistory(
+    projectId: string,
+    testcaseIds: string[],
+    limitPerTestcase = 20,
+  ): Promise<Body[]> {
+    const ids = [...new Set(testcaseIds.filter(Boolean))];
+    if (!ids.length) return [];
+    const res = await this.db.query(
+      `WITH ranked AS (
+         SELECT ci.testcase_id,
+                t.human_id AS testcase_human_id,
+                t.external_id AS testcase_external_id,
+                COALESCE(t.title, ci.snapshot_title, 'Untitled test case') AS testcase_title,
+                COALESCE(s.name, 'Unassigned') AS suite_name,
+                t.owner_id AS testcase_owner_id,
+                COALESCE(owner_profile.display_name, owner_profile.email) AS testcase_owner_name,
+                e.id AS execution_id,
+                e.status,
+                e.actual_result,
+                e.error_message,
+                e.error_stack,
+                e.duration_ms,
+                e.retry_count,
+                e.reported_by,
+                e.assignee_id,
+                COALESCE(exec_profile.display_name, exec_profile.email) AS execution_owner_name,
+                e.executed_at,
+                c.id AS run_id,
+                c.human_id AS run_human_id,
+                c.name AS run_name,
+                c.environment,
+                c.build_version,
+                c.release_name,
+                c.commit_sha,
+                c.branch_name,
+                c.source,
+                COALESCE(step_rows.items, '[]'::json) AS steps,
+                COALESCE(evidence_rows.items, '[]'::json) AS evidence,
+                ROW_NUMBER() OVER (
+                  PARTITION BY ci.testcase_id
+                  ORDER BY COALESCE(e.executed_at, e.updated_at, e.created_at) DESC
+                ) AS rn
+           FROM cycle_items ci
+           JOIN cycles c ON c.id=ci.cycle_id AND c.project_id=$1 AND c.deleted_at IS NULL
+           JOIN executions e ON e.cycle_item_id=ci.id AND e.deleted_at IS NULL
+           LEFT JOIN testcases t ON t.id=ci.testcase_id
+           LEFT JOIN suites s ON s.id=COALESCE(ci.snapshot_suite_id, t.suite_id) AND s.deleted_at IS NULL
+           LEFT JOIN actor_profiles owner_profile ON owner_profile.id=t.owner_id
+           LEFT JOIN actor_profiles exec_profile ON exec_profile.id=e.assignee_id
+           LEFT JOIN LATERAL (
+             SELECT json_agg(
+               json_build_object(
+                 'id', es.id,
+                 'stepNumber', es.step_number,
+                 'action', es.action,
+                 'expectedResult', es.expected_result,
+                 'status', es.status,
+                 'actualResult', es.actual_result,
+                 'errorMessage', es.error_message,
+                 'reportedBy', es.reported_by,
+                 'executedAt', es.executed_at
+               ) ORDER BY es.step_number
+             ) AS items
+               FROM execution_step_results es
+              WHERE es.execution_id=e.id
+           ) step_rows ON true
+           LEFT JOIN LATERAL (
+             SELECT json_agg(
+               json_build_object(
+                 'id', a.id,
+                 'kind', a.evidence_kind,
+                 'contentType', a.content_type,
+                 'fileName', a.file_name
+               ) ORDER BY a.created_at
+             ) AS items
+               FROM attachments a
+              WHERE a.entity_type='execution' AND a.entity_id=e.id AND a.deleted_at IS NULL
+           ) evidence_rows ON true
+          WHERE ci.deleted_at IS NULL
+            AND ci.testcase_id = ANY($2::uuid[])
+       )
+       SELECT * FROM ranked
+        WHERE rn <= $3
+        ORDER BY testcase_id, COALESCE(executed_at, now() - interval '100 years') ASC, rn DESC`,
+      [projectId, ids, Math.max(3, Math.min(50, limitPerTestcase))],
+    );
+    return res.rows.map((row) => {
+      const camelled = toCamel(row) as Body;
+      camelled.steps = normalizeJsonArray(row.steps).map(toCamel);
+      camelled.evidence = normalizeJsonArray(row.evidence).map(toCamel);
+      return camelled;
+    });
+  }
+
+  private phase4HistoryByTestcase(rows: Body[]): Map<string, Body[]> {
+    const grouped = new Map<string, Body[]>();
+    for (const row of rows) {
+      const key = String(row.testcaseId || "");
+      if (!key) continue;
+      const list = grouped.get(key) || [];
+      list.push(row);
+      grouped.set(key, list);
+    }
+    return grouped;
+  }
+
+  private phase4EvidenceRefs(row: Body): string[] {
+    const testcaseRef = String(row.testcaseHumanId || row.testcaseExternalId || row.testcaseId || "testcase");
+    const runRef = String(row.runHumanId || row.runId || "run");
+    const refs = [
+      `TESTCASE:${testcaseRef}`,
+      `RUN:${runRef}`,
+      row.executionId ? `EXECUTION:${row.executionId}` : "",
+    ];
+    for (const step of normalizeJsonArray(row.steps)) {
+      if (!["Failed", "Blocked"].includes(String(step.status || ""))) continue;
+      refs.push(`STEP:${testcaseRef}:${step.stepNumber}`);
+    }
+    for (const evidence of normalizeJsonArray(row.evidence)) {
+      if (evidence.id) refs.push(`EVIDENCE:${row.executionId}:${evidence.id}`);
+    }
+    return refs.filter(Boolean);
+  }
+
+  private phase4TriageItem(testcaseId: string, history: Body[], currentExecutionId?: string | null): Body {
+    const current =
+      (currentExecutionId ? history.find((row) => String(row.executionId) === String(currentExecutionId)) : null) ||
+      [...history].reverse().find((row) => ["Failed", "Blocked"].includes(String(row.status || ""))) ||
+      history[history.length - 1] ||
+      {};
+    const signature = failureSignatureFor(current as FailureExecutionInput);
+    const classification = classifyExecutionHistory(history as FailureExecutionInput[]);
+    const ownerName = current.testcaseOwnerName || current.executionOwnerName || null;
+    const ownerId = current.testcaseOwnerId || current.assigneeId || null;
+    const ownerSource = current.testcaseOwnerId ? "testcase-owner" : current.assigneeId ? "execution-assignee" : "unassigned";
+    return {
+      testcaseId,
+      testcaseHumanId: current.testcaseHumanId || null,
+      testcaseExternalId: current.testcaseExternalId || null,
+      title: current.testcaseTitle || "Untitled test case",
+      currentExecutionId: current.executionId || currentExecutionId || null,
+      currentRunId: current.runId || null,
+      currentRunHumanId: current.runHumanId || null,
+      failureSignature: signature.signature,
+      signatureLabel: signature.label,
+      signatureSignalCount: signature.signalCount,
+      classification: classification.classification,
+      flakeScore: classification.flakeScore,
+      metrics: {
+        settledRuns: classification.settledRuns,
+        passedRuns: classification.passedRuns,
+        failedRuns: classification.failedRuns,
+        blockedRuns: classification.blockedRuns,
+        flips: classification.flips,
+        flipRate: classification.flipRate,
+        retryPassObserved: classification.retryPassObserved,
+        currentSignatureOccurrences: classification.currentSignatureOccurrences,
+        failureSignatureCount: classification.failureSignatureCount,
+      },
+      probableSubsystem: {
+        name: current.suiteName || "Unassigned",
+        source: current.suiteName ? "suite" : "unassigned",
+      },
+      probableOwner: {
+        id: ownerId,
+        name: ownerName,
+        source: ownerSource,
+      },
+      rerunRecommendation: classification.rerunRecommendation,
+      evidenceRefs: this.phase4EvidenceRefs(current),
+      history: history.map((row) => ({
+        executionId: row.executionId,
+        runId: row.runId,
+        runHumanId: row.runHumanId,
+        runName: row.runName,
+        status: row.status,
+        retryCount: Number(row.retryCount || 0),
+        errorMessage: row.errorMessage || null,
+        executedAt: row.executedAt || null,
+        releaseName: row.releaseName || null,
+        buildVersion: row.buildVersion || null,
+        environment: row.environment || null,
+        signature: ["Failed", "Blocked"].includes(String(row.status || ""))
+          ? failureSignatureFor(row as FailureExecutionInput).signature
+          : null,
+      })),
+    };
+  }
+
+  private async latestTicketTriageSnapshot(projectId: string, ticketId: string) {
+    const res = await this.db.query(
+      `SELECT id, failure_signature, classification, flake_score, evidence_snapshot, hypotheses,
+              rerun_recommendation, provider, model, input_digest, created_by, created_at
+         FROM qa_failure_triage_snapshots
+        WHERE project_id=$1 AND ticket_id=$2
+        ORDER BY created_at DESC
+        LIMIT 1`,
+      [projectId, ticketId],
+    );
+    return res.rows[0] ? toCamel(res.rows[0]) : null;
+  }
+
+  async getTicketFailureTriage(
+    userId: string | null | undefined,
+    projectId: string,
+    ticketRef: string,
+    runRef?: string,
+  ) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const base = await this.getTicketFailureIntelligence(uid, projectId, ticketRef, runRef);
+    const ticketId = await this.resolveTicketRef(projectId, ticketRef);
+    const failures = normalizeJsonArray((base as Body).failures);
+    const testcaseIds = [...new Set(failures.map((item: Body) => String(item.testcaseId || "")).filter(Boolean))];
+    const historyRows = await this.phase4ExecutionHistory(projectId, testcaseIds, 20);
+    const byTestcase = this.phase4HistoryByTestcase(historyRows);
+    const triage = failures.map((item: Body) =>
+      this.phase4TriageItem(
+        String(item.testcaseId),
+        byTestcase.get(String(item.testcaseId)) || [],
+        String(item.current?.executionId || ""),
+      ),
+    );
+    const clusterRows = historyRows
+      .filter((row) => ["Failed", "Blocked"].includes(String(row.status || "")))
+      .map((row) => ({ ...row, testcaseId: row.testcaseId })) as Array<FailureExecutionInput & { testcaseId?: string }>;
+    const clusters = clusterFailures(clusterRows);
+    return {
+      ...base,
+      triage,
+      clusters,
+      latestAiAnalysis: await this.latestTicketTriageSnapshot(projectId, ticketId),
+      triageRules: {
+        signatureVersion: 1,
+        historyWindow: 20,
+        flakeMinimumSettledRuns: 3,
+        releaseDecisionUsesAi: false,
+      },
+    };
+  }
+
+  private sanitizeFailureHypotheses(raw: unknown, knownRefs: Set<string>): Body[] {
+    const hypotheses = normalizeJsonArray((raw as Body)?.hypotheses ?? raw);
+    const allowedConfidence = new Set(["low", "medium", "high"]);
+    const clean: Body[] = [];
+    for (const item of hypotheses.slice(0, 8)) {
+      const hypothesis = String(item.hypothesis || item.claim || "").trim().slice(0, 1200);
+      if (!hypothesis) continue;
+      const evidenceRefs = normalizeJsonArray(item.evidenceRefs)
+        .map(String)
+        .filter((ref) => knownRefs.has(ref));
+      if (!evidenceRefs.length) continue;
+      const confidence = allowedConfidence.has(String(item.confidence || "").toLowerCase())
+        ? String(item.confidence).toLowerCase()
+        : "low";
+      clean.push({
+        hypothesis,
+        confidence,
+        evidenceRefs: [...new Set(evidenceRefs)].slice(0, 12),
+        missingEvidence: normalizeJsonArray(item.missingEvidence).map(String).filter(Boolean).slice(0, 8),
+        recommendedChecks: normalizeJsonArray(item.recommendedChecks).map(String).filter(Boolean).slice(0, 8),
+      });
+    }
+    return clean;
+  }
+
+  async analyzeTicketFailureWithAi(
+    userId: string | null | undefined,
+    projectId: string,
+    ticketRef: string,
+    runRef?: string,
+    auditActorId?: string | null,
+  ) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const triage = await this.getTicketFailureTriage(uid, projectId, ticketRef, runRef);
+    const items = normalizeJsonArray((triage as Body).triage);
+    if (!items.length) {
+      throw new ConflictException({ error: "The selected retest has no Failed or Blocked executions to analyze" });
+    }
+
+    const ticketId = await this.resolveTicketRef(projectId, ticketRef);
+    const knownRefs = new Set<string>();
+    for (const item of items) {
+      for (const ref of normalizeJsonArray(item.evidenceRefs).map(String)) knownRefs.add(ref);
+      for (const row of normalizeJsonArray(item.history)) {
+        const rr = String(row.runHumanId || row.runId || "");
+        if (rr) knownRefs.add(`HISTORY:${item.testcaseHumanId || item.testcaseExternalId || item.testcaseId}:${rr}:${row.status}`);
+      }
+    }
+
+    const observations = items.map((item) => ({
+      testcase: item.testcaseHumanId || item.testcaseExternalId || item.testcaseId,
+      title: item.title,
+      signature: item.failureSignature,
+      signatureLabel: item.signatureLabel,
+      classification: item.classification,
+      flakeScore: item.flakeScore,
+      probableSubsystem: item.probableSubsystem,
+      probableOwner: item.probableOwner,
+      metrics: item.metrics,
+      rerunRecommendation: item.rerunRecommendation,
+      evidenceRefs: item.evidenceRefs,
+      history: normalizeJsonArray(item.history).map((row) => ({
+        ...row,
+        evidenceRef: `HISTORY:${item.testcaseHumanId || item.testcaseExternalId || item.testcaseId}:${row.runHumanId || row.runId}:${row.status}`,
+      })),
+    }));
+    const inputDigest = evidenceDigest(observations);
+    const allocation = await this.zyraAiAllocation(projectId);
+    if (!allocation.key) {
+      return {
+        ...triage,
+        ai: { available: false, reason: allocation.reason },
+        generatedAnalysis: null,
+      };
+    }
+
+    const key = allocation.key;
+    const provider = String(key.provider || "openai").toLowerCase();
+    const model = normalizeProviderModel(provider, key.default_model);
+    const systemPrompt = [
+      "You are a QA failure-triage assistant.",
+      "Use only the supplied observations and evidence references. Never state a root cause as fact.",
+      "Return hypotheses, not conclusions. A hypothesis must cite at least one exact evidenceRef supplied in the input.",
+      "If evidence is weak or contradictory, say so through low confidence and missingEvidence.",
+      "Do not decide release readiness or release approval; those are deterministic/human-governed outside this analysis.",
+      "Return only JSON: {\"summary\":\"...\",\"hypotheses\":[{\"hypothesis\":\"...\",\"confidence\":\"low|medium|high\",\"evidenceRefs\":[\"...\"],\"missingEvidence\":[\"...\"],\"recommendedChecks\":[\"...\"]}]}",
+    ].join(" ");
+    const userPrompt = JSON.stringify({
+      ticket: {
+        ref: (triage as Body).ticket?.humanId || (triage as Body).ticket?.externalId || ticketRef,
+        title: (triage as Body).ticket?.title || "",
+      },
+      observations,
+      allowedEvidenceRefs: [...knownRefs],
+    });
+
+    const raw = await this.zyraJsonCompletion(provider, model, key, systemPrompt, userPrompt);
+    const hypotheses = this.sanitizeFailureHypotheses(raw, knownRefs);
+    const summary = String(raw.summary || "").trim().slice(0, 3000);
+    const combinedSignature = evidenceDigest(items.map((item) => String(item.failureSignature || "")).sort());
+    const classifications = items.map((item) => String(item.classification || "unknown"));
+    const storedClassification =
+      classifications.includes("deterministic") ? "deterministic" :
+      classifications.includes("flaky") ? "flaky" :
+      classifications.includes("unknown") ? "unknown" :
+      classifications.includes("insufficient_history") ? "insufficient_history" : "stable_pass";
+    const flakeScore = Math.max(0, ...items.map((item) => Number(item.flakeScore || 0)));
+    const rerunRecommendation = items.map((item) => ({
+      testcase: item.testcaseHumanId || item.testcaseExternalId || item.testcaseId,
+      recommendation: item.rerunRecommendation,
+    }));
+
+    const inserted = await this.db.query(
+      `INSERT INTO qa_failure_triage_snapshots
+         (project_id, ticket_id, testcase_id, execution_id, failure_signature, signature_version,
+          classification, flake_score, evidence_snapshot, hypotheses, rerun_recommendation,
+          provider, model, input_digest, created_by)
+       VALUES ($1,$2,$3,$4,$5,1,$6,$7,$8::jsonb,$9::jsonb,$10::jsonb,$11,$12,$13,$14)
+       RETURNING *`,
+      [
+        projectId,
+        ticketId,
+        items.length === 1 ? items[0].testcaseId : null,
+        items.length === 1 ? items[0].currentExecutionId : null,
+        combinedSignature,
+        storedClassification,
+        flakeScore,
+        JSON.stringify({ summary, observations, allowedEvidenceRefs: [...knownRefs] }),
+        JSON.stringify(hypotheses),
+        JSON.stringify(rerunRecommendation),
+        provider,
+        model,
+        inputDigest,
+        uid,
+      ],
+    );
+    await this.logProjectActivity(projectId, auditActorId ?? uid, "ticket_failure_ai_analyzed", "ticket", ticketId, null, {
+      snapshotId: inserted.rows[0].id,
+      provider,
+      model,
+      hypothesisCount: hypotheses.length,
+      inputDigest,
+    });
+
+    return {
+      ...triage,
+      ai: { available: true, provider, model },
+      generatedAnalysis: toCamel(inserted.rows[0]),
+    };
+  }
+
+  async listReleaseGateCandidates(userId: string | null | undefined, projectId: string) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const res = await this.db.query(
+      `SELECT release_name, COALESCE(build_version,'') AS build_version,
+              COUNT(*)::int AS run_count,
+              COUNT(*) FILTER (WHERE status='Completed')::int AS completed_run_count,
+              MAX(COALESCE(ended_at, updated_at, created_at)) AS last_activity_at,
+              array_agg(DISTINCT COALESCE(environment,'') ORDER BY COALESCE(environment,'')) AS environments
+         FROM cycles
+        WHERE project_id=$1 AND deleted_at IS NULL
+          AND NULLIF(btrim(COALESCE(release_name,'')),'') IS NOT NULL
+          AND NULLIF(btrim(COALESCE(build_version,'')),'') IS NOT NULL
+        GROUP BY release_name, COALESCE(build_version,'')
+        ORDER BY MAX(COALESCE(ended_at, updated_at, created_at)) DESC
+        LIMIT 100`,
+      [projectId],
+    );
+    return res.rows.map(toCamel);
+  }
+
+  private async buildReleaseGateEvidence(
+    projectId: string,
+    releaseName: string,
+    buildVersion: string,
+    environment = "",
+  ): Promise<Body> {
+    const runs = await this.db.query(
+      `SELECT id, human_id, name, status, source, environment, build_version, release_name,
+              commit_sha, branch_name, started_at, ended_at, closed_at, close_status
+         FROM cycles
+        WHERE project_id=$1 AND deleted_at IS NULL
+          AND release_name=$2
+          AND COALESCE(build_version,'')=$3
+          AND ($4='' OR COALESCE(environment,'')=$4)
+        ORDER BY created_at ASC`,
+      [projectId, releaseName, buildVersion, environment],
+    );
+    const runIds = runs.rows.map((row) => String(row.id));
+    const executionCounts = runIds.length
+      ? await this.db.query<Record<string, number>>(
+          `SELECT COUNT(*)::int AS total,
+                  COUNT(*) FILTER (WHERE e.status='Passed')::int AS passed,
+                  COUNT(*) FILTER (WHERE e.status='Failed')::int AS failed,
+                  COUNT(*) FILTER (WHERE e.status='Blocked')::int AS blocked,
+                  COUNT(*) FILTER (WHERE e.status='Skipped')::int AS skipped,
+                  COUNT(*) FILTER (WHERE e.status IN ('Untested','Retest'))::int AS pending
+             FROM cycle_items ci
+             JOIN executions e ON e.cycle_item_id=ci.id AND e.deleted_at IS NULL
+            WHERE ci.cycle_id = ANY($1::uuid[]) AND ci.deleted_at IS NULL`,
+          [runIds],
+        )
+      : { rows: [] as Record<string, number>[] };
+    const counts = executionCounts.rows[0] || {};
+    const linkedTickets = runIds.length
+      ? await this.db.query<Record<string, number>>(
+          `SELECT
+              COUNT(DISTINCT b.id) FILTER (
+                WHERE b.status IN ('Open','Reopened') AND b.severity IN ('Critical','High')
+              )::int AS critical_high,
+              COUNT(DISTINCT b.id) FILTER (
+                WHERE b.status IN ('Open','Reopened') AND b.priority IN ('P0','P1')
+              )::int AS p0_p1
+             FROM bugs b
+             JOIN bug_links bl ON bl.bug_id=b.id AND bl.deleted_at IS NULL
+            WHERE b.project_id=$1 AND b.deleted_at IS NULL
+              AND bl.cycle_id = ANY($2::uuid[])`,
+          [projectId, runIds],
+        )
+      : { rows: [] as Record<string, number>[] };
+    const linked = linkedTickets.rows[0] || {};
+    const testcaseRes = runIds.length
+      ? await this.db.query<{ testcase_id: string }>(
+          `SELECT DISTINCT ci.testcase_id
+             FROM cycle_items ci
+            WHERE ci.cycle_id = ANY($1::uuid[]) AND ci.deleted_at IS NULL`,
+          [runIds],
+        )
+      : { rows: [] as { testcase_id: string }[] };
+    const testcaseIds = testcaseRes.rows.map((row) => row.testcase_id);
+    const histories = await this.phase4ExecutionHistory(projectId, testcaseIds, 20);
+    const byTestcase = this.phase4HistoryByTestcase(histories);
+    const patterns = [...byTestcase.entries()].map(([testcaseId, history]) => {
+      const item = this.phase4TriageItem(testcaseId, history);
+      return {
+        testcaseId,
+        testcaseHumanId: item.testcaseHumanId,
+        testcaseExternalId: item.testcaseExternalId,
+        classification: item.classification,
+        flakeScore: item.flakeScore,
+        signature: item.failureSignature,
+        rerunRecommendation: item.rerunRecommendation,
+      };
+    });
+    const highConfidenceFlaky = patterns.filter((item) => item.classification === "flaky" && Number(item.flakeScore) >= 60).length;
+    const deterministicFailures = patterns.filter((item) => item.classification === "deterministic").length;
+    const completedRuns = runs.rows.filter((row) => row.status === "Completed").length;
+    const evidence = {
+      releaseName,
+      buildVersion,
+      environment: environment || null,
+      runs: runs.rows.map(toCamel),
+      metrics: {
+        matchedRuns: runs.rows.length,
+        completedRuns,
+        incompleteRuns: Math.max(0, runs.rows.length - completedRuns),
+        totalExecutions: Number(counts.total || 0),
+        passed: Number(counts.passed || 0),
+        failed: Number(counts.failed || 0),
+        blocked: Number(counts.blocked || 0),
+        skipped: Number(counts.skipped || 0),
+        pending: Number(counts.pending || 0),
+        openCriticalHighTickets: Number(linked.critical_high || 0),
+        openP0P1Tickets: Number(linked.p0_p1 || 0),
+        highConfidenceFlaky,
+        deterministicFailures,
+      },
+      testcasePatterns: patterns.slice(0, 250),
+    };
+    return evidence;
+  }
+
+  async evaluateReleaseQaGate(
+    userId: string | null | undefined,
+    projectId: string,
+    body: Body,
+    auditActorId?: string | null,
+  ) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const releaseName = String(body.releaseName || "").trim();
+    const buildVersion = String(body.buildVersion || "").trim();
+    const environment = String(body.environment || "").trim();
+    if (!releaseName) throw new BadRequestException({ error: "releaseName is required" });
+    if (!buildVersion) throw new BadRequestException({ error: "buildVersion is required" });
+    if (releaseName.length > 128 || buildVersion.length > 128 || environment.length > 128) {
+      throw new BadRequestException({ error: "releaseName, buildVersion and environment must be 128 characters or fewer" });
+    }
+
+    const evidence = await this.buildReleaseGateEvidence(projectId, releaseName, buildVersion, environment);
+    const evaluation = evaluateReleaseGate((evidence as Body).metrics);
+    const digest = evidenceDigest(evidence);
+    const inserted = await this.db.query(
+      `INSERT INTO release_quality_gates
+         (project_id, release_name, build_version, environment, readiness, blockers, warnings,
+          evidence_snapshot, evidence_digest, evaluated_by)
+       VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8::jsonb,$9,$10)
+       RETURNING *`,
+      [
+        projectId,
+        releaseName,
+        buildVersion,
+        environment,
+        evaluation.readiness,
+        JSON.stringify(evaluation.blockers),
+        JSON.stringify(evaluation.warnings),
+        JSON.stringify(evidence),
+        digest,
+        uid,
+      ],
+    );
+    await this.logProjectActivity(projectId, auditActorId ?? uid, "release_qa_gate_evaluated", "release_quality_gate", inserted.rows[0].id, `${releaseName} / ${buildVersion}`, {
+      readiness: evaluation.readiness,
+      blockerCount: evaluation.blockers.length,
+      warningCount: evaluation.warnings.length,
+      evidenceDigest: digest,
+    });
+    return { gate: toCamel(inserted.rows[0]), evidence };
+  }
+
+  async getLatestReleaseQaGate(
+    userId: string | null | undefined,
+    projectId: string,
+    releaseName: string,
+    buildVersion: string,
+    environment = "",
+  ) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const res = await this.db.query(
+      `SELECT * FROM release_quality_gates
+        WHERE project_id=$1 AND release_name=$2 AND build_version=$3 AND environment=$4
+        ORDER BY evaluated_at DESC
+        LIMIT 1`,
+      [projectId, releaseName, buildVersion, environment],
+    );
+    if (!res.rows[0]) return { gate: null, stale: false, effectiveState: "not_evaluated" };
+    const gate = toCamel(res.rows[0]) as Body;
+    const currentEvidence = await this.buildReleaseGateEvidence(projectId, releaseName, buildVersion, environment);
+    const currentDigest = evidenceDigest(currentEvidence);
+    const stale = currentDigest !== String(gate.evidenceDigest || "");
+    const effectiveState = stale
+      ? "needs_re_evaluation"
+      : gate.decision === "approved"
+        ? "approved"
+        : gate.decision === "rejected"
+          ? "rejected"
+          : gate.readiness;
+    return { gate, stale, effectiveState, currentEvidenceDigest: currentDigest };
+  }
+
+  async decideReleaseQaGate(
+    userId: string | null | undefined,
+    projectId: string,
+    gateId: string,
+    body: Body,
+  ) {
+    const uid = this.requireUser(userId);
+    const project = await this.requireProjectAccess(uid, projectId);
+    if (this.normalizeRole(project.caller_role) === "qa_engineer") {
+      throw new ForbiddenException({ error: "Only a project owner or manager can approve or reject a release QA gate" });
+    }
+    if (!isUuid(gateId)) throw new NotFoundException({ error: "Release QA gate not found" });
+    const res = await this.db.query(
+      `SELECT * FROM release_quality_gates WHERE id=$1 AND project_id=$2`,
+      [gateId, projectId],
+    );
+    if (!res.rows[0]) throw new NotFoundException({ error: "Release QA gate not found" });
+    const gate = res.rows[0] as Body;
+    const latest = await this.db.query<{ id: string }>(
+      `SELECT id FROM release_quality_gates
+        WHERE project_id=$1 AND release_name=$2 AND build_version=$3 AND environment=$4
+        ORDER BY evaluated_at DESC LIMIT 1`,
+      [projectId, gate.release_name, gate.build_version, gate.environment],
+    );
+    if (latest.rows[0]?.id !== gateId) {
+      throw new ConflictException({ error: "A newer release QA gate evaluation exists; decide the latest evaluation instead" });
+    }
+
+    const currentEvidence = await this.buildReleaseGateEvidence(
+      projectId,
+      String(gate.release_name),
+      String(gate.build_version),
+      String(gate.environment || ""),
+    );
+    const currentDigest = evidenceDigest(currentEvidence);
+    if (currentDigest !== String(gate.evidence_digest)) {
+      throw new ConflictException({ error: "Release QA evidence changed after this evaluation. Re-evaluate before making a human decision." });
+    }
+
+    const decision = String(body.decision || "").trim().toLowerCase();
+    if (!["approved", "rejected"].includes(decision)) {
+      throw new BadRequestException({ error: "decision must be approved or rejected" });
+    }
+    if (decision === "approved" && gate.readiness !== "ready_for_approval") {
+      throw new ConflictException({ error: "This release QA gate is blocked and cannot be approved" });
+    }
+    const note = body.note == null ? null : String(body.note).trim().slice(0, 5000);
+    const updated = await this.db.query(
+      `UPDATE release_quality_gates
+          SET decision=$3, decision_by=$4, decided_at=now(), decision_note=$5, updated_at=now()
+        WHERE id=$1 AND project_id=$2
+        RETURNING *`,
+      [gateId, projectId, decision, uid, note],
+    );
+    await this.logProjectActivity(projectId, uid, `release_qa_gate_${decision}`, "release_quality_gate", gateId, `${gate.release_name} / ${gate.build_version}`, {
+      evidenceDigest: gate.evidence_digest,
+      note,
+    });
+    return { gate: toCamel(updated.rows[0]), stale: false, effectiveState: decision };
+  }
+
+  async listReleaseQaGateHistory(
+    userId: string | null | undefined,
+    projectId: string,
+    releaseName?: string,
+    buildVersion?: string,
+  ) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const params: unknown[] = [projectId];
+    const where = ["project_id=$1"];
+    if (releaseName) {
+      params.push(releaseName);
+      where.push(`release_name=$${params.length}`);
+    }
+    if (buildVersion) {
+      params.push(buildVersion);
+      where.push(`build_version=$${params.length}`);
+    }
+    const res = await this.db.query(
+      `SELECT * FROM release_quality_gates
+        WHERE ${where.join(" AND ")}
+        ORDER BY evaluated_at DESC
+        LIMIT 100`,
+      params,
+    );
+    return res.rows.map(toCamel);
+  }
+
   async resolveRequirementRef(projectId: string, requirementRef: string): Promise<string> {
     const ref = String(requirementRef || "").trim();
     if (!ref) throw new NotFoundException({ error: "Requirement not found" });
@@ -9108,56 +9794,40 @@ export class LegacyService implements OnModuleInit {
   }
 
   private async detectFlakyTests(projectId: string) {
-    const res = await this.db.query<{
-      testcase_id: string;
-      external_id: string;
-      title: string;
-      suite_name: string;
-      status: string;
-      run_name: string;
-      run_created_at: string;
-    }>(
-      `SELECT ci.testcase_id, COALESCE(ci.snapshot_external_id, t.external_id, '') AS external_id,
-              COALESCE(t.title, ci.snapshot_title, 'Untitled test case') AS title,
-              COALESCE(s.name, 'Unassigned') AS suite_name,
-              e.status, c.name AS run_name, c.created_at AS run_created_at
-       FROM cycle_items ci
-       JOIN executions e ON e.cycle_item_id = ci.id
-       JOIN cycles c ON c.id = ci.cycle_id
-       LEFT JOIN testcases t ON t.id = ci.testcase_id
-       LEFT JOIN suites s ON s.id = COALESCE(ci.snapshot_suite_id, t.suite_id) AND s.deleted_at IS NULL
-       WHERE c.project_id = $1 AND c.deleted_at IS NULL AND ci.deleted_at IS NULL
-         AND e.status IS NOT NULL AND e.status <> 'Untested'
-       ORDER BY ci.testcase_id, c.created_at ASC`,
-      [projectId]
+    // Phase 4 keeps the existing Reports contract, but the classification now comes from the same
+    // governed history engine used by ticket triage and release gates. This avoids two definitions
+    // of "flaky" drifting apart: a status flip alone is not enough unless there are at least three
+    // settled observations and both pass + failure outcomes.
+    const testcaseRows = await this.db.query<{ id: string }>(
+      `SELECT id FROM testcases WHERE project_id=$1 AND deleted_at IS NULL ORDER BY updated_at DESC LIMIT 2000`,
+      [projectId],
     );
-    const byTestcase = new Map<string, typeof res.rows>();
-    for (const row of res.rows) {
-      const list = byTestcase.get(row.testcase_id) || [];
-      list.push(row);
-      byTestcase.set(row.testcase_id, list);
-    }
+    const testcaseIds = testcaseRows.rows.map((row) => row.id);
+    const historyRows = await this.phase4ExecutionHistory(projectId, testcaseIds, 20);
+    const byTestcase = this.phase4HistoryByTestcase(historyRows);
     const flaky: Body[] = [];
     for (const [testcaseId, rows] of byTestcase) {
-      if (rows.length < 2) continue;
-      const distinctStatuses = new Set(rows.map((r) => r.status));
-      if (distinctStatuses.size < 2) continue;
-      let flips = 0;
-      for (let i = 1; i < rows.length; i++) {
-        if (rows[i].status !== rows[i - 1].status) flips++;
-      }
-      const flipRate = flips / (rows.length - 1);
+      const classification = classifyExecutionHistory(rows as FailureExecutionInput[]);
+      if (classification.classification !== "flaky") continue;
+      const current = rows[rows.length - 1] || {};
       flaky.push({
         testcaseId,
-        externalId: rows[0].external_id,
-        title: rows[0].title,
-        suiteName: rows[0].suite_name,
-        runs: rows.map((r) => ({ runName: r.run_name, status: r.status })),
-        flipCount: flips,
-        flakinessLabel: flipRate >= 0.5 ? "High" : flipRate >= 0.25 ? "Medium" : "Low"
+        externalId: current.testcaseHumanId || current.testcaseExternalId || testcaseId,
+        title: current.testcaseTitle || "Untitled test case",
+        suiteName: current.suiteName || "Unassigned",
+        runs: rows
+          .filter((row) => ["Passed", "Failed", "Blocked"].includes(String(row.status || "")))
+          .slice(-10)
+          .map((row) => ({ runName: row.runHumanId || row.runName || "Run", status: row.status })),
+        flipCount: classification.flips,
+        flakeScore: classification.flakeScore,
+        flakinessLabel:
+          classification.flakeScore >= 70 ? "High" :
+          classification.flakeScore >= 45 ? "Medium" :
+          "Low",
       });
     }
-    flaky.sort((a, b) => (b.flipCount as number) - (a.flipCount as number));
+    flaky.sort((a, b) => Number(b.flakeScore || 0) - Number(a.flakeScore || 0));
     return flaky.slice(0, 20);
   }
 

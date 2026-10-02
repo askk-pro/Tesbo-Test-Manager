@@ -21,8 +21,8 @@ async function main() {
     const migration = await scalar(
       "select count(*)::int as count, max(version)::int as max_version from schema_migrations",
     );
-    if (migration.count < 131 || migration.max_version < 131) {
-      throw new Error(`Expected migration 131; got count=${migration.count}, max=${migration.max_version}`);
+    if (migration.count < 132 || migration.max_version < 132) {
+      throw new Error(`Expected migration 132; got count=${migration.count}, max=${migration.max_version}`);
     }
 
     await client.query("BEGIN");
@@ -151,6 +151,32 @@ async function main() {
       [projectId, execution.id, stepResult.id],
     );
 
+    await client.query(
+      `insert into qa_failure_triage_snapshots
+         (project_id, ticket_id, testcase_id, execution_id, failure_signature, classification,
+          flake_score, evidence_snapshot, hypotheses, rerun_recommendation, input_digest)
+       values ($1,$2,$3,$4,$5,'deterministic',0,$6::jsonb,$7::jsonb,$8::jsonb,$9)`,
+      [
+        projectId,
+        qaOne.id,
+        tcOne.id,
+        execution.id,
+        "a".repeat(64),
+        JSON.stringify({ executionId: execution.id, evidenceRefs: ["EXECUTION:" + execution.id] }),
+        JSON.stringify([{ hypothesis: "CI hypothesis", confidence: "low", evidenceRefs: ["EXECUTION:" + execution.id] }]),
+        JSON.stringify({ shouldRerun: false, strategy: "after-change-targeted" }),
+        "b".repeat(64),
+      ],
+    );
+    await client.query(
+      `insert into release_quality_gates
+         (project_id, release_name, build_version, environment, readiness, blockers, warnings,
+          evidence_snapshot, evidence_digest)
+       values ($1,'release-ci','build-132','staging','ready_for_approval','[]'::jsonb,
+               '[{"code":"FLAKY_TESTS","count":1}]'::jsonb,$2::jsonb,$3)`,
+      [projectId, JSON.stringify({ releaseName: "release-ci", buildVersion: "build-132", passed: 1 }), "c".repeat(64)],
+    );
+
     const comment = await scalar(
       "select count(*)::int as count from ticket_comments where project_id=$1 and source='mcp'",
       [projectId],
@@ -177,6 +203,19 @@ async function main() {
          and a.evidence_kind='screenshot' and a.deleted_at is null`,
       [projectId],
     );
+    const phase4 = await scalar(
+      `select
+         (select count(*)::int
+            from qa_failure_triage_snapshots
+           where project_id=$1 and ticket_id=$2 and testcase_id=$3 and execution_id=$4
+             and classification='deterministic' and failure_signature=$5 and input_digest=$6) as triage_snapshots,
+         (select count(*)::int
+            from release_quality_gates
+           where project_id=$1 and release_name='release-ci' and build_version='build-132'
+             and environment='staging' and readiness='ready_for_approval'
+             and decision is null and evidence_digest=$7) as release_gates`,
+      [projectId, qaOne.id, tcOne.id, execution.id, "a".repeat(64), "b".repeat(64), "c".repeat(64)],
+    );
     const phase3 = await scalar(
       `select
          (select count(*)::int from ticket_retests where project_id=$1) as retests,
@@ -194,10 +233,12 @@ async function main() {
       ticketEvidence.count !== 1 ||
       phase3.retests !== 1 ||
       phase3.step_results !== 1 ||
-      phase3.step_evidence !== 1
+      phase3.step_evidence !== 1 ||
+      phase4.triage_snapshots !== 1 ||
+      phase4.release_gates !== 1
     ) {
       throw new Error(
-        `QA relation acceptance failed: comments=${comment.count}, requirement_testcases=${link.count}, ticket_requirements=${ticketRequirement.count}, ticket_evidence=${ticketEvidence.count}, retests=${phase3.retests}, step_results=${phase3.step_results}, step_evidence=${phase3.step_evidence}`,
+        `QA relation acceptance failed: comments=${comment.count}, requirement_testcases=${link.count}, ticket_requirements=${ticketRequirement.count}, ticket_evidence=${ticketEvidence.count}, retests=${phase3.retests}, step_results=${phase3.step_results}, step_evidence=${phase3.step_evidence}, triage_snapshots=${phase4.triage_snapshots}, release_gates=${phase4.release_gates}`,
       );
     }
 
@@ -225,7 +266,7 @@ async function main() {
     }
 
     await client.query("ROLLBACK");
-    console.log("QA domain schema acceptance passed: migration 131, QA/TC/REQ/RUN IDs, retest lineage, step results, step evidence, ticket/requirement/test links, sequence.");
+    console.log("QA domain schema acceptance passed: migration 132, QA/TC/REQ/RUN IDs, retest lineage, step results, step evidence, failure triage snapshots, release QA gates, ticket/requirement/test links, sequence.");
   } catch (error) {
     try {
       await client.query("ROLLBACK");

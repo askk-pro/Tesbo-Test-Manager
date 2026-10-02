@@ -3200,6 +3200,260 @@ export async function getQaTicketFailureIntelligence(
   return api(`/api/projects/${projectId}/qa-tickets/${encodeURIComponent(ticketRef)}/failure-intelligence${q}`);
 }
 
+export type QaFailureClassification =
+  | "flaky"
+  | "deterministic"
+  | "stable_pass"
+  | "insufficient_history"
+  | "unknown";
+
+export interface QaFailureRerunRecommendation {
+  shouldRerun: boolean;
+  count: number;
+  strategy: "same-build-isolated" | "after-change-targeted" | "single-targeted" | "none";
+  reason: string;
+  capture: string[];
+}
+
+export interface QaFailureTriageItem {
+  testcaseId: string;
+  testcaseHumanId?: string | null;
+  testcaseExternalId?: string | null;
+  title: string;
+  currentExecutionId?: string | null;
+  currentRunId?: string | null;
+  currentRunHumanId?: string | null;
+  failureSignature: string;
+  signatureLabel: string;
+  signatureSignalCount: number;
+  classification: QaFailureClassification;
+  flakeScore: number;
+  metrics: {
+    settledRuns: number;
+    passedRuns: number;
+    failedRuns: number;
+    blockedRuns: number;
+    flips: number;
+    flipRate: number;
+    retryPassObserved: boolean;
+    currentSignatureOccurrences: number;
+    failureSignatureCount: number;
+  };
+  probableSubsystem: { name: string; source: string };
+  probableOwner: { id?: string | null; name?: string | null; source: string };
+  rerunRecommendation: QaFailureRerunRecommendation;
+  evidenceRefs: string[];
+  history: Array<{
+    executionId?: string | null;
+    runId?: string | null;
+    runHumanId?: string | null;
+    runName?: string | null;
+    status?: string | null;
+    retryCount?: number;
+    errorMessage?: string | null;
+    executedAt?: string | null;
+    releaseName?: string | null;
+    buildVersion?: string | null;
+    environment?: string | null;
+    signature?: string | null;
+  }>;
+}
+
+export interface QaFailureCluster {
+  signature: string;
+  label: string;
+  occurrenceCount: number;
+  testcaseCount: number;
+  firstSeen?: string | null;
+  lastSeen?: string | null;
+  executionIds: string[];
+  runIds: string[];
+}
+
+export interface QaFailureHypothesis {
+  hypothesis: string;
+  confidence: "low" | "medium" | "high";
+  evidenceRefs: string[];
+  missingEvidence: string[];
+  recommendedChecks: string[];
+}
+
+export interface QaFailureAiSnapshot {
+  id: string;
+  failureSignature: string;
+  classification: QaFailureClassification;
+  flakeScore: number;
+  evidenceSnapshot: {
+    summary?: string;
+    observations?: unknown[];
+    allowedEvidenceRefs?: string[];
+  };
+  hypotheses: QaFailureHypothesis[];
+  rerunRecommendation: unknown;
+  provider?: string | null;
+  model?: string | null;
+  inputDigest: string;
+  createdAt: string;
+}
+
+export interface QaFailureTriage extends QaFailureIntelligence {
+  triage: QaFailureTriageItem[];
+  clusters: QaFailureCluster[];
+  latestAiAnalysis: QaFailureAiSnapshot | null;
+  triageRules: {
+    signatureVersion: number;
+    historyWindow: number;
+    flakeMinimumSettledRuns: number;
+    releaseDecisionUsesAi: boolean;
+  };
+  ai?: { available: boolean; provider?: string; model?: string; reason?: string };
+  generatedAnalysis?: QaFailureAiSnapshot | null;
+}
+
+export async function getQaTicketFailureTriage(
+  projectId: string,
+  ticketRef: string,
+  runRef?: string
+): Promise<QaFailureTriage> {
+  const q = runRef ? `?runRef=${encodeURIComponent(runRef)}` : "";
+  return api(`/api/projects/${projectId}/qa-tickets/${encodeURIComponent(ticketRef)}/failure-triage${q}`);
+}
+
+export async function analyzeQaTicketFailure(
+  projectId: string,
+  ticketRef: string,
+  runRef?: string
+): Promise<QaFailureTriage> {
+  const q = runRef ? `?runRef=${encodeURIComponent(runRef)}` : "";
+  return api(`/api/projects/${projectId}/qa-tickets/${encodeURIComponent(ticketRef)}/failure-triage/analyze${q}`, {
+    method: "POST",
+  });
+}
+
+export interface ReleaseQaGateCandidate {
+  releaseName: string;
+  buildVersion: string;
+  runCount: number;
+  completedRunCount: number;
+  lastActivityAt?: string | null;
+  environments: string[];
+}
+
+export interface ReleaseQaGateFinding {
+  code: string;
+  message: string;
+  count?: number;
+}
+
+export interface ReleaseQualityGate {
+  id: string;
+  projectId: string;
+  releaseName: string;
+  buildVersion: string;
+  environment: string;
+  readiness: "blocked" | "ready_for_approval";
+  blockers: ReleaseQaGateFinding[];
+  warnings: ReleaseQaGateFinding[];
+  evidenceSnapshot: ReleaseQaGateEvidence;
+  evidenceDigest: string;
+  evaluatedBy?: string | null;
+  evaluatedAt: string;
+  decision?: "approved" | "rejected" | null;
+  decisionBy?: string | null;
+  decidedAt?: string | null;
+  decisionNote?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ReleaseQaGateEvidence {
+  releaseName: string;
+  buildVersion: string;
+  environment?: string | null;
+  runs: Array<{
+    id: string;
+    humanId?: string | null;
+    name: string;
+    status: string;
+    source?: string | null;
+    environment?: string | null;
+    buildVersion?: string | null;
+    releaseName?: string | null;
+    commitSha?: string | null;
+    branchName?: string | null;
+  }>;
+  metrics: {
+    matchedRuns: number;
+    completedRuns: number;
+    incompleteRuns: number;
+    totalExecutions: number;
+    passed: number;
+    failed: number;
+    blocked: number;
+    skipped: number;
+    pending: number;
+    openCriticalHighTickets: number;
+    openP0P1Tickets: number;
+    highConfidenceFlaky: number;
+    deterministicFailures: number;
+  };
+  testcasePatterns: Array<{
+    testcaseId: string;
+    testcaseHumanId?: string | null;
+    testcaseExternalId?: string | null;
+    classification: QaFailureClassification;
+    flakeScore: number;
+    signature: string;
+    rerunRecommendation: QaFailureRerunRecommendation;
+  }>;
+}
+
+export async function listReleaseQaGateCandidates(projectId: string): Promise<ReleaseQaGateCandidate[]> {
+  return api(`/api/projects/${projectId}/release-qa-gates/candidates`);
+}
+
+export async function evaluateReleaseQaGate(
+  projectId: string,
+  data: { releaseName: string; buildVersion: string; environment?: string }
+): Promise<{ gate: ReleaseQualityGate; evidence: ReleaseQaGateEvidence }> {
+  return api(`/api/projects/${projectId}/release-qa-gates/evaluate`, { method: "POST", body: data });
+}
+
+export async function getLatestReleaseQaGate(
+  projectId: string,
+  releaseName: string,
+  buildVersion: string,
+  environment = ""
+): Promise<{
+  gate: ReleaseQualityGate | null;
+  stale: boolean;
+  effectiveState: "not_evaluated" | "needs_re_evaluation" | "blocked" | "ready_for_approval" | "approved" | "rejected";
+  currentEvidenceDigest?: string;
+}> {
+  const sp = new URLSearchParams({ releaseName, buildVersion });
+  if (environment) sp.set("environment", environment);
+  return api(`/api/projects/${projectId}/release-qa-gates/latest?${sp.toString()}`);
+}
+
+export async function listReleaseQaGateHistory(
+  projectId: string,
+  params?: { releaseName?: string; buildVersion?: string }
+): Promise<ReleaseQualityGate[]> {
+  const sp = new URLSearchParams();
+  if (params?.releaseName) sp.set("releaseName", params.releaseName);
+  if (params?.buildVersion) sp.set("buildVersion", params.buildVersion);
+  const q = sp.toString();
+  return api(`/api/projects/${projectId}/release-qa-gates${q ? `?${q}` : ""}`);
+}
+
+export async function decideReleaseQaGate(
+  projectId: string,
+  gateId: string,
+  data: { decision: "approved" | "rejected"; note?: string }
+): Promise<{ gate: ReleaseQualityGate; stale: boolean; effectiveState: "approved" | "rejected" }> {
+  return api(`/api/projects/${projectId}/release-qa-gates/${gateId}/decision`, { method: "POST", body: data });
+}
+
 export async function decideQaTicketRetest(
   projectId: string,
   ticketRef: string,

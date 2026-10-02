@@ -1020,6 +1020,71 @@ export class LegacyController {
     return this.legacy.getTicketFailureIntelligence(req.userId, projectId, ticketRef, runRef);
   }
 
+  @Get("/api/projects/:projectId/qa-tickets/:ticketRef/failure-triage")
+  getQaTicketFailureTriage(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("ticketRef") ticketRef: string,
+    @Query("runRef") runRef?: string,
+  ) {
+    return this.legacy.getTicketFailureTriage(req.userId, projectId, ticketRef, runRef);
+  }
+
+  @Post("/api/projects/:projectId/qa-tickets/:ticketRef/failure-triage/analyze")
+  analyzeQaTicketFailure(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("ticketRef") ticketRef: string,
+    @Query("runRef") runRef?: string,
+  ) {
+    return this.legacy.analyzeTicketFailureWithAi(req.userId, projectId, ticketRef, runRef);
+  }
+
+  @Get("/api/projects/:projectId/release-qa-gates/candidates")
+  listReleaseQaGateCandidates(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.listReleaseGateCandidates(req.userId, projectId);
+  }
+
+  @Post("/api/projects/:projectId/release-qa-gates/evaluate")
+  evaluateReleaseQaGate(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Body() body: Record<string, any>,
+  ) {
+    return this.legacy.evaluateReleaseQaGate(req.userId, projectId, body || {}, req.userId || null);
+  }
+
+  @Get("/api/projects/:projectId/release-qa-gates/latest")
+  getLatestReleaseQaGate(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Query("releaseName") releaseName: string,
+    @Query("buildVersion") buildVersion: string,
+    @Query("environment") environment?: string,
+  ) {
+    return this.legacy.getLatestReleaseQaGate(req.userId, projectId, releaseName || "", buildVersion || "", environment || "");
+  }
+
+  @Get("/api/projects/:projectId/release-qa-gates")
+  listReleaseQaGateHistory(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Query("releaseName") releaseName?: string,
+    @Query("buildVersion") buildVersion?: string,
+  ) {
+    return this.legacy.listReleaseQaGateHistory(req.userId, projectId, releaseName, buildVersion);
+  }
+
+  @Post("/api/projects/:projectId/release-qa-gates/:gateId/decision")
+  decideReleaseQaGate(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("gateId") gateId: string,
+    @Body() body: Record<string, any>,
+  ) {
+    return this.legacy.decideReleaseQaGate(req.userId, projectId, gateId, body || {});
+  }
+
   @Post("/api/projects/:projectId/qa-tickets/:ticketRef/retests/:runRef/decision")
   decideQaTicketRetest(
     @Req() req: AuthenticatedRequest,

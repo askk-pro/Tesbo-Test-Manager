@@ -85,6 +85,35 @@ function makeLegacy(overrides: Partial<Record<string, jest.Mock>> = {}) {
       attention: [],
       analysisGuidance: []
     }),
+    getTicketFailureTriage: jest.fn().mockResolvedValue({
+      ticket: { id: "bug-1", humanId: "QA-1", title: "Bug 1" },
+      current: { cycleId: "cycle-1", runHumanId: "RUN-1" },
+      failures: [],
+      triage: [{ testcaseId: "tc-1", classification: "flaky", flakeScore: 75 }],
+      clusters: [],
+      latestAiAnalysis: null
+    }),
+    analyzeTicketFailureWithAi: jest.fn().mockResolvedValue({
+      ticket: { id: "bug-1", humanId: "QA-1", title: "Bug 1" },
+      triage: [{ testcaseId: "tc-1", classification: "flaky", flakeScore: 75 }],
+      ai: { available: true, provider: "openai", model: "gpt-4o-mini" },
+      generatedAnalysis: { id: "triage-1", hypotheses: [] }
+    }),
+    listReleaseGateCandidates: jest.fn().mockResolvedValue([
+      { releaseName: "v1.2", buildVersion: "101", runCount: 2, completedRunCount: 2, environments: ["staging"] }
+    ]),
+    evaluateReleaseQaGate: jest.fn().mockResolvedValue({
+      gate: { id: "gate-1", readiness: "ready_for_approval", evidenceDigest: "abc" },
+      evidence: { releaseName: "v1.2", buildVersion: "101" }
+    }),
+    getLatestReleaseQaGate: jest.fn().mockResolvedValue({
+      gate: { id: "gate-1", readiness: "ready_for_approval", evidenceDigest: "abc" },
+      stale: false,
+      effectiveState: "ready_for_approval"
+    }),
+    listReleaseQaGateHistory: jest.fn().mockResolvedValue([
+      { id: "gate-1", releaseName: "v1.2", buildVersion: "101", readiness: "ready_for_approval" }
+    ]),
     listExecutionStepResults: jest.fn().mockResolvedValue([
       { stepNumber: 1, action: "Open login", status: "Failed", reportedBy: "human" }
     ]),
@@ -315,6 +344,12 @@ describe("McpService", () => {
           "list_ticket_retests",
           "get_ticket_retest_comparison",
           "get_ticket_failure_intelligence",
+          "get_ticket_failure_triage",
+          "analyze_ticket_failure",
+          "list_release_qa_gate_candidates",
+          "evaluate_release_qa_gate",
+          "get_release_qa_gate",
+          "list_release_qa_gate_history",
           "decide_ticket_retest",
           "link_ticket_to_requirement",
           "unlink_ticket_from_requirement",
@@ -2809,6 +2844,124 @@ describe("McpService", () => {
       expect(decision.error.code).toBe(RpcCode.ScopeDenied);
       expect((legacy as any).saveExecutionStepResults).not.toHaveBeenCalled();
       expect((legacy as any).decideTicketRetest).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("Phase 4 AI triage, flake detection and release-gate MCP tools", () => {
+    it("exposes deterministic failure triage to read-only clients", async () => {
+      const { db } = makeDb();
+      const legacy = makeLegacy();
+      const svc = new McpService(legacy, db);
+      const res: any = await svc.handleRequest(
+        rpc("tools/call", { name: "get_ticket_failure_triage", arguments: { ticketRef: "QA-1", runRef: "RUN-1" } }),
+        principal({ userId: "user-7", scopes: ["read"] }),
+        "proj-1"
+      );
+      expect(res.result.isError).toBe(false);
+      expect((legacy as any).getTicketFailureTriage).toHaveBeenCalledWith("user-7", "proj-1", "QA-1", "RUN-1");
+    });
+
+    it("requires write scope for persisted AI failure analysis", async () => {
+      const { db } = makeDb();
+      const legacy = makeLegacy();
+      const svc = new McpService(legacy, db);
+      const denied: any = await svc.handleRequest(
+        rpc("tools/call", { name: "analyze_ticket_failure", arguments: { ticketRef: "QA-1" } }),
+        principal({ userId: "user-7", scopes: ["read"] }),
+        "proj-1"
+      );
+      expect(denied.error.code).toBe(RpcCode.ScopeDenied);
+      expect((legacy as any).analyzeTicketFailureWithAi).not.toHaveBeenCalled();
+    });
+
+    it("attributes persisted AI analysis activity to the MCP actor while authorizing as the token user", async () => {
+      const { db } = makeDb({ mcpActorId: "mcp-actor-1" });
+      const legacy = makeLegacy();
+      const svc = new McpService(legacy, db);
+      const res: any = await svc.handleRequest(
+        rpc("tools/call", { name: "analyze_ticket_failure", arguments: { ticketRef: "QA-1", runRef: "RUN-1" } }),
+        principal({ userId: "user-7" }),
+        "proj-1"
+      );
+      expect(res.result.isError).toBe(false);
+      expect((legacy as any).analyzeTicketFailureWithAi).toHaveBeenCalledWith(
+        "user-7",
+        "proj-1",
+        "QA-1",
+        "RUN-1",
+        "mcp-actor-1"
+      );
+    });
+
+    it("evaluates a release gate as the token user and attributes audit activity to the MCP actor", async () => {
+      const { db } = makeDb({ mcpActorId: "mcp-actor-1" });
+      const legacy = makeLegacy();
+      const svc = new McpService(legacy, db);
+      const res: any = await svc.handleRequest(
+        rpc("tools/call", {
+          name: "evaluate_release_qa_gate",
+          arguments: { releaseName: "v1.2", buildVersion: "101", environment: "staging" }
+        }),
+        principal({ userId: "user-7" }),
+        "proj-1"
+      );
+      expect(res.result.isError).toBe(false);
+      expect((legacy as any).evaluateReleaseQaGate).toHaveBeenCalledWith(
+        "user-7",
+        "proj-1",
+        { releaseName: "v1.2", buildVersion: "101", environment: "staging" },
+        "mcp-actor-1"
+      );
+    });
+
+    it("lets read-only clients inspect release candidates, current gate and history", async () => {
+      const { db } = makeDb();
+      const legacy = makeLegacy();
+      const svc = new McpService(legacy, db);
+      const ro = principal({ userId: "user-7", scopes: ["read"] });
+      const candidates: any = await svc.handleRequest(
+        rpc("tools/call", { name: "list_release_qa_gate_candidates", arguments: {} }),
+        ro,
+        "proj-1"
+      );
+      const current: any = await svc.handleRequest(
+        rpc("tools/call", {
+          name: "get_release_qa_gate",
+          arguments: { releaseName: "v1.2", buildVersion: "101", environment: "staging" }
+        }),
+        ro,
+        "proj-1"
+      );
+      const history: any = await svc.handleRequest(
+        rpc("tools/call", {
+          name: "list_release_qa_gate_history",
+          arguments: { releaseName: "v1.2", buildVersion: "101" }
+        }),
+        ro,
+        "proj-1"
+      );
+      expect(candidates.result.isError).toBe(false);
+      expect(current.result.isError).toBe(false);
+      expect(history.result.isError).toBe(false);
+      expect((legacy as any).listReleaseGateCandidates).toHaveBeenCalledWith("user-7", "proj-1");
+      expect((legacy as any).getLatestReleaseQaGate).toHaveBeenCalledWith("user-7", "proj-1", "v1.2", "101", "staging");
+      expect((legacy as any).listReleaseQaGateHistory).toHaveBeenCalledWith("user-7", "proj-1", "v1.2", "101");
+    });
+
+    it("does not expose a release-approval MCP tool; approval stays human-only", async () => {
+      const { db } = makeDb();
+      const svc = new McpService(makeLegacy(), db);
+      const listed: any = await svc.handleRequest(rpc("tools/list"), principal(), "proj-1");
+      const names = listed.result.tools.map((tool: any) => tool.name);
+      expect(names).not.toContain("decide_release_qa_gate");
+      expect(names).not.toContain("approve_release_qa_gate");
+
+      const attempted: any = await svc.handleRequest(
+        rpc("tools/call", { name: "decide_release_qa_gate", arguments: { gateId: "gate-1", decision: "approved" } }),
+        principal(),
+        "proj-1"
+      );
+      expect(attempted.error.code).toBe(RpcCode.MethodNotFound);
     });
   });
 
