@@ -1,4 +1,9 @@
-FROM node:20-alpine AS deps
+FROM node:22-alpine AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --ignore-scripts --no-audit --no-fund
+
+FROM node:22-alpine AS builder
 WORKDIR /app
 
 ARG NEXT_PUBLIC_API_URL=http://localhost:7000
@@ -7,51 +12,29 @@ ARG NEXT_PUBLIC_BETTERBUGS_API_KEY=
 ENV NEXT_PUBLIC_BETTERBUGS_API_KEY=${NEXT_PUBLIC_BETTERBUGS_API_KEY}
 ARG NEXT_PUBLIC_BETTERBUGS_PROJECT_ID=
 ENV NEXT_PUBLIC_BETTERBUGS_PROJECT_ID=${NEXT_PUBLIC_BETTERBUGS_PROJECT_ID}
-# Stage-only Sentry. Leave blank on production so the SDK never initializes.
 ARG NEXT_PUBLIC_SENTRY_DSN=
 ENV NEXT_PUBLIC_SENTRY_DSN=${NEXT_PUBLIC_SENTRY_DSN}
 ARG NEXT_PUBLIC_SENTRY_ENVIRONMENT=
 ENV NEXT_PUBLIC_SENTRY_ENVIRONMENT=${NEXT_PUBLIC_SENTRY_ENVIRONMENT}
-# PostHog — set on production (app.tesbo.io); leave blank on stage to disable.
 ARG NEXT_PUBLIC_POSTHOG_KEY=
 ENV NEXT_PUBLIC_POSTHOG_KEY=${NEXT_PUBLIC_POSTHOG_KEY}
 ARG NEXT_PUBLIC_POSTHOG_HOST=
 ENV NEXT_PUBLIC_POSTHOG_HOST=${NEXT_PUBLIC_POSTHOG_HOST}
 
-COPY package.json package-lock.json ./
-RUN npm ci --ignore-scripts
-
+COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-RUN mkdir -p public
-RUN npm run build
+RUN mkdir -p public && npm run build
 
-FROM node:20-alpine AS runner
+FROM node:22-alpine AS runner
 WORKDIR /app
-
 ENV NODE_ENV=production
 ENV PORT=3000
-ARG NEXT_PUBLIC_API_URL=http://localhost:7000
-ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
-ARG NEXT_PUBLIC_BETTERBUGS_API_KEY=
-ENV NEXT_PUBLIC_BETTERBUGS_API_KEY=${NEXT_PUBLIC_BETTERBUGS_API_KEY}
-ARG NEXT_PUBLIC_BETTERBUGS_PROJECT_ID=
-ENV NEXT_PUBLIC_BETTERBUGS_PROJECT_ID=${NEXT_PUBLIC_BETTERBUGS_PROJECT_ID}
-ARG NEXT_PUBLIC_SENTRY_DSN=
-ENV NEXT_PUBLIC_SENTRY_DSN=${NEXT_PUBLIC_SENTRY_DSN}
-ARG NEXT_PUBLIC_SENTRY_ENVIRONMENT=
-ENV NEXT_PUBLIC_SENTRY_ENVIRONMENT=${NEXT_PUBLIC_SENTRY_ENVIRONMENT}
-ARG NEXT_PUBLIC_POSTHOG_KEY=
-ENV NEXT_PUBLIC_POSTHOG_KEY=${NEXT_PUBLIC_POSTHOG_KEY}
-ARG NEXT_PUBLIC_POSTHOG_HOST=
-ENV NEXT_PUBLIC_POSTHOG_HOST=${NEXT_PUBLIC_POSTHOG_HOST}
+ENV HOSTNAME=0.0.0.0
 
-COPY --from=deps --chown=node:node /app/package.json /app/package-lock.json ./
-COPY --from=deps --chown=node:node /app/node_modules ./node_modules
-COPY --from=deps --chown=node:node /app/public ./public
-COPY --from=deps --chown=node:node /app/.next ./.next
-
-USER node
-
+RUN addgroup -S app && adduser -S app -G app
+COPY --from=builder --chown=app:app /app/public ./public
+COPY --from=builder --chown=app:app /app/.next/standalone ./
+COPY --from=builder --chown=app:app /app/.next/static ./.next/static
+USER app
 EXPOSE 3000
-
-CMD ["npm", "run", "start"]
+CMD ["node", "server.js"]

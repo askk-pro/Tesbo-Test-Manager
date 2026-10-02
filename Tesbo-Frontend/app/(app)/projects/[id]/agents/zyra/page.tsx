@@ -859,7 +859,7 @@ function ZyraBacklog({ steps }: { steps: ZyraBacklogStep[] }) {
   // No "N of M" here: how many steps a request takes depends on what it turns out to need (an
   // answer never generates; a retry adds steps), so any fixed denominator would be made up.
   const turnElapsed = zyraFormatDuration(now - steps[0].activatedAt);
-  let contextHeaderShown = false;
+  const firstContextIndex = steps.findIndex((step) => step.stage.startsWith("context:"));
 
   return (
     <div className="flex items-start gap-2" data-zyra-trace="running">
@@ -873,8 +873,7 @@ function ZyraBacklog({ steps }: { steps: ZyraBacklogStep[] }) {
         </div>
         <div className="flex flex-col">
           {steps.map((step, i) => {
-            const isFirstContext = step.stage.startsWith("context:") && !contextHeaderShown;
-            if (isFirstContext) contextHeaderShown = true;
+            const isFirstContext = i === firstContextIndex;
             return (
               <div key={zyraStepKey(step)} className="flex gap-2.5">
                 <div className="flex w-2.5 flex-none flex-col items-center">
@@ -928,12 +927,15 @@ function RenameSessionModal({
 }) {
   const [title, setTitle] = useState(initialTitle);
   const [titleError, setTitleError] = useState("");
-  useEffect(() => {
+  const resetKey = String(open) + ":" + initialTitle;
+  const [previousResetKey, setPreviousResetKey] = useState(resetKey);
+  if (resetKey !== previousResetKey) {
+    setPreviousResetKey(resetKey);
     if (open) {
       setTitle(initialTitle);
       setTitleError("");
     }
-  }, [open, initialTitle]);
+  }
 
   async function handleSaveClick() {
     const trimmed = title.trim();

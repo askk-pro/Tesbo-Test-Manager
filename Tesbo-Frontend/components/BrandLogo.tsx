@@ -45,5 +45,7 @@ export function BrandLogo({ className = "h-10 w-auto object-contain", alt, decor
     );
   }
 
+  // Custom branding URLs are workspace-managed and can use arbitrary origins.
+  // eslint-disable-next-line @next/next/no-img-element
   return <img src={branding.logoUrl} alt={label ?? ""} className={className} />;
 }

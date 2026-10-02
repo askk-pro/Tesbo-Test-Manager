@@ -22,9 +22,6 @@ export default function AccountPage() {
   const { currentUser, refetchCurrentUser } = useAppData();
   const [loading, setLoading] = useState(true);
   const [email, setEmail] = useState("");
-  const [firstName, setFirstName] = useState("");
-  const [lastName, setLastName] = useState("");
-  const [mobileNumber, setMobileNumber] = useState("");
   const [hasPassword, setHasPassword] = useState(false);
 
   const [firstNameDraft, setFirstNameDraft] = useState("");
@@ -62,11 +59,8 @@ export default function AccountPage() {
     setEmail(currentUser.email ?? "");
     const trimmedFirstName = (currentUser.firstName ?? "").trim();
     const trimmedLastName = (currentUser.lastName ?? "").trim();
-    setFirstName(trimmedFirstName);
     setFirstNameDraft(trimmedFirstName);
-    setLastName(trimmedLastName);
     setLastNameDraft(trimmedLastName);
-    setMobileNumber((currentUser.mobileNumber ?? "").trim());
     setMobileNumberDraft((currentUser.mobileNumber ?? "").trim());
     setHasPassword(Boolean(currentUser.hasPassword));
     setLoading(false);
@@ -125,11 +119,8 @@ export default function AccountPage() {
         lastName: trimmedLastName,
         mobileNumber: normalizedMobileNumber,
       });
-      setFirstName((updated.firstName ?? "").trim());
       setFirstNameDraft((updated.firstName ?? "").trim());
-      setLastName((updated.lastName ?? "").trim());
       setLastNameDraft((updated.lastName ?? "").trim());
-      setMobileNumber(updated.mobileNumber ?? "");
       setMobileNumberDraft(updated.mobileNumber ?? "");
       setProfileSuccess(true);
       setIsEditingFirstName(false);

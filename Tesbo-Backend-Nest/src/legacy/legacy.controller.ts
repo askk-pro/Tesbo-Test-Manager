@@ -846,6 +846,27 @@ export class LegacyController {
   createBug(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
     return this.legacy.createBug(projectId, req.userId, body);
   }
+  // Phase 1 QA ticket aliases: bugs remain the canonical storage/domain, while qa-tickets
+  // exposes the stable QA-n key without colliding with the existing cross-source /tickets API.
+  @Get("/api/projects/:projectId/qa-tickets/:ticketRef")
+  getQaTicket(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("ticketRef") ticketRef: string) {
+    return this.legacy.getTicketByRefForUser(req.userId, projectId, ticketRef);
+  }
+
+  @Get("/api/projects/:projectId/qa-tickets/:ticketRef/comments")
+  listQaTicketComments(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("ticketRef") ticketRef: string) {
+    return this.legacy.listTicketCommentsForUser(req.userId, projectId, ticketRef);
+  }
+
+  @Post("/api/projects/:projectId/qa-tickets/:ticketRef/comments")
+  addQaTicketComment(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("ticketRef") ticketRef: string,
+    @Body() body: Record<string, any>,
+  ) {
+    return this.legacy.createTicketCommentForUser(req.userId, projectId, ticketRef, body);
+  }
 
   @Get("/api/bugs/:bugId")
   getBug(@Req() req: AuthenticatedRequest, @Param("bugId") bugId: string) {
@@ -1918,6 +1939,36 @@ export class LegacyController {
   @Get("/api/projects/:projectId/linear/search-issues")
   linearSearchIssues(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Query() query: Record<string, any>) {
     return this.legacy.linearSearchIssues(projectId, req.userId, query);
+  }
+
+  // First-class internal QA requirements (REQ-n). These coexist with Jira/Linear tickets.
+  @Get("/api/projects/:projectId/qa-requirements")
+  listQaRequirements(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.listInternalRequirementsForUser(req.userId, projectId);
+  }
+
+  @Post("/api/projects/:projectId/qa-requirements")
+  createQaRequirement(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.createInternalRequirementForUser(req.userId, projectId, body);
+  }
+
+  @Get("/api/projects/:projectId/qa-requirements/:requirementRef")
+  getQaRequirement(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("requirementRef") requirementRef: string,
+  ) {
+    return this.legacy.getInternalRequirementForUser(req.userId, projectId, requirementRef);
+  }
+
+  @Patch("/api/projects/:projectId/qa-requirements/:requirementRef")
+  updateQaRequirement(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("requirementRef") requirementRef: string,
+    @Body() body: Record<string, any>,
+  ) {
+    return this.legacy.updateInternalRequirementForUser(req.userId, projectId, requirementRef, body);
   }
 
   // ── Requirements page: cross-source (Jira + Linear) aggregates ──

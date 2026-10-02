@@ -80,12 +80,6 @@ type SettingsTab = "general" | "testRuns" | "members" | "apiTokens" | "customFie
 type ProjectMember = { userId: string; email: string; name: string; role: string; joinedAt: string };
 type WorkspaceMember = { userId: string; email: string; name: string; role: string; joinedAt: string };
 
-const PLATFORM_ROLES = [
-  { value: "owner", label: "Owner" },
-  { value: "manager", label: "Manager" },
-  { value: "qa_engineer", label: "QA Engineer" },
-] as const;
-
 function normalizeRole(role: string): "owner" | "manager" | "qa_engineer" {
   const n = (role ?? "").trim().toLowerCase().replace(/-/g, "_").replace(/ /g, "_");
   if (n === "owner") return "owner";

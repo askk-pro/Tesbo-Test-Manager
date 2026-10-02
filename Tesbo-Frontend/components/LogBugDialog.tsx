@@ -70,12 +70,12 @@ function ExistingBugPickerModal({
     if (open) {
       setPicked(new Map(selectedBugs.map((bug) => [bug.id, bug])));
       setSearch("");
+      setLoading(true);
     }
   }
 
   useEffect(() => {
     if (!open) return;
-    setLoading(true);
     listBugs(projectId)
       .then(setBugs)
       .finally(() => setLoading(false));

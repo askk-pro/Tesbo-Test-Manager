@@ -1169,7 +1169,7 @@ export function buildMcpTools(): McpTool[] {
       handler: async (args, ctx) => {
         requireString(args, "title");
         // reported_by references users(id), so use the token's human owner, not the agent actor.
-        return ctx.legacy.createBug(ctx.projectId, ctx.userId, args);
+        return ctx.legacy.createBug(ctx.projectId, ctx.userId, args, ctx.actorId);
       }
     },
     {
@@ -1200,7 +1200,7 @@ export function buildMcpTools(): McpTool[] {
         // before calling it, same as update_testcase/update_suite.
         await requireProjectOwnedRow(ctx, "bugs", bugId, "Bug");
         const { bugId: _ignored, ...body } = args;
-        return ctx.legacy.updateBug(ctx.userId, bugId, body);
+        return ctx.legacy.updateBug(ctx.userId, bugId, body, ctx.actorId);
       }
     },
     {
@@ -1234,7 +1234,7 @@ export function buildMcpTools(): McpTool[] {
           testcaseId,
           cycleId: args.cycleId,
           executionId: args.executionId
-        });
+        }, ctx.actorId);
       }
     },
     {
@@ -1264,8 +1264,262 @@ export function buildMcpTools(): McpTool[] {
         if (!match) {
           return { ok: true, bugId, testcaseId, wasLinked: false };
         }
-        await ctx.legacy.removeBugLink(ctx.userId, bugId, match.id);
+        await ctx.legacy.removeBugLink(ctx.userId, bugId, match.id, ctx.actorId);
         return { ok: true, bugId, testcaseId, wasLinked: true };
+      }
+    },
+    {
+      name: "get_testcase_by_ref",
+      description:
+        "Get one test case using its human id (for example TC-291), existing external id, or UUID. Required: testcaseRef.",
+      requiredScope: "read",
+      inputSchema: {
+        type: "object",
+        properties: { testcaseRef: { type: "string" } },
+        required: ["testcaseRef"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) => {
+        const testcaseRef = requireString(args, "testcaseRef");
+        const testcaseId = await ctx.legacy.resolveTestcaseRef(ctx.projectId, testcaseRef);
+        return ctx.legacy.getTestCase(testcaseId);
+      }
+    },
+    {
+      name: "get_test_run_by_ref",
+      description:
+        "Get one test run using its human id (for example RUN-42), automation external id, or UUID. Required: runRef.",
+      requiredScope: "read",
+      inputSchema: {
+        type: "object",
+        properties: { runRef: { type: "string" } },
+        required: ["runRef"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) => {
+        const runRef = requireString(args, "runRef");
+        const runId = await ctx.legacy.resolveRunRef(ctx.projectId, runRef);
+        const run = (await ctx.legacy.listCycles(ctx.projectId)).find((cycle) => cycle.id === runId);
+        if (!run) throw new McpError(RpcCode.ToolExecutionError, "Test run not found");
+        return run;
+      }
+    },
+    {
+      name: "get_ticket",
+      description:
+        "Get a QA ticket using its human id (for example QA-184), legacy bug external id, or UUID. Returns ticket fields, linked test cases/runs/executions, and attachments. Required: ticketRef.",
+      requiredScope: "read",
+      inputSchema: {
+        type: "object",
+        properties: { ticketRef: { type: "string" } },
+        required: ["ticketRef"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) => ctx.legacy.getTicketByRef(ctx.projectId, requireString(args, "ticketRef"))
+    },
+    {
+      name: "update_ticket",
+      description:
+        "Update a QA ticket by QA-n, legacy external id, or UUID. Required: ticketRef. Optional: title, description, status, severity, priority, externalUrl, assigneeId, links. The human token owner authorizes the change; the immutable audit event is attributed to the MCP agent.",
+      requiredScope: "write",
+      inputSchema: {
+        type: "object",
+        properties: {
+          ticketRef: { type: "string" },
+          title: { type: "string" },
+          description: { type: "string" },
+          status: { type: "string" },
+          severity: { type: "string" },
+          priority: { type: ["string", "null"] },
+          externalUrl: { type: "string" },
+          assigneeId: { type: ["string", "null"] },
+          links: { type: "array" }
+        },
+        required: ["ticketRef"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) => {
+        const ticketId = await ctx.legacy.resolveTicketRef(ctx.projectId, requireString(args, "ticketRef"));
+        const { ticketRef: _ignored, ...body } = args;
+        return ctx.legacy.updateBug(ctx.userId, ticketId, body, ctx.actorId);
+      }
+    },
+    {
+      name: "list_ticket_comments",
+      description:
+        "List the discussion on a QA ticket, oldest first, including author identity/type and source. Required: ticketRef.",
+      requiredScope: "read",
+      inputSchema: {
+        type: "object",
+        properties: { ticketRef: { type: "string" } },
+        required: ["ticketRef"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) => {
+        const ticketId = await ctx.legacy.resolveTicketRef(ctx.projectId, requireString(args, "ticketRef"));
+        return { comments: await ctx.legacy.listTicketComments(ctx.projectId, ticketId) };
+      }
+    },
+    {
+      name: "add_ticket_comment",
+      description:
+        "Append a comment to a QA ticket. Required: ticketRef, body. The comment and immutable activity event are attributed to the MCP agent.",
+      requiredScope: "write",
+      inputSchema: {
+        type: "object",
+        properties: { ticketRef: { type: "string" }, body: { type: "string" } },
+        required: ["ticketRef", "body"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) => {
+        const ticketId = await ctx.legacy.resolveTicketRef(ctx.projectId, requireString(args, "ticketRef"));
+        return ctx.legacy.createTicketComment(ctx.projectId, ticketId, ctx.actorId, requireString(args, "body"), "mcp");
+      }
+    },
+    {
+      name: "link_ticket_to_testcase",
+      description:
+        "Link a QA ticket to a test case using human ids or legacy ids. Required: ticketRef, testcaseRef. Optional: runRef, executionId; linking an execution follows the existing bug behavior and marks that execution Failed.",
+      requiredScope: "write",
+      inputSchema: {
+        type: "object",
+        properties: {
+          ticketRef: { type: "string" },
+          testcaseRef: { type: "string" },
+          runRef: { type: "string" },
+          executionId: { type: "string" }
+        },
+        required: ["ticketRef", "testcaseRef"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) => {
+        const ticketId = await ctx.legacy.resolveTicketRef(ctx.projectId, requireString(args, "ticketRef"));
+        const testcaseId = await ctx.legacy.resolveTestcaseRef(ctx.projectId, requireString(args, "testcaseRef"));
+        const cycleId = typeof args.runRef === "string" && args.runRef ? await ctx.legacy.resolveRunRef(ctx.projectId, args.runRef) : undefined;
+        if (typeof args.executionId === "string" && args.executionId) await requireExecutionOwner(ctx, args.executionId);
+        return ctx.legacy.addBugLink(ctx.userId, ticketId, { testcaseId, cycleId, executionId: args.executionId }, ctx.actorId);
+      }
+    },
+    {
+      name: "request_ticket_retest",
+      description:
+        "Create a new governed test run containing every currently linked test case for a QA ticket. Required: ticketRef. Optional: name, description, environment, buildVersion, releaseName. Returns the ticket, new RUN-n run, and add result.",
+      requiredScope: "write",
+      inputSchema: {
+        type: "object",
+        properties: {
+          ticketRef: { type: "string" },
+          name: { type: "string" },
+          description: { type: "string" },
+          environment: { type: "string" },
+          buildVersion: { type: "string" },
+          releaseName: { type: "string" }
+        },
+        required: ["ticketRef"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) => {
+        const ticketRef = requireString(args, "ticketRef");
+        const { ticketRef: _ignored, ...body } = args;
+        return ctx.legacy.requestTicketRetest(ctx.projectId, ticketRef, ctx.userId, ctx.actorId, body);
+      }
+    },
+    {
+      name: "list_internal_requirements",
+      description:
+        "List first-class internal QA requirements (REQ-n) in the token project, including linked test cases. Jira/Linear cross-source tickets are separate and unchanged.",
+      requiredScope: "read",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      handler: async (_args, ctx) => ({ requirements: await ctx.legacy.listInternalRequirements(ctx.projectId) })
+    },
+    {
+      name: "get_internal_requirement",
+      description:
+        "Get an internal QA requirement by REQ-n, source key, or UUID. Required: requirementRef.",
+      requiredScope: "read",
+      inputSchema: {
+        type: "object",
+        properties: { requirementRef: { type: "string" } },
+        required: ["requirementRef"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) => ctx.legacy.getInternalRequirement(ctx.projectId, requireString(args, "requirementRef"))
+    },
+    {
+      name: "create_internal_requirement",
+      description:
+        "Create a first-class internal QA requirement and allocate its REQ-n id. Required: title. Optional: description, status, priority, sourceProvider, sourceKey, sourceUrl.",
+      requiredScope: "write",
+      inputSchema: {
+        type: "object",
+        properties: {
+          title: { type: "string" }, description: { type: "string" }, status: { type: "string" },
+          priority: { type: ["string", "null"] }, sourceProvider: { type: "string" },
+          sourceKey: { type: "string" }, sourceUrl: { type: "string" }
+        },
+        required: ["title"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) => {
+        requireString(args, "title");
+        return ctx.legacy.createInternalRequirement(ctx.projectId, ctx.actorId, args);
+      }
+    },
+    {
+      name: "update_internal_requirement",
+      description:
+        "Update a first-class internal QA requirement by REQ-n, source key, or UUID. Required: requirementRef. Optional fields match create_internal_requirement.",
+      requiredScope: "write",
+      inputSchema: {
+        type: "object",
+        properties: {
+          requirementRef: { type: "string" }, title: { type: "string" }, description: { type: "string" },
+          status: { type: "string" }, priority: { type: ["string", "null"] }, sourceProvider: { type: "string" },
+          sourceKey: { type: ["string", "null"] }, sourceUrl: { type: ["string", "null"] }
+        },
+        required: ["requirementRef"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) => {
+        const requirementRef = requireString(args, "requirementRef");
+        const { requirementRef: _ignored, ...body } = args;
+        return ctx.legacy.updateInternalRequirement(ctx.projectId, requirementRef, ctx.actorId, body);
+      }
+    },
+    {
+      name: "link_internal_requirement_to_testcase",
+      description:
+        "Link an internal REQ-n requirement to a test case identified by TC-n, existing external id, or UUID. Required: requirementRef, testcaseRef.",
+      requiredScope: "write",
+      inputSchema: {
+        type: "object",
+        properties: { requirementRef: { type: "string" }, testcaseRef: { type: "string" } },
+        required: ["requirementRef", "testcaseRef"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) => {
+        const testcaseId = await ctx.legacy.resolveTestcaseRef(ctx.projectId, requireString(args, "testcaseRef"));
+        return ctx.legacy.linkInternalRequirementToTestcase(
+          ctx.projectId, requireString(args, "requirementRef"), testcaseId, ctx.actorId,
+        );
+      }
+    },
+    {
+      name: "unlink_internal_requirement_from_testcase",
+      description:
+        "Remove the governed link between an internal QA requirement and a test case without deleting either record. Required: requirementRef, testcaseRef.",
+      requiredScope: "write",
+      inputSchema: {
+        type: "object",
+        properties: { requirementRef: { type: "string" }, testcaseRef: { type: "string" } },
+        required: ["requirementRef", "testcaseRef"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) => {
+        const testcaseId = await ctx.legacy.resolveTestcaseRef(ctx.projectId, requireString(args, "testcaseRef"));
+        return ctx.legacy.unlinkInternalRequirementFromTestcase(
+          ctx.projectId, requireString(args, "requirementRef"), testcaseId, ctx.actorId,
+        );
       }
     },
     {

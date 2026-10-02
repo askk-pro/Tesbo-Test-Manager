@@ -52,15 +52,6 @@ import { statusTone, formatDate, RunAvatar, RunProgressBar } from "@/components/
 
 /* ───── Helpers ───── */
 
-function runStatusToTone(status: string) {
-  const map: Record<string, "success" | "info" | "warning" | "neutral"> = {
-    Completed: "success",
-    "In Progress": "info",
-    Planning: "neutral",
-  };
-  return map[status] ?? "neutral";
-}
-
 function pctColor(pct: number): string {
   if (pct >= 90) return "var(--status-pass-text)";
   if (pct >= 70) return "var(--status-blocked-text)";

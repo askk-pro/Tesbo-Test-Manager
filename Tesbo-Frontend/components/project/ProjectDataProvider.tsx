@@ -41,6 +41,13 @@ export function ProjectDataProvider({ projectId, children }: { projectId: string
   const [project, setProject] = useState<ProjectRecord | null>(null);
   const [projectMembers, setProjectMembers] = useState<ProjectMember[]>([]);
   const [ready, setReady] = useState(false);
+  const [previousProjectId, setPreviousProjectId] = useState(projectId);
+  if (projectId !== previousProjectId) {
+    setPreviousProjectId(projectId);
+    setReady(false);
+    setProject(null);
+    setProjectMembers([]);
+  }
 
   const refetchProject = useCallback(async () => {
     const p = await getProject(projectId);
@@ -56,8 +63,6 @@ export function ProjectDataProvider({ projectId, children }: { projectId: string
 
   useEffect(() => {
     let cancelled = false;
-    setReady(false);
-    setProject(null);
     Promise.all([getProject(projectId), listProjectMembers(projectId).catch(() => [])])
       .then(([p, m]) => {
         if (cancelled) return;

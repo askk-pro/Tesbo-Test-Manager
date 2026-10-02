@@ -46,6 +46,7 @@ function makeConfig(overrides: Partial<AppConfigService> = {}): AppConfigService
     supportContactEmail: "support@example.com",
     planGraceDays: 30,
     stripeWebhookSecret: "whsec_test",
+    isStripeBillingEnabled: true,
     ...overrides
   } as unknown as AppConfigService;
 }

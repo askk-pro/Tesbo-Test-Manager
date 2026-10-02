@@ -6190,6 +6190,331 @@ export class LegacyService implements OnModuleInit {
    * link routes took no caller at all — a bug carries reproduction steps, severity and links to the
    * executions that found it, and PATCH let anyone rewrite someone else's defect report.
    */
+  async resolveTicketRef(projectId: string, ticketRef: string): Promise<string> {
+    const ref = String(ticketRef || "").trim();
+    if (!ref) throw new NotFoundException({ error: "Ticket not found" });
+    const res = await this.db.query<{ id: string }>(
+      `SELECT id
+         FROM bugs
+        WHERE project_id = $1
+          AND deleted_at IS NULL
+          AND (id::text = $2 OR upper(human_id) = upper($2) OR upper(external_id) = upper($2))
+        LIMIT 1`,
+      [projectId, ref]
+    );
+    if (!res.rows[0]) throw new NotFoundException({ error: "Ticket not found" });
+    return res.rows[0].id;
+  }
+
+  async getTicketByRef(projectId: string, ticketRef: string) {
+    const ticketId = await this.resolveTicketRef(projectId, ticketRef);
+    return this.getBug(ticketId);
+  }
+
+  async getTicketByRefForUser(userId: string | null | undefined, projectId: string, ticketRef: string) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    return this.getTicketByRef(projectId, ticketRef);
+  }
+
+  async listTicketComments(projectId: string, ticketId: string) {
+    const owner = await this.db.query<{ project_id: string }>(
+      "SELECT project_id FROM bugs WHERE id = $1 AND deleted_at IS NULL",
+      [ticketId],
+    );
+    if (!owner.rows[0] || owner.rows[0].project_id !== projectId) {
+      throw new NotFoundException({ error: "Ticket not found" });
+    }
+    const res = await this.db.query(
+      `SELECT tc.*, ap.display_name AS author_name, ap.email AS author_email, ap.actor_type AS author_type
+         FROM ticket_comments tc
+         LEFT JOIN actor_profiles ap ON ap.id = tc.author_actor_id
+        WHERE tc.project_id = $1 AND tc.ticket_id = $2 AND tc.deleted_at IS NULL
+        ORDER BY tc.created_at ASC`,
+      [projectId, ticketId],
+    );
+    return res.rows.map(toCamel);
+  }
+
+  async createTicketComment(
+    projectId: string,
+    ticketId: string,
+    actorId: string | null,
+    body: unknown,
+    source: "ui" | "api" | "mcp" | "system" | "integration" = "api",
+  ) {
+    const text = String(body ?? "").trim();
+    if (!text) throw new BadRequestException({ error: "Comment body is required" });
+    if (text.length > 20000) throw new BadRequestException({ error: "Comment body must be 20000 characters or fewer" });
+    const ticket = await this.getBug(ticketId);
+    if (String((ticket as Body).projectId || "") !== projectId) throw new NotFoundException({ error: "Ticket not found" });
+    const inserted = await this.db.query(
+      `INSERT INTO ticket_comments (project_id, ticket_id, body, author_actor_id, source)
+       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [projectId, ticketId, text, actorId, source],
+    );
+    const row = toCamel(inserted.rows[0]);
+    await this.logProjectActivity(
+      projectId,
+      actorId,
+      "ticket_commented",
+      "ticket",
+      ticketId,
+      `${(ticket as Body).humanId || (ticket as Body).externalId || ticketId} - ${(ticket as Body).title || "Ticket"}`,
+      { commentId: row.id, source },
+    );
+    return row;
+  }
+
+  async listTicketCommentsForUser(userId: string | null | undefined, projectId: string, ticketRef: string) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    const ticketId = await this.resolveTicketRef(projectId, ticketRef);
+    return this.listTicketComments(projectId, ticketId);
+  }
+
+  async createTicketCommentForUser(userId: string | null | undefined, projectId: string, ticketRef: string, body: Body) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const ticketId = await this.resolveTicketRef(projectId, ticketRef);
+    return this.createTicketComment(projectId, ticketId, uid, body.body ?? body.comment, "ui");
+  }
+  async resolveTestcaseRef(projectId: string, testcaseRef: string): Promise<string> {
+    const ref = String(testcaseRef || "").trim();
+    if (!ref) throw new NotFoundException({ error: "Test case not found" });
+    const res = await this.db.query<{ id: string }>(
+      `SELECT id FROM testcases
+        WHERE project_id = $1 AND deleted_at IS NULL
+          AND (id::text = $2 OR upper(human_id) = upper($2) OR upper(external_id) = upper($2))
+        LIMIT 1`,
+      [projectId, ref],
+    );
+    if (!res.rows[0]) throw new NotFoundException({ error: "Test case not found" });
+    return res.rows[0].id;
+  }
+
+  async resolveRunRef(projectId: string, runRef: string): Promise<string> {
+    const ref = String(runRef || "").trim();
+    if (!ref) throw new NotFoundException({ error: "Test run not found" });
+    const res = await this.db.query<{ id: string }>(
+      `SELECT id FROM cycles
+        WHERE project_id = $1 AND deleted_at IS NULL
+          AND (id::text = $2 OR upper(human_id) = upper($2) OR upper(COALESCE(external_id, '')) = upper($2))
+        LIMIT 1`,
+      [projectId, ref],
+    );
+    if (!res.rows[0]) throw new NotFoundException({ error: "Test run not found" });
+    return res.rows[0].id;
+  }
+
+  async requestTicketRetest(
+    projectId: string,
+    ticketRef: string,
+    userId: string | null | undefined,
+    actorId: string | null,
+    body: Body = {},
+  ) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const ticketId = await this.resolveTicketRef(projectId, ticketRef);
+    const ticket = await this.getBug(ticketId);
+    const testcaseIds = [...new Set(
+      normalizeJsonArray((ticket as Body).links)
+        .map((link: Body) => String(link.testcaseId || ""))
+        .filter(Boolean),
+    )];
+    if (!testcaseIds.length) {
+      throw new BadRequestException({ error: "Ticket has no linked test cases to retest" });
+    }
+    const run = await this.createCycle(projectId, {
+      name: body.name || `Retest ${(ticket as Body).humanId || (ticket as Body).externalId || ticketId}`,
+      description: body.description || `Retest requested for ${(ticket as Body).humanId || ticketId}: ${(ticket as Body).title || ""}`,
+      environment: body.environment,
+      buildVersion: body.buildVersion,
+      releaseName: body.releaseName,
+    });
+    const added = await this.addCycleTestCases((run as Body).id, uid, { testcaseIds });
+    await this.logProjectActivity(
+      projectId,
+      actorId ?? uid,
+      "ticket_retest_requested",
+      "ticket",
+      ticketId,
+      `${(ticket as Body).humanId || (ticket as Body).externalId || ticketId} - ${(ticket as Body).title || "Ticket"}`,
+      { runId: (run as Body).id, runHumanId: (run as Body).humanId, testcaseIds, added },
+    );
+    return { ticket, run, added };
+  }
+
+  async resolveRequirementRef(projectId: string, requirementRef: string): Promise<string> {
+    const ref = String(requirementRef || "").trim();
+    if (!ref) throw new NotFoundException({ error: "Requirement not found" });
+    const res = await this.db.query<{ id: string }>(
+      `SELECT id FROM requirements
+        WHERE project_id = $1 AND deleted_at IS NULL
+          AND (id::text = $2 OR upper(human_id) = upper($2) OR upper(COALESCE(source_key, '')) = upper($2))
+        LIMIT 1`,
+      [projectId, ref],
+    );
+    if (!res.rows[0]) throw new NotFoundException({ error: "Requirement not found" });
+    return res.rows[0].id;
+  }
+
+  private requirementSelect(where: string): string {
+    return `
+      SELECT r.*, COALESCE(ap.display_name, ap.email) AS owner_name, links.items AS testcases
+        FROM requirements r
+        LEFT JOIN actor_profiles ap ON ap.id = r.owner_id
+        LEFT JOIN LATERAL (
+          SELECT COALESCE(json_agg(json_build_object(
+            'id', t.id, 'humanId', t.human_id, 'externalId', t.external_id, 'title', t.title, 'status', t.status
+          ) ORDER BY t.updated_at DESC), '[]'::json) AS items
+            FROM requirement_testcases rt
+            JOIN testcases t ON t.id = rt.testcase_id
+           WHERE rt.requirement_id = r.id AND rt.deleted_at IS NULL AND t.deleted_at IS NULL
+        ) links ON true
+       WHERE r.deleted_at IS NULL AND (${where})`;
+  }
+
+  async listInternalRequirements(projectId: string) {
+    const res = await this.db.query(`${this.requirementSelect("r.project_id = $1")} ORDER BY r.updated_at DESC`, [projectId]);
+    return res.rows.map((row) => ({ ...toCamel(row), testcases: normalizeJsonArray(row.testcases).map(toCamel) }));
+  }
+
+  async getInternalRequirement(projectId: string, requirementRef: string) {
+    const requirementId = await this.resolveRequirementRef(projectId, requirementRef);
+    const res = await this.db.query(this.requirementSelect("r.id = $1 AND r.project_id = $2"), [requirementId, projectId]);
+    if (!res.rows[0]) throw new NotFoundException({ error: "Requirement not found" });
+    const row = res.rows[0];
+    return { ...toCamel(row), testcases: normalizeJsonArray(row.testcases).map(toCamel) };
+  }
+
+  async createInternalRequirement(projectId: string, actorId: string | null, body: Body) {
+    validateBoundedField(body.title, "Requirement title", 512);
+    if (!String(body.title || "").trim()) throw new BadRequestException({ error: "Requirement title is required" });
+    const provider = String(body.sourceProvider || "internal").trim().toLowerCase();
+    if (!["internal", "jira", "linear", "other"].includes(provider)) {
+      throw new BadRequestException({ error: "sourceProvider must be internal, jira, linear, or other" });
+    }
+    const priority = this.parseBugPriority(body.priority);
+    const res = await this.db.query<{ id: string }>(
+      `INSERT INTO requirements
+       (project_id, title, description, status, priority, source_provider, source_key, source_url, created_by, updated_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9) RETURNING id`,
+      [
+        projectId,
+        String(body.title).trim(),
+        body.description || "",
+        body.status || "Draft",
+        priority,
+        provider,
+        body.sourceKey || null,
+        body.sourceUrl || null,
+        actorId,
+      ],
+    );
+    const created = await this.getInternalRequirement(projectId, res.rows[0].id);
+    await this.logProjectActivity(
+      projectId, actorId, "requirement_created", "requirement", res.rows[0].id,
+      `${(created as Body).humanId} - ${(created as Body).title}`, { after: created },
+    );
+    return created;
+  }
+
+  async updateInternalRequirement(projectId: string, requirementRef: string, actorId: string | null, body: Body) {
+    const requirementId = await this.resolveRequirementRef(projectId, requirementRef);
+    const before = await this.getInternalRequirement(projectId, requirementId);
+    validateBoundedField(body.title, "Requirement title", 512);
+    const provider = body.sourceProvider === undefined ? undefined : String(body.sourceProvider).trim().toLowerCase();
+    if (provider !== undefined && !["internal", "jira", "linear", "other"].includes(provider)) {
+      throw new BadRequestException({ error: "sourceProvider must be internal, jira, linear, or other" });
+    }
+    const clearsPriority = body.priority === null || body.priority === "";
+    const priority = body.priority === undefined ? null : this.parseBugPriority(body.priority);
+    await this.db.query(
+      `UPDATE requirements SET
+         title = COALESCE($3, title),
+         description = COALESCE($4, description),
+         status = COALESCE($5, status),
+         priority = CASE WHEN $6::boolean THEN NULL ELSE COALESCE($7, priority) END,
+         source_provider = COALESCE($8, source_provider),
+         source_key = CASE WHEN $9::boolean THEN NULL ELSE COALESCE($10, source_key) END,
+         source_url = CASE WHEN $11::boolean THEN NULL ELSE COALESCE($12, source_url) END,
+         updated_by = $13, updated_at = now()
+       WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL`,
+      [
+        requirementId, projectId, body.title || null, body.description ?? null, body.status || null,
+        clearsPriority, priority, provider || null,
+        body.sourceKey === null || body.sourceKey === "", body.sourceKey || null,
+        body.sourceUrl === null || body.sourceUrl === "", body.sourceUrl || null, actorId,
+      ],
+    );
+    const after = await this.getInternalRequirement(projectId, requirementId);
+    await this.logProjectActivity(
+      projectId, actorId, "requirement_updated", "requirement", requirementId,
+      `${(after as Body).humanId} - ${(after as Body).title}`, { before, after },
+    );
+    return after;
+  }
+
+  async linkInternalRequirementToTestcase(projectId: string, requirementRef: string, testcaseId: string, actorId: string | null) {
+    const requirementId = await this.resolveRequirementRef(projectId, requirementRef);
+    const testcase = await this.db.query<{ id: string }>(
+      "SELECT id FROM testcases WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL",
+      [testcaseId, projectId],
+    );
+    if (!testcase.rows[0]) throw new NotFoundException({ error: "Test case not found" });
+    await this.db.query(
+      `INSERT INTO requirement_testcases (requirement_id, testcase_id, created_by)
+       VALUES ($1,$2,$3)
+       ON CONFLICT (requirement_id, testcase_id) WHERE deleted_at IS NULL DO NOTHING`,
+      [requirementId, testcaseId, actorId],
+    );
+    const requirement = await this.getInternalRequirement(projectId, requirementId);
+    await this.logProjectActivity(
+      projectId, actorId, "requirement_testcase_linked", "requirement", requirementId,
+      `${(requirement as Body).humanId} - ${(requirement as Body).title}`, { testcaseId },
+    );
+    return requirement;
+  }
+
+  async unlinkInternalRequirementFromTestcase(projectId: string, requirementRef: string, testcaseId: string, actorId: string | null) {
+    const requirementId = await this.resolveRequirementRef(projectId, requirementRef);
+    const result = await this.db.query(
+      `UPDATE requirement_testcases SET deleted_at = now(), deleted_by = $3
+        WHERE requirement_id = $1 AND testcase_id = $2 AND deleted_at IS NULL RETURNING id`,
+      [requirementId, testcaseId, actorId],
+    );
+    const requirement = await this.getInternalRequirement(projectId, requirementId);
+    if (result.rows[0]) {
+      await this.logProjectActivity(
+        projectId, actorId, "requirement_testcase_unlinked", "requirement", requirementId,
+        `${(requirement as Body).humanId} - ${(requirement as Body).title}`, { testcaseId },
+      );
+    }
+    return { requirement, wasLinked: Boolean(result.rows[0]) };
+  }
+
+  async listInternalRequirementsForUser(userId: string | null | undefined, projectId: string) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    return this.listInternalRequirements(projectId);
+  }
+
+  async getInternalRequirementForUser(userId: string | null | undefined, projectId: string, requirementRef: string) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    return this.getInternalRequirement(projectId, requirementRef);
+  }
+
+  async createInternalRequirementForUser(userId: string | null | undefined, projectId: string, body: Body) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    return this.createInternalRequirement(projectId, uid, body);
+  }
+
+  async updateInternalRequirementForUser(userId: string | null | undefined, projectId: string, requirementRef: string, body: Body) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    return this.updateInternalRequirement(projectId, requirementRef, uid, body);
+  }
+
   private async requireBugAccess(userId: string | null | undefined, bugId: string): Promise<string> {
     const uid = this.requireUser(userId);
     if (!isUuid(bugId)) throw new NotFoundException({ error: "Bug not found" });
@@ -6439,7 +6764,7 @@ export class LegacyService implements OnModuleInit {
     return id;
   }
 
-  async createBug(projectId: string, userId: string | null | undefined, body: Body) {
+  async createBug(projectId: string, userId: string | null | undefined, body: Body, auditActorId?: string | null) {
     // Deliberately not this.requireUser(userId) — the MCP create_bug tool can call this with a null
     // userId (an API-token caller with no owning user) and must keep working, same as before this
     // link-diffing existed. uid is only ever consumed by replaceBugLinks' UPDATE ... deleted_by
@@ -6506,7 +6831,17 @@ export class LegacyService implements OnModuleInit {
     // After the commit, not inside it: the bug is the record that must exist, and a failure while
     // flipping an execution should not roll back the bug report someone just wrote.
     await this.failLinkedExecutions(projectId, userId, links);
-    return this.getBug(bugId as string);
+    const created = await this.getBug(bugId as string);
+    await this.logProjectActivity(
+      projectId,
+      auditActorId ?? userId ?? null,
+      "ticket_created",
+      "ticket",
+      bugId as string,
+      `${(created as Body).humanId || (created as Body).externalId || bugId} - ${(created as Body).title || "Ticket"}`,
+      { after: created },
+    );
+    return created;
   }
 
   async getBugForUser(userId: string | null | undefined, bugId: string) {
@@ -6528,9 +6863,10 @@ export class LegacyService implements OnModuleInit {
     return { ...toCamel(row), links: normalizeJsonArray(row.links).map(toCamel), attachments: normalizeJsonArray(row.attachments).map(toCamel) };
   }
 
-  async updateBug(userId: string | null | undefined, bugId: string, body: Body) {
+  async updateBug(userId: string | null | undefined, bugId: string, body: Body, auditActorId?: string | null) {
     const uid = this.requireUser(userId);
     const projectId = await this.requireBugAccess(userId, bugId);
+    const before = await this.getBug(bugId);
     // Same refusal as createBug — an unknown severity on edit hit the same constraint and the same
     // opaque 500. Absent/empty leaves the stored value alone via COALESCE, so it isn't parsed.
     if (body.severity) this.parseBugSeverity(body.severity);
@@ -6576,11 +6912,21 @@ export class LegacyService implements OnModuleInit {
       const sanitized = await this.sanitizeBugLinks(String(owner.rows[0]?.project_id ?? ""), normalizeJsonArray(body.links));
       await this.db.transaction((client) => this.replaceBugLinks(client, bugId, uid, sanitized));
     }
-    return this.getBug(bugId);
+    const after = await this.getBug(bugId);
+    await this.logProjectActivity(
+      projectId,
+      auditActorId ?? userId ?? null,
+      "ticket_updated",
+      "ticket",
+      bugId,
+      `${(after as Body).humanId || (after as Body).externalId || bugId} - ${(after as Body).title || "Ticket"}`,
+      { before, after },
+    );
+    return after;
   }
 
-  async addBugLink(userId: string | null | undefined, bugId: string, body: Body) {
-    await this.requireBugAccess(userId, bugId);
+  async addBugLink(userId: string | null | undefined, bugId: string, body: Body, auditActorId?: string | null) {
+    const projectId = await this.requireBugAccess(userId, bugId);
     if (!body.testcaseId && !body.cycleId) throw new BadRequestException({ error: "testcaseId or cycleId is required." });
     const testcaseId = body.testcaseId || null;
     const cycleId = body.cycleId || null;
@@ -6607,26 +6953,55 @@ export class LegacyService implements OnModuleInit {
     }
     // requireBugAccess already resolved this bug's project; re-read it rather than trusting the
     // caller's body, which never carries a project id.
-    const owner = await this.db.query<{ project_id: string }>("SELECT project_id FROM bugs WHERE id = $1", [bugId]);
-    const projectId = owner.rows[0]?.project_id;
-    if (projectId) await this.failLinkedExecutions(String(projectId), userId, [body]);
-    return this.getBug(bugId);
+    await this.failLinkedExecutions(projectId, userId, [body]);
+    const after = await this.getBug(bugId);
+    await this.logProjectActivity(
+      projectId,
+      auditActorId ?? userId ?? null,
+      "ticket_testcase_linked",
+      "ticket",
+      bugId,
+      `${(after as Body).humanId || (after as Body).externalId || bugId} - ${(after as Body).title || "Ticket"}`,
+      { testcaseId, cycleId, executionId },
+    );
+    return after;
   }
 
-  async removeBugLink(userId: string | null | undefined, bugId: string, linkId: string) {
+  async removeBugLink(userId: string | null | undefined, bugId: string, linkId: string, auditActorId?: string | null) {
     const uid = this.requireUser(userId);
-    await this.requireBugAccess(userId, bugId);
+    const projectId = await this.requireBugAccess(userId, bugId);
+    const before = await this.getBug(bugId);
     await this.db.query(
       "UPDATE bug_links SET deleted_at = now(), deleted_by = $3 WHERE id = $1 AND bug_id = $2 AND deleted_at IS NULL",
       [linkId, bugId, uid]
     );
-    return this.getBug(bugId);
+    const after = await this.getBug(bugId);
+    await this.logProjectActivity(
+      projectId,
+      auditActorId ?? userId ?? null,
+      "ticket_testcase_unlinked",
+      "ticket",
+      bugId,
+      `${(after as Body).humanId || (after as Body).externalId || bugId} - ${(after as Body).title || "Ticket"}`,
+      { linkId, beforeLinks: (before as Body).links, afterLinks: (after as Body).links },
+    );
+    return after;
   }
 
-  async deleteBug(userId: string | null | undefined, bugId: string) {
+  async deleteBug(userId: string | null | undefined, bugId: string, auditActorId?: string | null) {
     const uid = this.requireUser(userId);
-    await this.requireBugAccess(userId, bugId);
+    const projectId = await this.requireBugAccess(userId, bugId);
+    const before = await this.getBug(bugId);
     await this.db.query("UPDATE bugs SET deleted_at = now(), deleted_by = $2, updated_at = now() WHERE id = $1 AND deleted_at IS NULL", [bugId, uid]);
+    await this.logProjectActivity(
+      projectId,
+      auditActorId ?? userId ?? null,
+      "ticket_deleted",
+      "ticket",
+      bugId,
+      `${(before as Body).humanId || (before as Body).externalId || bugId} - ${(before as Body).title || "Ticket"}`,
+      { before },
+    );
   }
 
   // The client controls the uploaded filename completely, and it is only ever a display label —

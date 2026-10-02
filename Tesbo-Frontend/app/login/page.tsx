@@ -98,7 +98,7 @@ function LoginForm() {
         router.replace(target);
       })
       .catch(() => setCheckingSetup(false));
-  }, [router, redirect]);
+  }, [router, redirect, inviteEmail, isInviteEmailLocked]);
 
   /*
    * A deadline on the loading screen, so it is never a terminal state.

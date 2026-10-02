@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import { IconChevronDown, IconCheck, IconPlus } from "@tabler/icons-react";
 import {
   createAdditionalWorkspace,
@@ -23,6 +24,7 @@ function planLabel(plan?: string): string {
 }
 
 export default function WorkspaceSwitcher({ isCollapsed }: { isCollapsed: boolean }) {
+  const router = useRouter();
   const [workspaces, setWorkspaces] = useState<WorkspaceListItem[]>([]);
   const [isOpen, setIsOpen] = useState(false);
   const [switchingId, setSwitchingId] = useState<string | null>(null);
@@ -33,17 +35,16 @@ export default function WorkspaceSwitcher({ isCollapsed }: { isCollapsed: boolea
   const [createError, setCreateError] = useState("");
   const menuRef = useRef<HTMLDivElement>(null);
 
-  const loadWorkspaces = async () => {
-    try {
-      const data = await listWorkspaces();
-      setWorkspaces(data);
-    } catch {
-      // Not onboarded yet, or request failed — switcher just stays empty.
-    }
-  };
-
   useEffect(() => {
-    loadWorkspaces();
+    let cancelled = false;
+    listWorkspaces()
+      .then((data) => {
+        if (!cancelled) setWorkspaces(data);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -68,11 +69,8 @@ export default function WorkspaceSwitcher({ isCollapsed }: { isCollapsed: boolea
     try {
       await switchWorkspace(id);
       setIsOpen(false);
-      // Hard navigation: /projects and every other page here fetch their data
-      // client-side on mount, so a same-route router.push()/refresh() would not
-      // re-run those fetches. A full reload guarantees everything reflects the
-      // newly active workspace.
-      window.location.href = "/projects";
+      router.replace("/projects");
+      router.refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to switch workspace");
       setSwitchingId(null);
@@ -91,7 +89,8 @@ export default function WorkspaceSwitcher({ isCollapsed }: { isCollapsed: boolea
       await createAdditionalWorkspace({ orgName: orgName.trim() });
       setOrgName("");
       setIsCreateOpen(false);
-      window.location.href = "/projects";
+      router.replace("/projects");
+      router.refresh();
     } catch (err) {
       setCreateError(err instanceof Error ? err.message : "Failed to create workspace");
       setCreating(false);

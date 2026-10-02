@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "phase1/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Tesbo-Backend-Nest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: Tesbo-Backend-Nest/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - name: Block High/Critical dependency findings
+        run: npm audit --audit-level=high
+
+  migration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: tesbo
+          POSTGRES_PASSWORD: tesbo_ci
+          POSTGRES_DB: tesbo
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tesbo -d tesbo"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    defaults:
+      run:
+        working-directory: Tesbo-Backend-Nest
+    env:
+      DATABASE_URL: postgresql://tesbo:tesbo_ci@127.0.0.1:5432/tesbo
+      DATABASE_USER: tesbo
+      DATABASE_PASSWORD: tesbo_ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: Tesbo-Backend-Nest/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - name: Enable pgvector
+        run: |
+          node - <<'NODE'
+          const { Client } = require("pg");
+          (async () => {
+            const client = new Client({ connectionString: process.env.DATABASE_URL });
+            await client.connect();
+            await client.query("create extension if not exists vector");
+            await client.end();
+          })().catch((error) => { console.error(error); process.exit(1); });
+          NODE
+      - run: npm run migrate
+      - name: Verify QA domain migration and human IDs
+        run: node scripts/verify-qa-domain-schema.js
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Tesbo-Frontend
+    env:
+      NEXT_PUBLIC_API_URL: http://127.0.0.1:7000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: Tesbo-Frontend/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+      - name: Block High/Critical dependency findings
+        run: npm audit --audit-level=high
+
+  reporter:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/playwright-reporter
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: sdk/playwright-reporter/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - run: npm audit --audit-level=high
+
+  containers:
+    runs-on: ubuntu-latest
+    needs: [backend, migration, frontend, reporter]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build backend image
+        run: docker build -t tesbo-backend-ci ./Tesbo-Backend-Nest
+      - name: Build frontend image
+        run: docker build --build-arg NEXT_PUBLIC_API_URL=http://127.0.0.1:7000 -t tesbo-frontend-ci ./Tesbo-Frontend

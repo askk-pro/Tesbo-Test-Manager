@@ -29,7 +29,9 @@ type ImportPreviewResult = {
   totalRows: number;
 };
 
-const SUPPORTED_FILE_EXTENSIONS = [".csv", ".xlsx", ".xls"];
+// Legacy .xls parsing previously depended on unpatched SheetJS 0.18.x.
+ // Phase 1 supports modern XLSX + CSV only, using ExcelJS plus a local CSV parser.
+const SUPPORTED_FILE_EXTENSIONS = [".csv", ".xlsx"];
 const MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024; // 20MB
 const MAX_FILE_SIZE_LABEL = "20MB";
 
@@ -267,43 +269,106 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
     setImportError(null);
   }, [autoMap, autoMapCustomFields, buildPreview, preview?.sheets]);
 
-  const parseWorkbook = useCallback(async (inputFile: File): Promise<ParsedSheet[]> => {
-    const XLSX = await import("xlsx");
-    const buffer = await inputFile.arrayBuffer();
-    const workbook = XLSX.read(buffer, { type: "array", cellDates: false });
-    const sheets = workbook.SheetNames.map((name) => {
-      const worksheet = workbook.Sheets[name];
-      const rawRows = XLSX.utils.sheet_to_json<string[]>(worksheet, {
-        header: 1,
-        blankrows: false,
-        defval: "",
-        raw: false,
-      });
-      const rows = rawRows
-        .map((row) => row.map((cell) => String(cell ?? "").trim()))
-        .filter((row) => row.some(Boolean));
-      const headerRowIndex = rows.findIndex((row) => row.some((cell) => {
-        const normalized = normalizeHeader(cell);
-        return ["title", "testcasetitle", "testcase", "summary", "name"].includes(normalized);
-      }));
-      const effectiveHeaderIndex = headerRowIndex >= 0 ? headerRowIndex : 0;
-      const headers = (rows[effectiveHeaderIndex] || []).map((cell, index) => cell || `Column ${index + 1}`);
-      const dataRows = rows.slice(effectiveHeaderIndex + 1).filter((row) => row.some(Boolean));
-      return {
-        name,
-        headers,
-        rows: dataRows,
-        totalRows: dataRows.length,
-        headerRowIndex: effectiveHeaderIndex,
-      };
-    });
-    return sheets.filter((sheet) => sheet.headers.length > 0);
+  const parseRows = useCallback((name: string, rawRows: string[][]): ParsedSheet => {
+    const rows = rawRows
+      .map((row) => row.map((cell) => String(cell ?? "").trim()))
+      .filter((row) => row.some(Boolean));
+    const headerRowIndex = rows.findIndex((row) => row.some((cell) => {
+      const normalized = normalizeHeader(cell);
+      return ["title", "testcasetitle", "testcase", "summary", "name"].includes(normalized);
+    }));
+    const effectiveHeaderIndex = headerRowIndex >= 0 ? headerRowIndex : 0;
+    const headers = (rows[effectiveHeaderIndex] || []).map(
+      (cell, index) => cell || "Column " + String(index + 1),
+    );
+    const dataRows = rows.slice(effectiveHeaderIndex + 1).filter((row) => row.some(Boolean));
+    return {
+      name,
+      headers,
+      rows: dataRows,
+      totalRows: dataRows.length,
+      headerRowIndex: effectiveHeaderIndex,
+    };
   }, [normalizeHeader]);
+
+  const parseCsvRows = useCallback((source: string): string[][] => {
+    const rows: string[][] = [];
+    let row: string[] = [];
+    let cell = "";
+    let quoted = false;
+
+    for (let i = 0; i < source.length; i += 1) {
+      const ch = source[i];
+      if (quoted) {
+        if (ch === '"') {
+          if (source[i + 1] === '"') {
+            cell += '"';
+            i += 1;
+          } else {
+            quoted = false;
+          }
+        } else {
+          cell += ch;
+        }
+        continue;
+      }
+
+      if (ch === '"') {
+        quoted = true;
+      } else if (ch === ",") {
+        row.push(cell);
+        cell = "";
+      } else if (ch === "\n") {
+        row.push(cell);
+        rows.push(row);
+        row = [];
+        cell = "";
+      } else if (ch !== "\r") {
+        cell += ch;
+      }
+    }
+
+    row.push(cell);
+    if (row.some((value) => value.length > 0) || rows.length === 0) rows.push(row);
+    return rows;
+  }, []);
+
+  const parseWorkbook = useCallback(async (inputFile: File): Promise<ParsedSheet[]> => {
+    const dot = inputFile.name.lastIndexOf(".");
+    const extension = dot >= 0 ? inputFile.name.slice(dot).toLowerCase() : "";
+
+    if (extension === ".csv") {
+      const text = await inputFile.text();
+      const sheet = parseRows("CSV", parseCsvRows(text));
+      return sheet.headers.length > 0 ? [sheet] : [];
+    }
+
+    const ExcelJS = await import("exceljs");
+    const workbook = new ExcelJS.Workbook();
+    const buffer = await inputFile.arrayBuffer();
+    await workbook.xlsx.load(buffer);
+
+    const sheets: ParsedSheet[] = [];
+    workbook.eachSheet((worksheet) => {
+      const rawRows: string[][] = [];
+      worksheet.eachRow({ includeEmpty: false }, (row) => {
+        const width = Math.max(worksheet.columnCount, row.cellCount);
+        const values = Array.from(
+          { length: width },
+          (_, index) => row.getCell(index + 1).text || "",
+        );
+        if (values.some((value) => value.trim().length > 0)) rawRows.push(values);
+      });
+      const parsed = parseRows(worksheet.name, rawRows);
+      if (parsed.headers.length > 0) sheets.push(parsed);
+    });
+    return sheets;
+  }, [parseCsvRows, parseRows]);
 
   // The <input accept> hint only filters the OS file picker — and not even reliably there (an
   // "All Files" option, a file manager that ignores it) — and drag-and-drop bypasses it entirely.
   // This is the only real gate against a PDF, image, or other unsupported file reaching the
-  // XLSX parser, which otherwise fails deep in handleUpload with a confusing "Failed to parse
+  // spreadsheet parser, which otherwise fails deep in handleUpload with a confusing "Failed to parse
   // file" rather than telling the user their format isn't supported at all.
   const getFileExtension = (name: string) => {
     const idx = name.lastIndexOf(".");
@@ -317,8 +382,8 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
       setRejectedFileName(f.name);
       setUploadError(
         ext
-          ? `Unsupported file format "${ext}". Please upload a .csv, .xlsx, or .xls file.`
-          : "This file type isn't supported. Please upload a .csv, .xlsx, or .xls file.",
+          ? `Unsupported file format "${ext}". Please upload a .csv or .xlsx file.`
+          : "This file type isn't supported. Please upload a .csv or .xlsx file.",
       );
       return;
     }
@@ -645,7 +710,7 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
                   {file ? file.name : rejectedFileName || "Drop your CSV or Excel file here"}
                 </p>
                 <p className={`text-xs text-[var(--muted)] ${uploadError ? "mb-1" : "mb-3"}`}>
-                  {file ? `${(file.size / 1024).toFixed(1)} KB` : `Supports .csv, .xlsx, and .xls files (up to ${MAX_FILE_SIZE_LABEL})`}
+                  {file ? `${(file.size / 1024).toFixed(1)} KB` : `Supports .csv and .xlsx files (up to ${MAX_FILE_SIZE_LABEL})`}
                 </p>
                 {uploadError && (
                   <p className="mb-3 text-xs font-medium text-[var(--error-foreground)]">{uploadError}</p>
@@ -660,7 +725,7 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
                 <input
                   ref={fileInputRef}
                   type="file"
-                  accept=".csv,.xlsx,.xls"
+                  accept=".csv,.xlsx"
                   className="hidden"
                   onChange={(e) => {
                     const f = e.target.files?.[0];

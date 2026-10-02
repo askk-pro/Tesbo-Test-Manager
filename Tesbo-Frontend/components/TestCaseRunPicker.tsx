@@ -24,23 +24,24 @@ export default function TestCaseRunPicker({ projectId, value, onChange }: Props)
   const [pickerExecutions, setPickerExecutions] = useState<ExecutionItem[]>([]);
   const [pickerExecutionId, setPickerExecutionId] = useState("");
   const [loadingExecutions, setLoadingExecutions] = useState(false);
+  const [previousPickerRunId, setPreviousPickerRunId] = useState(pickerRunId);
+  if (pickerRunId !== previousPickerRunId) {
+    setPreviousPickerRunId(pickerRunId);
+    setPickerExecutionId("");
+    setPickerExecutions([]);
+    setLoadingExecutions(Boolean(pickerRunId));
+  }
 
   useEffect(() => {
     listTestRuns(projectId).then(setRuns).catch(() => setRuns([]));
   }, [projectId]);
 
   useEffect(() => {
-    if (!pickerRunId) {
-      setPickerExecutions([]);
-      setPickerExecutionId("");
-      return;
-    }
-    setLoadingExecutions(true);
+    if (!pickerRunId) return;
     listCycleExecutions(pickerRunId)
       .then((list) => setPickerExecutions(list))
       .catch(() => setPickerExecutions([]))
       .finally(() => setLoadingExecutions(false));
-    setPickerExecutionId("");
   }, [pickerRunId]);
 
   function addLink() {

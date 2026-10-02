@@ -859,7 +859,7 @@ describe("McpService", () => {
       expect(actorLookups).toHaveLength(1);
     });
 
-    it("reports bugs under the token's user, not the agent actor", async () => {
+    it("reports bugs under the token user while attributing the mutation to the MCP actor", async () => {
       const { db } = makeDb({ mcpActorId: "mcp-actor-1" });
       const legacy = makeLegacy();
       const svc = new McpService(legacy, db);
@@ -868,7 +868,7 @@ describe("McpService", () => {
         principal({ userId: "user-7" }),
         "proj-1"
       );
-      expect((legacy as any).createBug).toHaveBeenCalledWith("proj-1", "user-7", { title: "Broken" });
+      expect((legacy as any).createBug).toHaveBeenCalledWith("proj-1", "user-7", { title: "Broken" }, "mcp-actor-1");
     });
   });
 
@@ -1886,7 +1886,7 @@ describe("McpService", () => {
       ).toMatch(/"bugId"/i);
     });
 
-    it("updates a bug, attributed to the token's user (not the agent actor)", async () => {
+    it("updates a bug with the token user for authorization and the MCP actor for audit attribution", async () => {
       const { db } = makeDb({ mcpActorId: "mcp-actor-1", bugProject: "proj-1" });
       const legacy = makeLegacy();
       const svc = new McpService(legacy, db);
@@ -1896,7 +1896,7 @@ describe("McpService", () => {
         "proj-1"
       );
       expect(res.result.isError).toBe(false);
-      expect((legacy as any).updateBug).toHaveBeenCalledWith("user-7", "bug-1", { status: "Closed", severity: "High" });
+      expect((legacy as any).updateBug).toHaveBeenCalledWith("user-7", "bug-1", { status: "Closed", severity: "High" }, "mcp-actor-1");
     });
   });
 
@@ -1915,7 +1915,7 @@ describe("McpService", () => {
         testcaseId: "tc-1",
         cycleId: undefined,
         executionId: undefined
-      });
+      }, null);
     });
 
     it("is idempotent: linking the same test case to the same bug twice does not error", async () => {
@@ -1947,7 +1947,7 @@ describe("McpService", () => {
         "proj-1"
       );
       expect(res.result.isError).toBe(false);
-      expect((legacy as any).removeBugLink).toHaveBeenCalledWith("user-7", "bug-1", "link-1");
+      expect((legacy as any).removeBugLink).toHaveBeenCalledWith("user-7", "bug-1", "link-1", null);
       expect(JSON.parse(res.result.content[0].text)).toEqual({ ok: true, bugId: "bug-1", testcaseId: "tc-1", wasLinked: true });
     });
 
