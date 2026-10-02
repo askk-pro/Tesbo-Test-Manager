@@ -6,9 +6,12 @@ import Link from "next/link";
 import {
   listCycleExecutions,
   updateExecution,
+  listExecutionSteps,
+  saveExecutionSteps,
   listBugs,
   removeBugLink,
   type ExecutionItem,
+  type ExecutionStepResult,
   type BugItem,
 } from "@/lib/api";
 import { IconBug } from "@tabler/icons-react";
@@ -21,6 +24,7 @@ import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
 
 const STATUSES = ["Untested", "Passed", "Failed", "Skipped", "Blocked", "Retest"];
+const STEP_STATUSES: ExecutionStepResult["status"][] = ["Untested", "Passed", "Failed", "Blocked", "Skipped"];
 
 function statusToTone(status: string) {
   const map: Record<string, "success" | "error" | "blocked" | "skipped" | "retest" | "notRun"> = {
@@ -36,6 +40,15 @@ function statusToTone(status: string) {
 
 function executionTitle(execution: ExecutionItem) {
   return execution.title || execution.snapshotTitle || "Untitled test case";
+}
+
+function aggregateStepStatus(rows: ExecutionStepResult[]): string {
+  if (!rows.length) return "Untested";
+  if (rows.some((row) => row.status === "Failed")) return "Failed";
+  if (rows.some((row) => row.status === "Blocked")) return "Blocked";
+  if (rows.every((row) => row.status === "Skipped")) return "Skipped";
+  if (rows.every((row) => row.status === "Passed" || row.status === "Skipped")) return "Passed";
+  return "Untested";
 }
 
 function normalizeSteps(value: unknown): Array<{ action: string; expected: string }> {
@@ -70,6 +83,7 @@ export default function ExecutionDetailPage() {
   const [status, setStatus] = useState("");
   const [actualResult, setActualResult] = useState("");
   const [assigneeId, setAssigneeId] = useState("");
+  const [stepResults, setStepResults] = useState<ExecutionStepResult[]>([]);
   const [saving, setSaving] = useState(false);
   /* Bug Key / Bug Title shown for a Failed execution — read from the real bug(s) filed via "Log
      bug" (bugs/bug_links), not the old free-text defectKey/defectUrl columns on the execution row.
@@ -152,6 +166,34 @@ export default function ExecutionDetailPage() {
           setActualResult(e.actualResult || "");
           setAssigneeId(e.assigneeId || "");
           loadLinkedBugs(e);
+          void listExecutionSteps(cycleId, e.id)
+            .then((stored) => {
+              if (stored.length) {
+                setStepResults(stored);
+                setStatus(aggregateStepStatus(stored));
+                return;
+              }
+              const seeded = normalizeSteps(e.steps).map((step, index) => ({
+                stepNumber: index + 1,
+                action: step.action,
+                expectedResult: step.expected,
+                status: "Untested" as const,
+                actualResult: "",
+                errorMessage: "",
+              }));
+              setStepResults(seeded);
+            })
+            .catch(() => {
+              const seeded = normalizeSteps(e.steps).map((step, index) => ({
+                stepNumber: index + 1,
+                action: step.action,
+                expectedResult: step.expected,
+                status: "Untested" as const,
+                actualResult: "",
+                errorMessage: "",
+              }));
+              setStepResults(seeded);
+            });
         }
       })
       .catch(() => router.replace("/projects"));
@@ -162,11 +204,20 @@ export default function ExecutionDetailPage() {
     e.preventDefault();
     setSaving(true);
     try {
-      await updateExecution(cycleId, executionId, {
-        status,
-        actualResult,
-        assigneeId: assigneeId || null,
-      });
+      if (stepResults.length) {
+        const saved = await saveExecutionSteps(cycleId, executionId, stepResults);
+        setStatus(saved.status);
+        await updateExecution(cycleId, executionId, {
+          actualResult,
+          assigneeId: assigneeId || null,
+        });
+      } else {
+        await updateExecution(cycleId, executionId, {
+          status,
+          actualResult,
+          assigneeId: assigneeId || null,
+        });
+      }
       router.push(`/projects/${projectId}/cycles/${cycleId}`);
       router.refresh();
     } finally {
@@ -178,7 +229,13 @@ export default function ExecutionDetailPage() {
     return <PageLoader variant="screen" />;
   }
 
-  const steps = normalizeSteps(execution.steps);
+  function updateStep(index: number, patch: Partial<ExecutionStepResult>) {
+    setStepResults((current) => {
+      const next = current.map((row, i) => (i === index ? { ...row, ...patch } : row));
+      setStatus(aggregateStepStatus(next));
+      return next;
+    });
+  }
 
   return (
     <div className="min-h-screen bg-[var(--background)]">
@@ -225,20 +282,50 @@ export default function ExecutionDetailPage() {
                 <p className="whitespace-pre-wrap text-[var(--foreground)]">{execution.testData}</p>
               </div>
             )}
-            {steps.length > 0 && (
+            {stepResults.length > 0 && (
               <div>
-                <p className="mb-2 text-xs font-medium uppercase tracking-[0.08em] text-[var(--muted)]">Steps</p>
-                <ol className="space-y-2">
-                  {steps.map((step, index) => (
-                    <li key={`${step.action}-${index}`} className="rounded-lg border border-[var(--border-subtle)] bg-[var(--surface-secondary)] p-3">
-                      <p className="font-medium text-[var(--foreground)]">{index + 1}. {step.action}</p>
-                      {step.expected && <p className="mt-1 text-[var(--muted)]">Expected: {step.expected}</p>}
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <p className="text-xs font-medium uppercase tracking-[0.08em] text-[var(--muted)]">Step execution</p>
+                  <span className="text-xs text-[var(--muted-soft)]">Overall status is derived from the saved step results.</span>
+                </div>
+                <ol className="space-y-3">
+                  {stepResults.map((step, index) => (
+                    <li key={`${step.stepNumber}-${step.action}`} className="rounded-xl border border-[var(--border-subtle)] bg-[var(--surface-secondary)] p-4">
+                      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                        <div className="min-w-0 flex-1">
+                          <p className="font-medium text-[var(--foreground)]">{step.stepNumber}. {step.action}</p>
+                          {step.expectedResult ? <p className="mt-1 text-sm text-[var(--muted)]">Expected: {step.expectedResult}</p> : null}
+                          {step.reportedBy === "automation" ? (
+                            <p className="mt-1 text-[11px] uppercase tracking-wide text-[var(--accent-light)]">Playwright reported</p>
+                          ) : null}
+                        </div>
+                        <Select
+                          value={step.status}
+                          onChange={(e) => updateStep(index, { status: e.target.value as ExecutionStepResult["status"] })}
+                          aria-label={`Step ${step.stepNumber} status`}
+                          className="sm:w-36"
+                        >
+                          {STEP_STATUSES.map((value) => <option key={value} value={value}>{value}</option>)}
+                        </Select>
+                      </div>
+                      <Textarea
+                        value={step.actualResult || ""}
+                        onChange={(e) => updateStep(index, { actualResult: e.target.value })}
+                        rows={2}
+                        className="mt-3"
+                        placeholder="What happened in this step?"
+                      />
+                      {step.errorMessage ? (
+                        <div className="mt-3 rounded-lg border border-[var(--error)]/25 bg-[var(--error-soft)] p-3 text-xs text-[var(--status-fail-text)]">
+                          {step.errorMessage}
+                        </div>
+                      ) : null}
                     </li>
                   ))}
                 </ol>
               </div>
             )}
-            {!execution.description && !execution.preconditions && !execution.testData && steps.length === 0 && (
+            {!execution.description && !execution.preconditions && !execution.testData && stepResults.length === 0 && (
               <p className="text-[var(--muted)]">No additional test case details were captured for this execution.</p>
             )}
           </div>
@@ -265,8 +352,9 @@ export default function ExecutionDetailPage() {
                   <button
                     key={s}
                     type="button"
+                    disabled={stepResults.length > 0}
                     onClick={() => setStatus(s)}
-                    className={`rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors ${colors[s]}`}
+                    className={`rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors ${colors[s]} ${stepResults.length ? "cursor-not-allowed opacity-60" : ""}`}
                   >
                     {s}
                   </button>
@@ -371,7 +459,7 @@ export default function ExecutionDetailPage() {
 
           <div className="h-px bg-[var(--border)]" />
 
-          <ExecutionEvidencePanel cycleId={cycleId} executionId={execution.id} />
+          <ExecutionEvidencePanel cycleId={cycleId} executionId={execution.id} steps={stepResults} />
 
           <div className="flex gap-2 pt-2">
             <Button type="submit" disabled={saving}>

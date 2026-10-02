@@ -2578,6 +2578,36 @@ export async function updateExecution(cycleId: string, executionId: string, data
   await api(`/api/cycles/${cycleId}/executions/${executionId}`, { method: "PATCH", body: data });
 }
 
+export interface ExecutionStepResult {
+  id?: string;
+  projectId?: string;
+  executionId?: string;
+  stepNumber: number;
+  action: string;
+  expectedResult: string;
+  status: "Untested" | "Passed" | "Failed" | "Blocked" | "Skipped";
+  actualResult?: string | null;
+  errorMessage?: string | null;
+  reportedBy?: "human" | "automation";
+  executedBy?: string | null;
+  executedAt?: string | null;
+}
+
+export async function listExecutionSteps(cycleId: string, executionId: string): Promise<ExecutionStepResult[]> {
+  return api(`/api/cycles/${cycleId}/executions/${executionId}/steps`);
+}
+
+export async function saveExecutionSteps(
+  cycleId: string,
+  executionId: string,
+  steps: ExecutionStepResult[]
+): Promise<{ executionId: string; status: string; steps: ExecutionStepResult[] }> {
+  return api(`/api/cycles/${cycleId}/executions/${executionId}/steps`, {
+    method: "PUT",
+    body: { steps },
+  });
+}
+
 export async function bulkAssignExecutions(cycleId: string, data: { executionIds: string[]; assigneeId: string | null }): Promise<{ updated: number; assigneeId: string | null }> {
   return api(`/api/cycles/${cycleId}/executions/bulk-assign`, { method: "POST", body: data });
 }
@@ -3070,12 +3100,122 @@ export async function unlinkQaTicketTestcase(
 export async function requestQaTicketRetest(
   projectId: string,
   ticketRef: string,
-  data: { name?: string; environment?: string; buildVersion?: string } = {}
+  data: { name?: string; description?: string; environment?: string; buildVersion?: string; releaseName?: string } = {}
 ): Promise<unknown> {
   return api(`/api/projects/${projectId}/qa-tickets/${encodeURIComponent(ticketRef)}/retest`, {
     method: "POST",
     body: data,
   });
+}
+
+export interface QaTicketRetest {
+  id: string;
+  ticketId: string;
+  cycleId: string;
+  previousCycleId?: string | null;
+  decision: "pending" | "passed" | "failed" | "blocked";
+  decisionNote?: string | null;
+  runHumanId?: string | null;
+  runName?: string | null;
+  runStatus?: string | null;
+  source?: "manual" | "automation";
+  environment?: string | null;
+  buildVersion?: string | null;
+  releaseName?: string | null;
+  startedAt?: string | null;
+  endedAt?: string | null;
+  total: number;
+  passed: number;
+  failed: number;
+  blocked: number;
+  skipped: number;
+  pending: number;
+  createdAt: string;
+  decidedAt?: string | null;
+}
+
+export interface QaRetestExecutionSnapshot {
+  testcaseId: string;
+  testcaseHumanId?: string | null;
+  testcaseExternalId?: string | null;
+  testcaseTitle: string;
+  executionId: string;
+  status: string;
+  actualResult?: string | null;
+  errorMessage?: string | null;
+  errorStack?: string | null;
+  durationMs?: number | null;
+  retryCount?: number;
+  reportedBy?: string | null;
+  executedAt?: string | null;
+  evidenceCount?: number;
+  stepTotal?: number;
+  stepPassed?: number;
+  stepFailed?: number;
+  stepBlocked?: number;
+}
+
+export interface QaRetestComparisonItem {
+  testcaseId: string;
+  testcaseHumanId?: string | null;
+  testcaseExternalId?: string | null;
+  title: string;
+  change: "new" | "unchanged" | "fixed" | "regressed" | "changed";
+  previous: QaRetestExecutionSnapshot | null;
+  current: QaRetestExecutionSnapshot;
+}
+
+export interface QaRetestComparison {
+  ticket: BugItem;
+  current: QaTicketRetest | null;
+  previous: QaTicketRetest | null;
+  items: QaRetestComparisonItem[];
+}
+
+export interface QaFailureIntelligence extends QaRetestComparison {
+  failures: Array<QaRetestComparisonItem & { steps: ExecutionStepResult[] }>;
+  attention: string[];
+  analysisGuidance: string[];
+}
+
+export async function listQaTicketRetests(projectId: string, ticketRef: string): Promise<QaTicketRetest[]> {
+  return api(`/api/projects/${projectId}/qa-tickets/${encodeURIComponent(ticketRef)}/retests`);
+}
+
+export async function getQaTicketRetestComparison(
+  projectId: string,
+  ticketRef: string,
+  runRef?: string
+): Promise<QaRetestComparison> {
+  const q = runRef ? `?runRef=${encodeURIComponent(runRef)}` : "";
+  return api(`/api/projects/${projectId}/qa-tickets/${encodeURIComponent(ticketRef)}/retest-comparison${q}`);
+}
+
+export async function getQaTicketFailureIntelligence(
+  projectId: string,
+  ticketRef: string,
+  runRef?: string
+): Promise<QaFailureIntelligence> {
+  const q = runRef ? `?runRef=${encodeURIComponent(runRef)}` : "";
+  return api(`/api/projects/${projectId}/qa-tickets/${encodeURIComponent(ticketRef)}/failure-intelligence${q}`);
+}
+
+export async function decideQaTicketRetest(
+  projectId: string,
+  ticketRef: string,
+  runRef: string,
+  data: { decision?: "auto" | "passed" | "failed" | "blocked"; note?: string } = {}
+): Promise<{
+  ticket: BugItem;
+  runId: string;
+  decision: "passed" | "failed" | "blocked";
+  ticketStatus: string;
+  counts: { total: number; passed: number; failed: number; blocked: number; skipped: number };
+}> {
+  return api(
+    `/api/projects/${projectId}/qa-tickets/${encodeURIComponent(ticketRef)}/retests/${encodeURIComponent(runRef)}/decision`,
+    { method: "POST", body: data }
+  );
 }
 
 export async function uploadQaTicketEvidence(
@@ -4263,6 +4403,8 @@ export interface ExecutionEvidence {
   fileName: string;
   fileSize: number | null;
   contentType: string | null;
+  executionStepResultId?: string | null;
+  stepNumber?: number | null;
   createdAt?: string;
 }
 
@@ -4369,12 +4511,14 @@ export function playwrightTraceViewerUrl(traceUrl: string): string {
 export async function uploadExecutionEvidence(
   cycleId: string,
   executionId: string,
-  files: File[]
+  files: File[],
+  stepNumber?: number
 ): Promise<{ list: ExecutionEvidence[]; total: number }> {
   const form = new FormData();
   for (const file of files) form.append("files", file);
   const token = typeof window !== "undefined" ? readStoredValue("token") : null;
-  const res = await fetch(`${API_BASE}/api/cycles/${cycleId}/executions/${executionId}/attachments`, {
+  const stepQuery = stepNumber ? `?stepNumber=${encodeURIComponent(String(stepNumber))}` : "";
+  const res = await fetch(`${API_BASE}/api/cycles/${cycleId}/executions/${executionId}/attachments${stepQuery}`, {
     method: "POST",
     credentials: "include",
     headers: token ? { Authorization: `Bearer ${token}` } : undefined,

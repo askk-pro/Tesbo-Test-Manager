@@ -659,15 +659,36 @@ export class LegacyController {
     return this.legacy.updateExecution(executionId, req.userId, body);
   }
 
+  @Get("/api/cycles/:cycleId/executions/:executionId/steps")
+  listExecutionSteps(
+    @Req() req: AuthenticatedRequest,
+    @Param("cycleId") cycleId: string,
+    @Param("executionId") executionId: string,
+  ) {
+    return this.legacy.listExecutionStepResults(cycleId, executionId, req.userId);
+  }
+
+  @Put("/api/cycles/:cycleId/executions/:executionId/steps")
+  saveExecutionSteps(
+    @Req() req: AuthenticatedRequest,
+    @Param("cycleId") cycleId: string,
+    @Param("executionId") executionId: string,
+    @Body() body: Record<string, any>,
+  ) {
+    return this.legacy.saveExecutionStepResults(cycleId, executionId, req.userId, body || {});
+  }
+
   @Post("/api/cycles/:cycleId/executions/:executionId/attachments")
   @UseInterceptors(FilesInterceptor("files", 10, { limits: { fileSize: LegacyService.KB_MAX_UPLOAD_SIZE } }))
   uploadExecutionAttachments(
     @Req() req: AuthenticatedRequest,
     @Param("cycleId") cycleId: string,
     @Param("executionId") executionId: string,
-    @UploadedFiles() files: Array<{ buffer: Buffer; originalname: string; mimetype: string; size: number }>
+    @UploadedFiles() files: Array<{ buffer: Buffer; originalname: string; mimetype: string; size: number }>,
+    @Query("stepNumber") stepNumber?: string,
   ) {
-    return this.legacy.uploadExecutionAttachments(cycleId, req.userId, executionId, files);
+    const parsedStep = stepNumber === undefined || stepNumber === "" ? undefined : Number(stepNumber);
+    return this.legacy.uploadExecutionAttachments(cycleId, req.userId, executionId, files, parsedStep);
   }
 
   @Get("/api/cycles/:cycleId/executions/:executionId/attachments")
@@ -968,6 +989,46 @@ export class LegacyController {
     @Body() body: Record<string, any>,
   ) {
     return this.legacy.requestTicketRetest(projectId, ticketRef, req.userId, req.userId || null, body);
+  }
+
+  @Get("/api/projects/:projectId/qa-tickets/:ticketRef/retests")
+  listQaTicketRetests(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("ticketRef") ticketRef: string,
+  ) {
+    return this.legacy.listTicketRetests(req.userId, projectId, ticketRef);
+  }
+
+  @Get("/api/projects/:projectId/qa-tickets/:ticketRef/retest-comparison")
+  getQaTicketRetestComparison(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("ticketRef") ticketRef: string,
+    @Query("runRef") runRef?: string,
+  ) {
+    return this.legacy.getTicketRetestComparison(req.userId, projectId, ticketRef, runRef);
+  }
+
+  @Get("/api/projects/:projectId/qa-tickets/:ticketRef/failure-intelligence")
+  getQaTicketFailureIntelligence(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("ticketRef") ticketRef: string,
+    @Query("runRef") runRef?: string,
+  ) {
+    return this.legacy.getTicketFailureIntelligence(req.userId, projectId, ticketRef, runRef);
+  }
+
+  @Post("/api/projects/:projectId/qa-tickets/:ticketRef/retests/:runRef/decision")
+  decideQaTicketRetest(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("ticketRef") ticketRef: string,
+    @Param("runRef") runRef: string,
+    @Body() body: Record<string, any>,
+  ) {
+    return this.legacy.decideTicketRetest(req.userId, projectId, ticketRef, runRef, body || {}, req.userId || null);
   }
 
   @Get("/api/projects/:projectId/qa-tickets/:ticketRef/evidence")

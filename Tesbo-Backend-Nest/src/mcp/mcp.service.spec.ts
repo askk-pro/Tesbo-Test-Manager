@@ -67,6 +67,38 @@ function makeLegacy(overrides: Partial<Record<string, jest.Mock>> = {}) {
       evidence: [],
       analysisGuidance: []
     }),
+    listTicketRetests: jest.fn().mockResolvedValue([
+      { id: "rt-1", cycleId: "cycle-1", runHumanId: "RUN-1", decision: "pending", total: 1, passed: 0, failed: 1, blocked: 0, skipped: 0, pending: 0 }
+    ]),
+    getTicketRetestComparison: jest.fn().mockResolvedValue({
+      ticket: { id: "bug-1", humanId: "QA-1", title: "Bug 1" },
+      current: { cycleId: "cycle-1", runHumanId: "RUN-1" },
+      previous: null,
+      items: []
+    }),
+    getTicketFailureIntelligence: jest.fn().mockResolvedValue({
+      ticket: { id: "bug-1", humanId: "QA-1", title: "Bug 1" },
+      current: { cycleId: "cycle-1", runHumanId: "RUN-1" },
+      previous: null,
+      items: [],
+      failures: [],
+      attention: [],
+      analysisGuidance: []
+    }),
+    listExecutionStepResults: jest.fn().mockResolvedValue([
+      { stepNumber: 1, action: "Open login", status: "Failed", reportedBy: "human" }
+    ]),
+    saveExecutionStepResults: jest.fn().mockResolvedValue({
+      executionId: "ex-1",
+      status: "Failed",
+      steps: [{ stepNumber: 1, action: "Open login", status: "Failed" }]
+    }),
+    decideTicketRetest: jest.fn().mockResolvedValue({
+      ticket: { id: "bug-1", humanId: "QA-1", status: "Reopened" },
+      runId: "cycle-1",
+      decision: "failed",
+      ticketStatus: "Reopened"
+    }),
     linkTicketToRequirement: jest.fn().mockResolvedValue({ ticket: { id: "bug-1", humanId: "QA-1" }, requirements: [] }),
     unlinkTicketFromRequirement: jest.fn().mockResolvedValue({ ticket: { id: "bug-1", humanId: "QA-1" }, requirements: [], wasLinked: true }),
     searchQaReferences: jest.fn().mockResolvedValue({ matches: [{ kind: "ticket", id: "bug-1", humanId: "QA-1", title: "Bug 1" }] }),
@@ -266,6 +298,8 @@ describe("McpService", () => {
           "record_execution_result",
           "list_executions",
           "get_execution",
+          "get_execution_steps",
+          "record_execution_steps",
           "update_execution_result",
           "bulk_record_execution_results",
           "get_test_execution_summary",
@@ -278,6 +312,10 @@ describe("McpService", () => {
           "list_ticket_evidence",
           "attach_ticket_evidence",
           "get_ticket_analysis_context",
+          "list_ticket_retests",
+          "get_ticket_retest_comparison",
+          "get_ticket_failure_intelligence",
+          "decide_ticket_retest",
           "link_ticket_to_requirement",
           "unlink_ticket_from_requirement",
           "search_qa_references",
@@ -2659,6 +2697,118 @@ describe("McpService", () => {
       expect(res.result.isError).toBe(false);
       expect((legacy as any).searchQaReferences).toHaveBeenCalledWith("user-7", "proj-1", "QA-1");
       expect(JSON.parse(res.result.content[0].text).matches[0].humanId).toBe("QA-1");
+    });
+  });
+
+  describe("Phase 3 execution, retest and failure-intelligence MCP tools", () => {
+    it("allows retest comparison and failure intelligence with a read-only token", async () => {
+      const { db } = makeDb();
+      const legacy = makeLegacy();
+      const svc = new McpService(legacy, db);
+      const readOnly = principal({ userId: "user-7", scopes: ["read"] });
+
+      const compare: any = await svc.handleRequest(
+        rpc("tools/call", { name: "get_ticket_retest_comparison", arguments: { ticketRef: "QA-1", runRef: "RUN-1" } }),
+        readOnly,
+        "proj-1"
+      );
+      const intelligence: any = await svc.handleRequest(
+        rpc("tools/call", { name: "get_ticket_failure_intelligence", arguments: { ticketRef: "QA-1" } }),
+        readOnly,
+        "proj-1"
+      );
+
+      expect(compare.result.isError).toBe(false);
+      expect(intelligence.result.isError).toBe(false);
+      expect((legacy as any).getTicketRetestComparison).toHaveBeenCalledWith("user-7", "proj-1", "QA-1", "RUN-1");
+      expect((legacy as any).getTicketFailureIntelligence).toHaveBeenCalledWith("user-7", "proj-1", "QA-1", undefined);
+    });
+
+    it("reads execution steps only after project-scope validation", async () => {
+      const { db } = makeDb({ executionProject: "proj-1", executionCycleId: "cycle-1" });
+      const legacy = makeLegacy();
+      const svc = new McpService(legacy, db);
+      const res: any = await svc.handleRequest(
+        rpc("tools/call", { name: "get_execution_steps", arguments: { executionId: "ex-1" } }),
+        principal({ userId: "user-7", scopes: ["read"] }),
+        "proj-1"
+      );
+      expect(res.result.isError).toBe(false);
+      expect((legacy as any).listExecutionStepResults).toHaveBeenCalledWith("cycle-1", "ex-1", "user-7");
+    });
+
+    it("records execution steps as the MCP actor while authorizing as the token user", async () => {
+      const { db } = makeDb({
+        mcpActorId: "mcp-actor-1",
+        executionProject: "proj-1",
+        executionCycleId: "cycle-1"
+      });
+      const legacy = makeLegacy();
+      const svc = new McpService(legacy, db);
+      const steps = [{ stepNumber: 1, action: "Open login", status: "Failed" }];
+      const res: any = await svc.handleRequest(
+        rpc("tools/call", { name: "record_execution_steps", arguments: { executionId: "ex-1", steps } }),
+        principal({ userId: "user-7" }),
+        "proj-1"
+      );
+      expect(res.result.isError).toBe(false);
+      expect((legacy as any).saveExecutionStepResults).toHaveBeenCalledWith(
+        "cycle-1",
+        "ex-1",
+        "user-7",
+        { steps },
+        "mcp-actor-1"
+      );
+    });
+
+    it("uses the MCP actor for the controlled retest decision", async () => {
+      const { db } = makeDb({ mcpActorId: "mcp-actor-1" });
+      const legacy = makeLegacy();
+      const svc = new McpService(legacy, db);
+      const res: any = await svc.handleRequest(
+        rpc("tools/call", {
+          name: "decide_ticket_retest",
+          arguments: { ticketRef: "QA-1", runRef: "RUN-1", note: "Verified regression" }
+        }),
+        principal({ userId: "user-7" }),
+        "proj-1"
+      );
+      expect(res.result.isError).toBe(false);
+      expect((legacy as any).decideTicketRetest).toHaveBeenCalledWith(
+        "user-7",
+        "proj-1",
+        "QA-1",
+        "RUN-1",
+        { decision: "auto", note: "Verified regression" },
+        "mcp-actor-1"
+      );
+    });
+
+    it("blocks Phase 3 result mutations for a read-only token", async () => {
+      const { db } = makeDb({
+        mcpActorId: "mcp-actor-1",
+        executionProject: "proj-1",
+        executionCycleId: "cycle-1"
+      });
+      const legacy = makeLegacy();
+      const svc = new McpService(legacy, db);
+      const stepWrite: any = await svc.handleRequest(
+        rpc("tools/call", {
+          name: "record_execution_steps",
+          arguments: { executionId: "ex-1", steps: [{ stepNumber: 1, action: "Open", status: "Passed" }] }
+        }),
+        principal({ userId: "user-7", scopes: ["read"] }),
+        "proj-1"
+      );
+      const decision: any = await svc.handleRequest(
+        rpc("tools/call", { name: "decide_ticket_retest", arguments: { ticketRef: "QA-1", runRef: "RUN-1" } }),
+        principal({ userId: "user-7", scopes: ["read"] }),
+        "proj-1"
+      );
+      expect(stepWrite.error.code).toBe(RpcCode.ScopeDenied);
+      expect(decision.error.code).toBe(RpcCode.ScopeDenied);
+      expect((legacy as any).saveExecutionStepResults).not.toHaveBeenCalled();
+      expect((legacy as any).decideTicketRetest).not.toHaveBeenCalled();
     });
   });
 

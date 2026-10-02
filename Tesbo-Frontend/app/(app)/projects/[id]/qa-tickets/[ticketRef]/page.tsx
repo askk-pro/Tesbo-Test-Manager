@@ -41,11 +41,15 @@ import {
   Textarea,
 } from "@/components/ui";
 import { Breadcrumbs, PageHeader, StandardPageLayout } from "@/components/workflows";
+import QaRetestPanel from "@/components/qa/QaRetestPanel";
+import QaFailureIntelligencePanel from "@/components/qa/QaFailureIntelligencePanel";
 
-type Tab = "overview" | "traceability" | "evidence" | "comments" | "activity" | "analysis";
+type Tab = "overview" | "retests" | "failure" | "traceability" | "evidence" | "comments" | "activity" | "analysis";
 
 const TABS: Array<{ id: Tab; label: string; icon: typeof IconRoute }> = [
   { id: "overview", label: "Overview", icon: IconFile },
+  { id: "retests", label: "Retests", icon: IconTestPipe },
+  { id: "failure", label: "Failure intelligence", icon: IconBrain },
   { id: "traceability", label: "Traceability", icon: IconRoute },
   { id: "evidence", label: "Evidence", icon: IconUpload },
   { id: "comments", label: "Comments", icon: IconMessage },
@@ -365,6 +369,14 @@ export default function QaTicketWorkspacePage() {
             </Card>
           </div>
         </div>
+      ) : null}
+
+      {activeTab === "retests" ? (
+        <QaRetestPanel projectId={projectId} ticketRef={humanId} onChanged={load} />
+      ) : null}
+
+      {activeTab === "failure" ? (
+        <QaFailureIntelligencePanel projectId={projectId} ticketRef={humanId} />
       ) : null}
 
       {activeTab === "traceability" ? (

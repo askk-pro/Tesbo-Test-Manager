@@ -76,7 +76,7 @@ jobs:
           })().catch((error) => { console.error(error); process.exit(1); });
           NODE
       - run: npm run migrate
-      - name: Verify QA domain migration and human IDs
+      - name: Verify QA domain migrations, retest lineage and human IDs
         run: node scripts/verify-qa-domain-schema.js
 
   frontend:

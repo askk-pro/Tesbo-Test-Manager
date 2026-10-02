@@ -239,6 +239,12 @@ export class AutomationService {
     await this.legacy.requireProjectAccess(userId, projectId);
     const actorId = (await this.resolveAutomationActorId()) ?? this.requireActor(userId);
 
+    // Validate the optional ticket correlation before creating or mutating a run. A typo in QA-123
+    // must fail without leaving behind an orphan automation run that the reporter cannot use.
+    if (body?.ticketRef) {
+      await this.legacy.resolveTicketRef(projectId, String(body.ticketRef));
+    }
+
     const name = this.boundedString(body?.name, "name", MAX_RUN_NAME_LENGTH);
     if (!name) throw new BadRequestException({ error: "name is required" });
 
@@ -267,6 +273,14 @@ export class AutomationService {
       );
       if (existing.rows[0]) {
         const attached = await this.attachCases(existing.rows[0].id, projectId, caseIds);
+        if (body?.ticketRef) {
+          await this.legacy.correlateRunToTicketRetest(
+            projectId,
+            String(body.ticketRef),
+            existing.rows[0].id,
+            actorId,
+          );
+        }
         return {
           ...(await this.runSummary(existing.rows[0].id)),
           reused: true,
@@ -323,6 +337,14 @@ export class AutomationService {
         );
         if (!raced.rows[0]) throw err;
         const attached = await this.attachCases(raced.rows[0].id, projectId, caseIds);
+        if (body?.ticketRef) {
+          await this.legacy.correlateRunToTicketRetest(
+            projectId,
+            String(body.ticketRef),
+            raced.rows[0].id,
+            actorId,
+          );
+        }
         return {
           ...(await this.runSummary(raced.rows[0].id)),
           reused: true,
@@ -334,6 +356,9 @@ export class AutomationService {
     }
 
     const attached = await this.attachCases(runId, projectId, caseIds);
+    if (body?.ticketRef) {
+      await this.legacy.correlateRunToTicketRetest(projectId, String(body.ticketRef), runId, actorId);
+    }
     await this.legacy.logProjectActivity(projectId, actorId, "automation_run_created", "cycle", runId, name, {
       triggeredBy: triggeredByRaw ?? null,
       branch: this.boundedString(body?.branch, "branch", MAX_BRANCH_LENGTH),
@@ -511,6 +536,9 @@ export class AutomationService {
       throw new NotFoundException({ error: `The result row for case "${caseId}" in this run is no longer available` });
     }
 
+    const stepResults = body?.steps
+      ? await this.legacy.recordAutomationStepResults(projectId, updated.id, actorId, body.steps)
+      : [];
     await this.db.query("UPDATE cycles SET last_result_at = now(), updated_at = now() WHERE id = $1", [runId]);
 
     return {
@@ -519,6 +547,7 @@ export class AutomationService {
       executionId: updated.id,
       status: updated.status,
       retryCount: updated.retry_count,
+      stepResults,
       runClosed: Boolean(run.closed_at)
     };
   }

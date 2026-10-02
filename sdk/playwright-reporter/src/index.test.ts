@@ -161,3 +161,41 @@ test("strict mode fails an untagged suite even when the config is complete", asy
     await assert.rejects(() => reporter.onBegin(fakeConfig, suite), /strict mode/);
   });
 });
+
+test("Phase 3 maps meaningful Playwright steps into governed execution outcomes", () => {
+  const reporter = new TesboReporter() as unknown as {
+    playwrightSteps: (result: unknown) => Array<{
+      stepNumber: number;
+      action: string;
+      status: string;
+      errorMessage?: string;
+    }>;
+  };
+  const steps = reporter.playwrightSteps({
+    steps: [
+      { title: "beforeEach hook", category: "hook" },
+      { title: "Open login page", category: "test.step" },
+      { title: "Expect dashboard", category: "expect", error: { message: "\u001b[31mExpected visible\u001b[39m" } },
+      { title: "browser fixture", category: "fixture" },
+    ],
+  });
+
+  assert.deepEqual(steps, [
+    {
+      stepNumber: 1,
+      action: "Open login page",
+      expectedResult: "",
+      status: "Passed",
+      actualResult: "Step completed",
+      errorMessage: undefined,
+    },
+    {
+      stepNumber: 2,
+      action: "Expect dashboard",
+      expectedResult: "",
+      status: "Failed",
+      actualResult: "Step failed",
+      errorMessage: "Expected visible",
+    },
+  ]);
+});

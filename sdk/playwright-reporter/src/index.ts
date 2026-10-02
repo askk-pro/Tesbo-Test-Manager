@@ -68,6 +68,8 @@ export interface TesboReporterOptions {
   environment?: string;
   buildVersion?: string;
   releaseName?: string;
+  /** Optional QA ticket human id. Defaults to TESBO_TICKET_REF and correlates the run as a ticket retest. */
+  ticketRef?: string;
   /**
    * Fail at collection time if any test lacks a `@tesbo.testId(...)` tag, or if a tagged id does not
    * exist in the project. Off by default: the card asks in §3 for untagged tests to be skipped and
@@ -245,6 +247,7 @@ export default class TesboReporter implements Reporter {
       environment: this.options.environment,
       buildVersion: this.options.buildVersion,
       releaseName: this.options.releaseName,
+      ticketRef: this.options.ticketRef ?? process.env.TESBO_TICKET_REF,
       caseIds
     });
 
@@ -312,7 +315,8 @@ export default class TesboReporter implements Reporter {
           durationMs: result.duration,
           retryCount: result.retry,
           errorMessage: this.errorMessage(result),
-          errorStack: result.error?.stack
+          errorStack: result.error?.stack,
+          steps: this.playwrightSteps(result)
         });
         if (!posted.ok) {
           // 404 is specifically "no such case in this project" — worth counting separately from a
@@ -323,6 +327,36 @@ export default class TesboReporter implements Reporter {
         await this.submitEvidence(client, runId, caseId, result);
       })()
     );
+  }
+
+  /**
+   * Converts Playwright's meaningful test/expect steps into Phase-3 execution step outcomes.
+   * Framework hook/fixture plumbing is excluded so the QA workspace shows what the test did,
+   * not Playwright internals. These are execution observations; the testcase's governed manual
+   * action/expected-result steps remain unchanged.
+   */
+  private playwrightSteps(result: TestResult): NonNullable<ResultBody["steps"]> {
+    const raw = Array.isArray(result.steps) ? result.steps : [];
+    return raw
+      .filter((step) => {
+        const category = String((step as unknown as { category?: string }).category || "").toLowerCase();
+        return category !== "hook" && category !== "fixture";
+      })
+      .map((step, index) => {
+        const item = step as unknown as {
+          title?: string;
+          error?: { message?: string };
+        };
+        const errorMessage = item.error?.message?.replace(ANSI_SGR, "").trim();
+        return {
+          stepNumber: index + 1,
+          action: String(item.title || `Playwright step ${index + 1}`),
+          expectedResult: "",
+          status: errorMessage ? "Failed" as const : "Passed" as const,
+          actualResult: errorMessage ? "Step failed" : "Step completed",
+          errorMessage: errorMessage || undefined
+        };
+      });
   }
 
   /**

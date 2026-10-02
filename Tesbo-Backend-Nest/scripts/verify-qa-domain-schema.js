@@ -21,8 +21,8 @@ async function main() {
     const migration = await scalar(
       "select count(*)::int as count, max(version)::int as max_version from schema_migrations",
     );
-    if (migration.count < 130 || migration.max_version < 130) {
-      throw new Error(`Expected migration 130; got count=${migration.count}, max=${migration.max_version}`);
+    if (migration.count < 131 || migration.max_version < 131) {
+      throw new Error(`Expected migration 131; got count=${migration.count}, max=${migration.max_version}`);
     }
 
     await client.query("BEGIN");
@@ -106,6 +106,51 @@ async function main() {
       [projectId],
     );
 
+    const runOne = await scalar(
+      "select id from cycles where project_id=$1 and human_id='RUN-1'",
+      [projectId],
+    );
+    const tcOne = await scalar(
+      "select id from testcases where project_id=$1 and human_id='TC-1'",
+      [projectId],
+    );
+    const qaOne = await scalar(
+      "select id from bugs where project_id=$1 and human_id='QA-1'",
+      [projectId],
+    );
+
+    const cycleItem = await scalar(
+      `insert into cycle_items (cycle_id, testcase_id, position)
+       values ($1,$2,0)
+       returning id`,
+      [runOne.id, tcOne.id],
+    );
+    const execution = await scalar(
+      `insert into executions (cycle_item_id, status, reported_by)
+       values ($1,'Failed','human')
+       returning id`,
+      [cycleItem.id],
+    );
+    await client.query(
+      `insert into ticket_retests (project_id, ticket_id, cycle_id, decision)
+       values ($1,$2,$3,'pending')`,
+      [projectId, qaOne.id, runOne.id],
+    );
+    const stepResult = await scalar(
+      `insert into execution_step_results
+         (project_id, execution_id, step_number, action, expected_result, status, actual_result, reported_by)
+       values ($1,$2,1,'Open login','Login opens','Failed','HTTP 500','human')
+       returning id`,
+      [projectId, execution.id],
+    );
+    await client.query(
+      `insert into attachments
+         (project_id, entity_type, entity_id, file_name, content_type, file_size, storage_path,
+          evidence_kind, execution_step_result_id)
+       values ($1,'execution',$2,'step-failure.png','image/png',84,'ci/phase3-step.png','screenshot',$3)`,
+      [projectId, execution.id, stepResult.id],
+    );
+
     const comment = await scalar(
       "select count(*)::int as count from ticket_comments where project_id=$1 and source='mcp'",
       [projectId],
@@ -132,9 +177,27 @@ async function main() {
          and a.evidence_kind='screenshot' and a.deleted_at is null`,
       [projectId],
     );
-    if (comment.count !== 1 || link.count !== 1 || ticketRequirement.count !== 1 || ticketEvidence.count !== 1) {
+    const phase3 = await scalar(
+      `select
+         (select count(*)::int from ticket_retests where project_id=$1) as retests,
+         (select count(*)::int from execution_step_results where project_id=$1 and status='Failed') as step_results,
+         (select count(*)::int
+            from attachments a
+            join execution_step_results es on es.id=a.execution_step_result_id
+           where a.project_id=$1 and a.entity_type='execution' and es.step_number=1 and a.deleted_at is null) as step_evidence`,
+      [projectId],
+    );
+    if (
+      comment.count !== 1 ||
+      link.count !== 1 ||
+      ticketRequirement.count !== 1 ||
+      ticketEvidence.count !== 1 ||
+      phase3.retests !== 1 ||
+      phase3.step_results !== 1 ||
+      phase3.step_evidence !== 1
+    ) {
       throw new Error(
-        `QA relation acceptance failed: comments=${comment.count}, requirement_testcases=${link.count}, ticket_requirements=${ticketRequirement.count}, ticket_evidence=${ticketEvidence.count}`,
+        `QA relation acceptance failed: comments=${comment.count}, requirement_testcases=${link.count}, ticket_requirements=${ticketRequirement.count}, ticket_evidence=${ticketEvidence.count}, retests=${phase3.retests}, step_results=${phase3.step_results}, step_evidence=${phase3.step_evidence}`,
       );
     }
 
@@ -162,7 +225,7 @@ async function main() {
     }
 
     await client.query("ROLLBACK");
-    console.log("QA domain schema acceptance passed: migration 130, QA/TC/REQ/RUN IDs, comments, ticket/requirement/test links, evidence, sequence.");
+    console.log("QA domain schema acceptance passed: migration 131, QA/TC/REQ/RUN IDs, retest lineage, step results, step evidence, ticket/requirement/test links, sequence.");
   } catch (error) {
     try {
       await client.query("ROLLBACK");

@@ -6324,6 +6324,16 @@ export class LegacyService implements OnModuleInit {
     if (!testcaseIds.length) {
       throw new BadRequestException({ error: "Ticket has no linked test cases to retest" });
     }
+
+    const previous = await this.db.query<{ cycle_id: string }>(
+      `SELECT cycle_id
+         FROM ticket_retests
+        WHERE project_id = $1 AND ticket_id = $2
+        ORDER BY created_at DESC
+        LIMIT 1`,
+      [projectId, ticketId],
+    );
+
     const run = await this.createCycle(projectId, {
       name: body.name || `Retest ${(ticket as Body).humanId || (ticket as Body).externalId || ticketId}`,
       description: body.description || `Retest requested for ${(ticket as Body).humanId || ticketId}: ${(ticket as Body).title || ""}`,
@@ -6331,7 +6341,34 @@ export class LegacyService implements OnModuleInit {
       buildVersion: body.buildVersion,
       releaseName: body.releaseName,
     });
-    const added = await this.addCycleTestCases((run as Body).id, uid, { testcaseIds });
+    const runId = String((run as Body).id);
+    const added = await this.addCycleTestCases(runId, uid, { testcaseIds });
+
+    await this.db.query(
+      `INSERT INTO ticket_retests
+         (project_id, ticket_id, cycle_id, previous_cycle_id, requested_by)
+       VALUES ($1,$2,$3,$4,$5)
+       ON CONFLICT (ticket_id, cycle_id) DO NOTHING`,
+      [projectId, ticketId, runId, previous.rows[0]?.cycle_id || null, actorId ?? uid],
+    );
+
+    const executions = await this.db.query<{ testcase_id: string; execution_id: string }>(
+      `SELECT ci.testcase_id, e.id AS execution_id
+         FROM cycle_items ci
+         JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
+        WHERE ci.cycle_id = $1 AND ci.deleted_at IS NULL`,
+      [runId],
+    );
+    for (const row of executions.rows) {
+      await this.db.query(
+        `INSERT INTO bug_links (bug_id, testcase_id, cycle_id, execution_id)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT (bug_id, testcase_id, cycle_id) WHERE deleted_at IS NULL
+         DO UPDATE SET execution_id = EXCLUDED.execution_id`,
+        [ticketId, row.testcase_id, runId, row.execution_id],
+      );
+    }
+
     await this.logProjectActivity(
       projectId,
       actorId ?? uid,
@@ -6339,9 +6376,568 @@ export class LegacyService implements OnModuleInit {
       "ticket",
       ticketId,
       `${(ticket as Body).humanId || (ticket as Body).externalId || ticketId} - ${(ticket as Body).title || "Ticket"}`,
-      { runId: (run as Body).id, runHumanId: (run as Body).humanId, testcaseIds, added },
+      {
+        runId,
+        runHumanId: (run as Body).humanId,
+        previousRunId: previous.rows[0]?.cycle_id || null,
+        testcaseIds,
+        added,
+      },
     );
-    return { ticket, run, added };
+    return { ticket: await this.getBug(ticketId), run, added };
+  }
+
+  async correlateRunToTicketRetest(
+    projectId: string,
+    ticketRef: string,
+    runId: string,
+    actorId: string | null,
+  ) {
+    const ticketId = await this.resolveTicketRef(projectId, ticketRef);
+    const run = await this.db.query<{ id: string; human_id: string | null }>(
+      "SELECT id, human_id FROM cycles WHERE id=$1 AND project_id=$2 AND deleted_at IS NULL",
+      [runId, projectId],
+    );
+    if (!run.rows[0]) throw new NotFoundException({ error: "Test run not found" });
+
+    const previous = await this.db.query<{ cycle_id: string }>(
+      `SELECT cycle_id FROM ticket_retests
+        WHERE project_id=$1 AND ticket_id=$2 AND cycle_id <> $3
+        ORDER BY created_at DESC LIMIT 1`,
+      [projectId, ticketId, runId],
+    );
+
+    await this.db.query(
+      `INSERT INTO ticket_retests (project_id,ticket_id,cycle_id,previous_cycle_id,requested_by)
+       VALUES ($1,$2,$3,$4,$5)
+       ON CONFLICT (ticket_id,cycle_id) DO UPDATE SET
+         previous_cycle_id=COALESCE(ticket_retests.previous_cycle_id, EXCLUDED.previous_cycle_id),
+         updated_at=now()`,
+      [projectId, ticketId, runId, previous.rows[0]?.cycle_id || null, actorId],
+    );
+
+    const executions = await this.db.query<{ testcase_id: string; execution_id: string }>(
+      `SELECT ci.testcase_id, e.id AS execution_id
+         FROM cycle_items ci
+         JOIN executions e ON e.cycle_item_id=ci.id AND e.deleted_at IS NULL
+        WHERE ci.cycle_id=$1 AND ci.deleted_at IS NULL`,
+      [runId],
+    );
+    for (const row of executions.rows) {
+      await this.db.query(
+        `INSERT INTO bug_links (bug_id,testcase_id,cycle_id,execution_id)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT (bug_id,testcase_id,cycle_id) WHERE deleted_at IS NULL
+         DO UPDATE SET execution_id=EXCLUDED.execution_id`,
+        [ticketId, row.testcase_id, runId, row.execution_id],
+      );
+    }
+
+    const ticket = await this.getBug(ticketId);
+    await this.logProjectActivity(
+      projectId,
+      actorId,
+      "automation_retest_correlated",
+      "ticket",
+      ticketId,
+      `${(ticket as Body).humanId || (ticket as Body).externalId || ticketId} - ${(ticket as Body).title || "Ticket"}`,
+      {
+        runId,
+        runHumanId: run.rows[0].human_id,
+        previousRunId: previous.rows[0]?.cycle_id || null,
+        executionCount: executions.rows.length,
+      },
+    );
+    return { ticketId, runId, executionCount: executions.rows.length };
+  }
+
+  // ── Phase 3: execution steps, retest lifecycle and failure intelligence ─────────────────────
+
+  private normalizeExecutionStepRows(raw: unknown): Body[] {
+    const items = normalizeJsonArray(raw);
+    return items.map((item: Body, index) => {
+      const stepNumber = Number(item.stepNumber ?? item.step ?? index + 1);
+      if (!Number.isInteger(stepNumber) || stepNumber <= 0) {
+        throw new BadRequestException({ error: "stepNumber must be a positive integer" });
+      }
+      const status = String(item.status || "Untested").trim();
+      const allowed = ["Untested", "Passed", "Failed", "Blocked", "Skipped"];
+      if (!allowed.includes(status)) {
+        throw new BadRequestException({ error: `step status must be one of: ${allowed.join(", ")}` });
+      }
+      return {
+        stepNumber,
+        action: String(item.action || item.title || ""),
+        expectedResult: String(item.expectedResult || item.expected || ""),
+        status,
+        actualResult: item.actualResult == null ? null : String(item.actualResult),
+        errorMessage: item.errorMessage == null ? null : String(item.errorMessage),
+      };
+    });
+  }
+
+  async listExecutionStepResults(
+    cycleId: string,
+    executionId: string,
+    userId: string | null | undefined,
+  ) {
+    const uid = this.requireUser(userId);
+    const owner = await this.executionOwner(cycleId, executionId);
+    await this.requireProjectAccess(uid, String(owner.project_id));
+    const res = await this.db.query(
+      `SELECT id, project_id, execution_id, step_number, action, expected_result, status,
+              actual_result, error_message, reported_by, executed_by, executed_at, created_at, updated_at
+         FROM execution_step_results
+        WHERE execution_id = $1
+        ORDER BY step_number`,
+      [executionId],
+    );
+    return res.rows.map(toCamel);
+  }
+
+  async saveExecutionStepResults(
+    cycleId: string,
+    executionId: string,
+    userId: string | null | undefined,
+    body: Body,
+    auditActorId?: string | null,
+  ) {
+    const uid = this.requireUser(userId);
+    const writerActorId = auditActorId ?? uid;
+    const owner = await this.executionOwner(cycleId, executionId);
+    const projectId = String(owner.project_id);
+    await this.requireProjectAccess(uid, projectId);
+    const rows = this.normalizeExecutionStepRows(body.steps);
+    if (!rows.length) throw new BadRequestException({ error: "steps is required" });
+
+    for (const row of rows) {
+      await this.db.query(
+        `INSERT INTO execution_step_results
+           (project_id, execution_id, step_number, action, expected_result, status,
+            actual_result, error_message, reported_by, executed_by, executed_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'human',$9,CASE WHEN $6='Untested' THEN NULL ELSE now() END)
+         ON CONFLICT (execution_id, step_number)
+         DO UPDATE SET
+           action = EXCLUDED.action,
+           expected_result = EXCLUDED.expected_result,
+           status = EXCLUDED.status,
+           actual_result = EXCLUDED.actual_result,
+           error_message = EXCLUDED.error_message,
+           reported_by = 'human',
+           executed_by = EXCLUDED.executed_by,
+           executed_at = EXCLUDED.executed_at,
+           updated_at = now()`,
+        [
+          projectId,
+          executionId,
+          row.stepNumber,
+          row.action,
+          row.expectedResult,
+          row.status,
+          row.actualResult,
+          row.errorMessage,
+          writerActorId,
+        ],
+      );
+    }
+
+    const summary = await this.db.query<Record<string, number>>(
+      `SELECT
+         COUNT(*)::int AS total,
+         COUNT(*) FILTER (WHERE status='Passed')::int AS passed,
+         COUNT(*) FILTER (WHERE status='Failed')::int AS failed,
+         COUNT(*) FILTER (WHERE status='Blocked')::int AS blocked,
+         COUNT(*) FILTER (WHERE status='Skipped')::int AS skipped,
+         COUNT(*) FILTER (WHERE status='Untested')::int AS untested
+       FROM execution_step_results WHERE execution_id = $1`,
+      [executionId],
+    );
+    const counts = summary.rows[0] || {};
+    const total = Number(counts.total || 0);
+    let aggregate = "Untested";
+    if (Number(counts.failed || 0) > 0) aggregate = "Failed";
+    else if (Number(counts.blocked || 0) > 0) aggregate = "Blocked";
+    else if (total > 0 && Number(counts.untested || 0) === 0) {
+      aggregate = Number(counts.skipped || 0) === total ? "Skipped" : "Passed";
+    }
+
+    await this.db.query(
+      `UPDATE executions
+          SET status = $2,
+              executed_at = CASE WHEN $2='Untested' THEN executed_at ELSE now() END,
+              executed_by = $3,
+              reported_by = 'human',
+              updated_at = now()
+        WHERE id = $1 AND deleted_at IS NULL`,
+      [executionId, aggregate, writerActorId],
+    );
+    await this.logProjectActivity(projectId, writerActorId, "execution_steps_updated", "execution", executionId, null, {
+      aggregateStatus: aggregate,
+      counts: {
+        total,
+        passed: Number(counts.passed || 0),
+        failed: Number(counts.failed || 0),
+        blocked: Number(counts.blocked || 0),
+        skipped: Number(counts.skipped || 0),
+        untested: Number(counts.untested || 0),
+      },
+    });
+
+    return {
+      executionId,
+      status: aggregate,
+      steps: await this.listExecutionStepResults(cycleId, executionId, uid),
+    };
+  }
+
+  async recordAutomationStepResults(
+    projectId: string,
+    executionId: string,
+    actorId: string | null,
+    rawSteps: unknown,
+  ) {
+    const rows = this.normalizeExecutionStepRows(rawSteps);
+    if (!rows.length) return [];
+    const execution = await this.db.query(
+      `SELECT e.id
+         FROM executions e
+         JOIN cycle_items ci ON ci.id=e.cycle_item_id
+         JOIN cycles c ON c.id=ci.cycle_id
+        WHERE e.id=$1 AND c.project_id=$2 AND e.deleted_at IS NULL AND c.deleted_at IS NULL`,
+      [executionId, projectId],
+    );
+    if (!execution.rows[0]) throw new NotFoundException({ error: "Execution not found" });
+
+    for (const row of rows) {
+      await this.db.query(
+        `INSERT INTO execution_step_results
+           (project_id, execution_id, step_number, action, expected_result, status,
+            actual_result, error_message, reported_by, executed_by, executed_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'automation',$9,CASE WHEN $6='Untested' THEN NULL ELSE now() END)
+         ON CONFLICT (execution_id, step_number)
+         DO UPDATE SET
+           action = EXCLUDED.action,
+           expected_result = EXCLUDED.expected_result,
+           status = EXCLUDED.status,
+           actual_result = EXCLUDED.actual_result,
+           error_message = EXCLUDED.error_message,
+           reported_by = 'automation',
+           executed_by = EXCLUDED.executed_by,
+           executed_at = EXCLUDED.executed_at,
+           updated_at = now()`,
+        [
+          projectId,
+          executionId,
+          row.stepNumber,
+          row.action,
+          row.expectedResult,
+          row.status,
+          row.actualResult,
+          row.errorMessage,
+          actorId,
+        ],
+      );
+    }
+    const res = await this.db.query(
+      `SELECT id, step_number, action, expected_result, status, actual_result, error_message,
+              reported_by, executed_at
+         FROM execution_step_results
+        WHERE execution_id=$1
+        ORDER BY step_number`,
+      [executionId],
+    );
+    return res.rows.map(toCamel);
+  }
+
+  async listTicketRetests(
+    userId: string | null | undefined,
+    projectId: string,
+    ticketRef: string,
+  ) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const ticketId = await this.resolveTicketRef(projectId, ticketRef);
+    const res = await this.db.query(
+      `SELECT tr.id, tr.ticket_id, tr.cycle_id, tr.previous_cycle_id, tr.decision, tr.decision_note,
+              tr.requested_by, tr.decided_by, tr.decided_at, tr.created_at, tr.updated_at,
+              c.human_id AS run_human_id, c.name AS run_name, c.status AS run_status,
+              c.source, c.environment, c.build_version, c.release_name, c.started_at, c.ended_at,
+              COALESCE(counts.total,0)::int AS total,
+              COALESCE(counts.passed,0)::int AS passed,
+              COALESCE(counts.failed,0)::int AS failed,
+              COALESCE(counts.blocked,0)::int AS blocked,
+              COALESCE(counts.skipped,0)::int AS skipped,
+              COALESCE(counts.pending,0)::int AS pending
+         FROM ticket_retests tr
+         JOIN cycles c ON c.id=tr.cycle_id AND c.deleted_at IS NULL
+         LEFT JOIN LATERAL (
+           SELECT COUNT(*)::int AS total,
+                  COUNT(*) FILTER (WHERE e.status='Passed')::int AS passed,
+                  COUNT(*) FILTER (WHERE e.status='Failed')::int AS failed,
+                  COUNT(*) FILTER (WHERE e.status='Blocked')::int AS blocked,
+                  COUNT(*) FILTER (WHERE e.status='Skipped')::int AS skipped,
+                  COUNT(*) FILTER (WHERE e.status IN ('Untested','Retest'))::int AS pending
+             FROM cycle_items ci
+             JOIN executions e ON e.cycle_item_id=ci.id AND e.deleted_at IS NULL
+            WHERE ci.cycle_id=c.id AND ci.deleted_at IS NULL
+         ) counts ON true
+        WHERE tr.project_id=$1 AND tr.ticket_id=$2
+        ORDER BY tr.created_at DESC`,
+      [projectId, ticketId],
+    );
+    return res.rows.map(toCamel);
+  }
+
+  private async cycleExecutionComparisonRows(projectId: string, cycleId: string | null) {
+    if (!cycleId) return [];
+    const res = await this.db.query(
+      `SELECT ci.testcase_id, t.human_id AS testcase_human_id,
+              COALESCE(NULLIF(ci.snapshot_external_id,''), t.external_id) AS testcase_external_id,
+              COALESCE(NULLIF(ci.snapshot_title,''), t.title, 'Untitled test case') AS testcase_title,
+              e.id AS execution_id, e.status, e.actual_result, e.error_message, e.error_stack,
+              e.duration_ms, e.retry_count, e.reported_by, e.executed_at,
+              COALESCE(ev.count,0)::int AS evidence_count,
+              COALESCE(steps.total,0)::int AS step_total,
+              COALESCE(steps.passed,0)::int AS step_passed,
+              COALESCE(steps.failed,0)::int AS step_failed,
+              COALESCE(steps.blocked,0)::int AS step_blocked
+         FROM cycle_items ci
+         JOIN cycles c ON c.id=ci.cycle_id AND c.project_id=$2 AND c.deleted_at IS NULL
+         JOIN executions e ON e.cycle_item_id=ci.id AND e.deleted_at IS NULL
+         LEFT JOIN testcases t ON t.id=ci.testcase_id
+         LEFT JOIN LATERAL (
+           SELECT COUNT(*) AS count FROM attachments a
+            WHERE a.entity_type='execution' AND a.entity_id=e.id AND a.deleted_at IS NULL
+         ) ev ON true
+         LEFT JOIN LATERAL (
+           SELECT COUNT(*)::int AS total,
+                  COUNT(*) FILTER (WHERE status='Passed')::int AS passed,
+                  COUNT(*) FILTER (WHERE status='Failed')::int AS failed,
+                  COUNT(*) FILTER (WHERE status='Blocked')::int AS blocked
+             FROM execution_step_results es
+            WHERE es.execution_id=e.id
+         ) steps ON true
+        WHERE ci.cycle_id=$1 AND ci.deleted_at IS NULL
+        ORDER BY ci.position, ci.created_at`,
+      [cycleId, projectId],
+    );
+    return res.rows.map(toCamel);
+  }
+
+  async getTicketRetestComparison(
+    userId: string | null | undefined,
+    projectId: string,
+    ticketRef: string,
+    runRef?: string,
+  ) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const ticketId = await this.resolveTicketRef(projectId, ticketRef);
+    const retests = await this.listTicketRetests(uid, projectId, ticketId);
+    if (!retests.length) return { ticket: await this.getBug(ticketId), current: null, previous: null, items: [] };
+
+    const currentRunId = runRef ? await this.resolveRunRef(projectId, runRef) : String((retests[0] as Body).cycleId);
+    const current = (retests as Body[]).find((item) => String(item.cycleId) === currentRunId);
+    if (!current) throw new NotFoundException({ error: "Retest run not found for this ticket" });
+    const previousRunId = current.previousCycleId ? String(current.previousCycleId) : null;
+    const previous = previousRunId
+      ? (retests as Body[]).find((item) => String(item.cycleId) === previousRunId) || null
+      : null;
+
+    const [currentRows, previousRows] = await Promise.all([
+      this.cycleExecutionComparisonRows(projectId, currentRunId),
+      this.cycleExecutionComparisonRows(projectId, previousRunId),
+    ]);
+    const prior = new Map((previousRows as Body[]).map((row) => [String(row.testcaseId), row]));
+
+    const items = (currentRows as Body[]).map((row) => {
+      const before = prior.get(String(row.testcaseId)) || null;
+      const beforeStatus = String(before?.status || "");
+      const afterStatus = String(row.status || "");
+      let change = before ? "unchanged" : "new";
+      if (before && ["Failed", "Blocked"].includes(beforeStatus) && afterStatus === "Passed") change = "fixed";
+      else if (before && beforeStatus === "Passed" && ["Failed", "Blocked"].includes(afterStatus)) change = "regressed";
+      else if (before && beforeStatus !== afterStatus) change = "changed";
+      return {
+        testcaseId: row.testcaseId,
+        testcaseHumanId: row.testcaseHumanId,
+        testcaseExternalId: row.testcaseExternalId,
+        title: row.testcaseTitle,
+        change,
+        previous: before,
+        current: row,
+      };
+    });
+
+    return { ticket: await this.getBug(ticketId), current, previous, items };
+  }
+
+  async getTicketFailureIntelligence(
+    userId: string | null | undefined,
+    projectId: string,
+    ticketRef: string,
+    runRef?: string,
+  ) {
+    const comparison = await this.getTicketRetestComparison(userId, projectId, ticketRef, runRef);
+    if (!comparison.current) {
+      return {
+        ...comparison,
+        failures: [],
+        attention: ["No retest run exists for this ticket."],
+        analysisGuidance: ["Do not infer a failure cause without a retest result."],
+      };
+    }
+
+    const failures = (comparison.items as Body[]).filter((item) =>
+      ["Failed", "Blocked"].includes(String(item.current?.status || "")),
+    );
+    const executionIds = failures.map((item) => String(item.current.executionId)).filter(Boolean);
+    const detail = executionIds.length
+      ? await this.db.query(
+          `SELECT es.execution_id, es.step_number, es.action, es.expected_result, es.status,
+                  es.actual_result, es.error_message, es.reported_by, es.executed_at
+             FROM execution_step_results es
+            WHERE es.execution_id = ANY($1::uuid[])
+            ORDER BY es.execution_id, es.step_number`,
+          [executionIds],
+        )
+      : { rows: [] as Body[] };
+
+    const stepsByExecution = new Map<string, Body[]>();
+    for (const raw of detail.rows) {
+      const row = toCamel(raw) as Body;
+      const key = String(row.executionId);
+      const list = stepsByExecution.get(key) || [];
+      list.push(row);
+      stepsByExecution.set(key, list);
+    }
+
+    const enriched = failures.map((item) => ({
+      ...item,
+      steps: stepsByExecution.get(String(item.current.executionId)) || [],
+    }));
+    const attention: string[] = [];
+    for (const item of enriched as Body[]) {
+      if (!Number(item.current?.evidenceCount || 0)) {
+        attention.push(`${item.testcaseHumanId || item.testcaseExternalId || item.title}: failed/blocked without evidence.`);
+      }
+      if (!normalizeJsonArray(item.steps).length) {
+        attention.push(`${item.testcaseHumanId || item.testcaseExternalId || item.title}: no step-level results were recorded.`);
+      }
+    }
+
+    return {
+      ...comparison,
+      failures: enriched,
+      attention,
+      analysisGuidance: [
+        "Separate observed facts from hypotheses.",
+        "Use current-vs-previous run changes before proposing regression causes.",
+        "Treat root cause as unknown unless logs, traces, screenshots, step errors or run metadata support it.",
+        "Do not recommend ticket closure unless the governed retest decision evaluates to passed.",
+      ],
+    };
+  }
+
+  async decideTicketRetest(
+    userId: string | null | undefined,
+    projectId: string,
+    ticketRef: string,
+    runRef: string,
+    body: Body = {},
+    auditActorId?: string | null,
+  ) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const ticketId = await this.resolveTicketRef(projectId, ticketRef);
+    const runId = await this.resolveRunRef(projectId, runRef);
+
+    const relation = await this.db.query(
+      `SELECT id FROM ticket_retests
+        WHERE project_id=$1 AND ticket_id=$2 AND cycle_id=$3`,
+      [projectId, ticketId, runId],
+    );
+    if (!relation.rows[0]) throw new NotFoundException({ error: "Retest run not found for this ticket" });
+
+    const countsRes = await this.db.query<Record<string, number>>(
+      `SELECT COUNT(*)::int AS total,
+              COUNT(*) FILTER (WHERE e.status='Passed')::int AS passed,
+              COUNT(*) FILTER (WHERE e.status='Failed')::int AS failed,
+              COUNT(*) FILTER (WHERE e.status='Blocked')::int AS blocked,
+              COUNT(*) FILTER (WHERE e.status='Skipped')::int AS skipped,
+              COUNT(*) FILTER (WHERE e.status IN ('Untested','Retest'))::int AS pending
+         FROM cycle_items ci
+         JOIN executions e ON e.cycle_item_id=ci.id AND e.deleted_at IS NULL
+        WHERE ci.cycle_id=$1 AND ci.deleted_at IS NULL`,
+      [runId],
+    );
+    const counts = countsRes.rows[0] || {};
+    const total = Number(counts.total || 0);
+    const pending = Number(counts.pending || 0);
+    if (!total) throw new ConflictException({ error: "Retest run has no executions" });
+    if (pending > 0) {
+      throw new ConflictException({ error: "Retest run is not complete; Untested/Retest executions remain" });
+    }
+
+    let computed: "passed" | "failed" | "blocked";
+    if (Number(counts.failed || 0) > 0) computed = "failed";
+    else if (Number(counts.blocked || 0) > 0 || Number(counts.skipped || 0) > 0) computed = "blocked";
+    else computed = "passed";
+
+    const requested = body.decision && body.decision !== "auto" ? String(body.decision).toLowerCase() : computed;
+    if (!["passed", "failed", "blocked"].includes(requested)) {
+      throw new BadRequestException({ error: "decision must be one of: auto, passed, failed, blocked" });
+    }
+    if (requested !== computed) {
+      throw new ConflictException({
+        error: `Requested decision "${requested}" conflicts with stored retest results; computed decision is "${computed}"`,
+      });
+    }
+
+    await this.db.query(
+      `UPDATE ticket_retests
+          SET decision=$4, decision_note=$5, decided_by=$6, decided_at=now(), updated_at=now()
+        WHERE project_id=$1 AND ticket_id=$2 AND cycle_id=$3`,
+      [
+        projectId,
+        ticketId,
+        runId,
+        computed,
+        body.note == null ? null : String(body.note),
+        auditActorId ?? uid,
+      ],
+    );
+    await this.db.query(
+      `UPDATE cycles SET status='Completed', ended_at=COALESCE(ended_at,now()), updated_at=now()
+        WHERE id=$1 AND deleted_at IS NULL`,
+      [runId],
+    );
+
+    const targetStatus = computed === "passed" ? "Closed" : "Reopened";
+    const ticket = await this.updateBug(uid, ticketId, { status: targetStatus }, auditActorId ?? uid);
+    await this.logProjectActivity(
+      projectId,
+      auditActorId ?? uid,
+      "ticket_retest_decided",
+      "ticket",
+      ticketId,
+      `${(ticket as Body).humanId || (ticket as Body).externalId || ticketId} - ${(ticket as Body).title || "Ticket"}`,
+      { runId, decision: computed, ticketStatus: targetStatus, counts },
+    );
+
+    return {
+      ticket,
+      runId,
+      decision: computed,
+      ticketStatus: targetStatus,
+      counts: {
+        total,
+        passed: Number(counts.passed || 0),
+        failed: Number(counts.failed || 0),
+        blocked: Number(counts.blocked || 0),
+        skipped: Number(counts.skipped || 0),
+      },
+    };
   }
 
   async resolveRequirementRef(projectId: string, requirementRef: string): Promise<string> {
@@ -7867,7 +8463,8 @@ export class LegacyService implements OnModuleInit {
     cycleId: string,
     actorId: string | null | undefined,
     executionId: string,
-    files: Array<{ buffer: Buffer; originalname: string; mimetype: string; size: number }>
+    files: Array<{ buffer: Buffer; originalname: string; mimetype: string; size: number }>,
+    stepNumber?: number,
   ) {
     const uid = this.requireUser(actorId);
     if (!files || files.length === 0) throw new BadRequestException({ error: "No files were uploaded" });
@@ -7877,6 +8474,23 @@ export class LegacyService implements OnModuleInit {
     // into that project, so the caller has to be a member of it.
     await this.requireProjectAccess(uid, projectId);
     LegacyService.assertValidEvidenceFiles(files);
+
+    let stepResultId: string | null = null;
+    if (stepNumber !== undefined) {
+      if (!Number.isInteger(stepNumber) || stepNumber <= 0) {
+        throw new BadRequestException({ error: "stepNumber must be a positive integer" });
+      }
+      const step = await this.db.query<{ id: string }>(
+        `SELECT id FROM execution_step_results
+          WHERE project_id=$1 AND execution_id=$2 AND step_number=$3`,
+        [projectId, executionId, stepNumber],
+      );
+      if (!step.rows[0]) {
+        throw new NotFoundException({ error: `Execution step ${stepNumber} not found` });
+      }
+      stepResultId = step.rows[0].id;
+    }
+
     await this.planLimits.assertStorageAvailable(
       execution.organization_id,
       files.reduce((sum, file) => sum + file.size, 0)
@@ -7888,14 +8502,16 @@ export class LegacyService implements OnModuleInit {
       const storageKey = `executions/${projectId}/${executionId}/${randomUUID()}${ext ? `.${ext}` : ""}`;
       await this.storage.put(storageKey, file.buffer, file.mimetype);
       const res = await this.db.query(
-        `INSERT INTO attachments (project_id, entity_type, entity_id, file_name, content_type, file_size, storage_path, uploaded_by)
-         VALUES ($1, 'execution', $2, $3, $4, $5, $6, $7) RETURNING *`,
-        [projectId, executionId, LegacyService.displayFileName(file.originalname), file.mimetype, file.size, storageKey, uid]
+        `INSERT INTO attachments
+           (project_id, entity_type, entity_id, file_name, content_type, file_size, storage_path, uploaded_by, execution_step_result_id)
+         VALUES ($1, 'execution', $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+        [projectId, executionId, LegacyService.displayFileName(file.originalname), file.mimetype, file.size, storageKey, uid, stepResultId]
       );
       created.push(toCamel(res.rows[0]));
     }
     await this.logProjectActivity(projectId, uid, "execution_evidence_uploaded", "execution", executionId, null, {
-      files: created.map((file) => ({ id: file.id, fileName: file.fileName }))
+      files: created.map((file) => ({ id: file.id, fileName: file.fileName })),
+      stepNumber: stepNumber ?? null
     });
     return { list: created, total: created.length };
   }
@@ -8036,9 +8652,12 @@ export class LegacyService implements OnModuleInit {
     // Columns are listed rather than SELECT *: storage_path is an internal storage key that no
     // client needs and that shouldn't travel out of the backend.
     const res = await this.db.query(
-      `SELECT id, project_id, entity_type, entity_id, file_name, content_type, file_size, uploaded_by,
-              evidence_kind, created_at
-       FROM attachments WHERE entity_type = 'execution' AND entity_id = $1 AND deleted_at IS NULL ORDER BY created_at`,
+      `SELECT a.id, a.project_id, a.entity_type, a.entity_id, a.file_name, a.content_type, a.file_size, a.uploaded_by,
+              a.evidence_kind, a.execution_step_result_id, es.step_number, a.created_at
+         FROM attachments a
+         LEFT JOIN execution_step_results es ON es.id = a.execution_step_result_id
+        WHERE a.entity_type = 'execution' AND a.entity_id = $1 AND a.deleted_at IS NULL
+        ORDER BY a.created_at`,
       [executionId]
     );
     return { list: res.rows.map(toCamel), total: res.rowCount };

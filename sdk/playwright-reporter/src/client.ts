@@ -33,6 +33,8 @@ export interface CreateRunBody {
   environment?: string;
   buildVersion?: string;
   releaseName?: string;
+  /** Optional QA ticket human id (for example QA-184). Correlates this automation run as a governed retest. */
+  ticketRef?: string;
   caseIds?: string[];
 }
 
@@ -43,6 +45,14 @@ export interface ResultBody {
   retryCount?: number;
   errorMessage?: string;
   errorStack?: string;
+  steps?: Array<{
+    stepNumber: number;
+    action: string;
+    expectedResult?: string;
+    status: "Untested" | "Passed" | "Failed" | "Blocked" | "Skipped";
+    actualResult?: string;
+    errorMessage?: string;
+  }>;
 }
 
 /** What a call produced: `ok` with data, or a failure that has already been logged. */

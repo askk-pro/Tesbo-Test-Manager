@@ -998,6 +998,70 @@ export function buildMcpTools(): McpTool[] {
       }
     },
     {
+      name: "get_execution_steps",
+      description:
+        "List step-level outcomes for one execution in the token project. Required: executionId. Returns manual or Playwright-reported step status, actual result, error, reporter and timestamps.",
+      requiredScope: "read",
+      inputSchema: {
+        type: "object",
+        properties: { executionId: { type: "string" } },
+        required: ["executionId"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) => {
+        const executionId = requireString(args, "executionId");
+        const { cycleId } = await requireExecutionOwner(ctx, executionId);
+        return {
+          executionId,
+          steps: await ctx.legacy.listExecutionStepResults(cycleId, executionId, ctx.userId)
+        };
+      }
+    },
+    {
+      name: "record_execution_steps",
+      description:
+        "Record governed step-level results for one execution. Required: executionId, steps. Each step has stepNumber, action, status and optional expectedResult, actualResult, errorMessage. The overall execution status is derived from the steps; it cannot contradict them.",
+      requiredScope: "write",
+      inputSchema: {
+        type: "object",
+        properties: {
+          executionId: { type: "string" },
+          steps: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                stepNumber: { type: "number" },
+                action: { type: "string" },
+                expectedResult: { type: "string" },
+                status: { type: "string", enum: ["Untested", "Passed", "Failed", "Blocked", "Skipped"] },
+                actualResult: { type: "string" },
+                errorMessage: { type: "string" }
+              },
+              required: ["stepNumber", "action", "status"],
+              additionalProperties: false
+            }
+          }
+        },
+        required: ["executionId", "steps"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) => {
+        const executionId = requireString(args, "executionId");
+        const { cycleId } = await requireExecutionOwner(ctx, executionId);
+        if (!Array.isArray(args.steps) || !args.steps.length) {
+          throw new McpError(RpcCode.ToolExecutionError, '"steps" must be a non-empty array');
+        }
+        return ctx.legacy.saveExecutionStepResults(
+          cycleId,
+          executionId,
+          ctx.userId,
+          { steps: args.steps },
+          ctx.actorId
+        );
+      }
+    },
+    {
       name: "update_execution_result",
       description:
         "Update an execution's result in the token's project — every field the app's own Test Run screen exposes for it: status (Untested/Passed/Failed/Blocked/Skipped/Retest), actualResult, defectKey, defectUrl (defectKey/defectUrl are cleared automatically the moment status is set to anything other than Failed, matching the app), assigneeId (must already be a member of this project; pass null or \"\" to unassign). Required: executionId; every other field is optional and omitting one leaves it unchanged. Attributed to the token's owning user, not the MCP agent actor — see record_execution_result's handler comment for why.",
@@ -1401,6 +1465,89 @@ export function buildMcpTools(): McpTool[] {
       },
       handler: async (args, ctx) =>
         ctx.legacy.getTicketAnalysisContext(ctx.userId, ctx.projectId, requireString(args, "ticketRef"))
+    },
+    {
+      name: "list_ticket_retests",
+      description:
+        "List governed retest runs for a QA ticket newest-first, including RUN id, manual/automation source, result counts, previous-run lineage and decision state. Required: ticketRef.",
+      requiredScope: "read",
+      inputSchema: {
+        type: "object",
+        properties: { ticketRef: { type: "string" } },
+        required: ["ticketRef"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) =>
+        ctx.legacy.listTicketRetests(ctx.userId, ctx.projectId, requireString(args, "ticketRef"))
+    },
+    {
+      name: "get_ticket_retest_comparison",
+      description:
+        "Compare a governed ticket retest against its previous governed retest, testcase by testcase. Returns fixed/regressed/changed/unchanged/new classification plus execution, step and evidence counts. Required: ticketRef. Optional: runRef; defaults to the latest retest.",
+      requiredScope: "read",
+      inputSchema: {
+        type: "object",
+        properties: {
+          ticketRef: { type: "string" },
+          runRef: { type: "string" }
+        },
+        required: ["ticketRef"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) =>
+        ctx.legacy.getTicketRetestComparison(
+          ctx.userId,
+          ctx.projectId,
+          requireString(args, "ticketRef"),
+          typeof args.runRef === "string" && args.runRef.trim() ? args.runRef : undefined
+        )
+    },
+    {
+      name: "get_ticket_failure_intelligence",
+      description:
+        "Return evidence-first failure intelligence for a ticket retest: previous/current comparison, Failed/Blocked executions, step outcomes, errors, evidence counts, attention flags and analysis guidance. It does not claim a root cause unless evidence supports one. Required: ticketRef. Optional: runRef.",
+      requiredScope: "read",
+      inputSchema: {
+        type: "object",
+        properties: {
+          ticketRef: { type: "string" },
+          runRef: { type: "string" }
+        },
+        required: ["ticketRef"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) =>
+        ctx.legacy.getTicketFailureIntelligence(
+          ctx.userId,
+          ctx.projectId,
+          requireString(args, "ticketRef"),
+          typeof args.runRef === "string" && args.runRef.trim() ? args.runRef : undefined
+        )
+    },
+    {
+      name: "decide_ticket_retest",
+      description:
+        "Evaluate a completed governed retest using its stored execution results. Required: ticketRef, runRef. Optional: note. The server computes Passed/Failed/Blocked; callers cannot override it. Passed closes the ticket, Failed/Blocked reopens it. Refuses incomplete runs.",
+      requiredScope: "write",
+      inputSchema: {
+        type: "object",
+        properties: {
+          ticketRef: { type: "string" },
+          runRef: { type: "string" },
+          note: { type: "string" }
+        },
+        required: ["ticketRef", "runRef"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) =>
+        ctx.legacy.decideTicketRetest(
+          ctx.userId,
+          ctx.projectId,
+          requireString(args, "ticketRef"),
+          requireString(args, "runRef"),
+          { decision: "auto", note: typeof args.note === "string" ? args.note : undefined },
+          ctx.actorId
+        )
     },
     {
       name: "link_ticket_to_requirement",

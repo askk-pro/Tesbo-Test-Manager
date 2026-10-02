@@ -18,6 +18,7 @@ import {
   uploadExecutionEvidence,
   type EvidenceKind,
   type ExecutionEvidence,
+  type ExecutionStepResult,
 } from "@/lib/api";
 import {
   EVIDENCE_ACCEPT_ATTRIBUTE,
@@ -83,11 +84,13 @@ interface Props {
   executionId: string;
   /** Hides the upload control on screens where the caller is read-only (a closed automated run). */
   readOnly?: boolean;
+  /** Optional Phase-3 step results. When supplied, human evidence can be scoped to one step. */
+  steps?: ExecutionStepResult[];
   /** Lets the parent keep its own row badge in step after an upload. */
   onCountChange?: (count: number) => void;
 }
 
-export default function ExecutionEvidencePanel({ cycleId, executionId, readOnly, onCountChange }: Props) {
+export default function ExecutionEvidencePanel({ cycleId, executionId, readOnly, steps = [], onCountChange }: Props) {
   const [files, setFiles] = useState<ExecutionEvidence[]>([]);
   const [loading, setLoading] = useState(true);
   /*
@@ -98,6 +101,7 @@ export default function ExecutionEvidencePanel({ cycleId, executionId, readOnly,
    */
   const [hasLoaded, setHasLoaded] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [targetStep, setTargetStep] = useState("");
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -140,6 +144,8 @@ export default function ExecutionEvidencePanel({ cycleId, executionId, readOnly,
     void load();
   }, [load]);
 
+  const persistedSteps = steps.filter((step) => step.id);
+
   const grouped = useMemo(() => {
     const map = new Map<EvidenceKind, ExecutionEvidence[]>();
     for (const file of files) {
@@ -169,7 +175,12 @@ export default function ExecutionEvidencePanel({ cycleId, executionId, readOnly,
 
     setUploading(true);
     try {
-      await uploadExecutionEvidence(cycleId, executionId, accepted);
+      await uploadExecutionEvidence(
+        cycleId,
+        executionId,
+        accepted,
+        targetStep ? Number(targetStep) : undefined
+      );
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Upload failed");
@@ -188,6 +199,21 @@ export default function ExecutionEvidencePanel({ cycleId, executionId, readOnly,
         </p>
         {!readOnly && (
           <>
+            {persistedSteps.length > 0 ? (
+              <select
+                value={targetStep}
+                onChange={(e) => setTargetStep(e.target.value)}
+                className="h-8 rounded-lg border border-[var(--border-subtle)] bg-[var(--surface)] px-2 text-[11.5px] text-[var(--foreground)]"
+                aria-label="Attach evidence to execution step"
+              >
+                <option value="">Whole execution</option>
+                {persistedSteps.map((step) => (
+                  <option key={step.stepNumber} value={step.stepNumber}>
+                    Step {step.stepNumber}
+                  </option>
+                ))}
+              </select>
+            ) : null}
             <input
               ref={fileInputRef}
               type="file"

@@ -131,6 +131,24 @@ Write operations require:
 
 Destructive operations remain separately explicit even with write scope.
 
+## Phase 3 execution and retest operations
+
+Phase 3 adds these governed reads:
+
+- `get_execution_steps` — read manual or Playwright step outcomes for one execution.
+- `list_ticket_retests` — read a ticket's governed retest lineage and result counts.
+- `get_ticket_retest_comparison` — compare current and previous retests testcase-by-testcase.
+- `get_ticket_failure_intelligence` — return evidence-first Failed/Blocked context, step outcomes, comparison and analysis guidance.
+
+Phase 3 adds these governed writes:
+
+- `record_execution_steps` — save step outcomes; the execution status is derived from the steps.
+- `decide_ticket_retest` — evaluate only a complete retest. The server computes Passed/Failed/Blocked; callers cannot override it. Passed closes the ticket, Failed/Blocked reopens it.
+
+For Phase-3 mutations the token owner remains the authorization principal while the MCP agent actor is the audit/mutation principal.
+
+Failure intelligence is factual context, not an autonomous root-cause verdict. Clients must separate observations from hypotheses and must not treat a proposed cause as established unless evidence supports it.
+
 ## Still reserved for later phases
 
 The following remain future operations:
@@ -138,10 +156,7 @@ The following remain future operations:
 - `create_ticket` QA-domain alias over canonical ticket creation.
 - `assign_ticket` convenience alias over `update_ticket`.
 - `generate_testcases_for_ticket` — reviewable/source-grounded candidate generation.
-- `analyze_ticket_failure` — richer AI analysis over evidence and linked knowledge.
-- `record_retest_result` — convenience workflow over execution-result tools.
 - `get_release_readiness` — factual readiness evidence and blockers.
-- `close_ticket_after_retest` — guarded closure only after required retest state is verified.
 
 ## Output and audit contract
 
