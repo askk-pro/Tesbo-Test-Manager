@@ -846,6 +846,25 @@ export class LegacyController {
   createBug(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
     return this.legacy.createBug(projectId, req.userId, body);
   }
+
+  @Get("/api/projects/:projectId/qa-tickets")
+  listQaTickets(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Query() query: Record<string, any>,
+  ) {
+    return this.legacy.listBugsForUser(req.userId, projectId, query);
+  }
+
+  @Get("/api/projects/:projectId/qa/search")
+  searchQaReferences(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Query("q") query: string,
+  ) {
+    return this.legacy.searchQaReferences(req.userId, projectId, query);
+  }
+
   // Phase 1 QA ticket aliases: bugs remain the canonical storage/domain, while qa-tickets
   // exposes the stable QA-n key without colliding with the existing cross-source /tickets API.
   @Get("/api/projects/:projectId/qa-tickets/:ticketRef")
@@ -866,6 +885,138 @@ export class LegacyController {
     @Body() body: Record<string, any>,
   ) {
     return this.legacy.createTicketCommentForUser(req.userId, projectId, ticketRef, body);
+  }
+
+
+  @Get("/api/projects/:projectId/qa-tickets/:ticketRef/workspace")
+  getQaTicketWorkspace(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("ticketRef") ticketRef: string,
+  ) {
+    return this.legacy.getTicketWorkspace(req.userId, projectId, ticketRef);
+  }
+
+  @Get("/api/projects/:projectId/qa-tickets/:ticketRef/traceability")
+  getQaTicketTraceability(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("ticketRef") ticketRef: string,
+  ) {
+    return this.legacy.getTicketTraceabilityForUser(req.userId, projectId, ticketRef);
+  }
+
+  @Get("/api/projects/:projectId/qa-tickets/:ticketRef/analysis-context")
+  getQaTicketAnalysisContext(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("ticketRef") ticketRef: string,
+  ) {
+    return this.legacy.getTicketAnalysisContext(req.userId, projectId, ticketRef);
+  }
+
+  @Post("/api/projects/:projectId/qa-tickets/:ticketRef/requirements")
+  linkQaTicketRequirement(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("ticketRef") ticketRef: string,
+    @Body() body: Record<string, any>,
+  ) {
+    return this.legacy.linkTicketToRequirementForUser(
+      req.userId,
+      projectId,
+      ticketRef,
+      String(body.requirementRef || body.requirementId || ""),
+    );
+  }
+
+  @Delete("/api/projects/:projectId/qa-tickets/:ticketRef/requirements/:requirementRef")
+  unlinkQaTicketRequirement(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("ticketRef") ticketRef: string,
+    @Param("requirementRef") requirementRef: string,
+  ) {
+    return this.legacy.unlinkTicketFromRequirementForUser(req.userId, projectId, ticketRef, requirementRef);
+  }
+
+  @Post("/api/projects/:projectId/qa-tickets/:ticketRef/testcases")
+  linkQaTicketTestcase(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("ticketRef") ticketRef: string,
+    @Body() body: Record<string, any>,
+  ) {
+    return this.legacy.linkTicketToTestcaseForUser(req.userId, projectId, ticketRef, body);
+  }
+
+  @Delete("/api/projects/:projectId/qa-tickets/:ticketRef/testcases/:testcaseRef")
+  unlinkQaTicketTestcase(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("ticketRef") ticketRef: string,
+    @Param("testcaseRef") testcaseRef: string,
+  ) {
+    return this.legacy.unlinkTicketFromTestcaseForUser(req.userId, projectId, ticketRef, testcaseRef);
+  }
+
+  @Post("/api/projects/:projectId/qa-tickets/:ticketRef/retest")
+  requestQaTicketRetest(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("ticketRef") ticketRef: string,
+    @Body() body: Record<string, any>,
+  ) {
+    return this.legacy.requestTicketRetest(projectId, ticketRef, req.userId, req.userId || null, body);
+  }
+
+  @Get("/api/projects/:projectId/qa-tickets/:ticketRef/evidence")
+  listQaTicketEvidence(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("ticketRef") ticketRef: string,
+  ) {
+    return this.legacy.listTicketEvidenceForUser(req.userId, projectId, ticketRef);
+  }
+
+  @Post("/api/projects/:projectId/qa-tickets/:ticketRef/evidence")
+  @UseInterceptors(FilesInterceptor("files", 10, { limits: { fileSize: LegacyService.KB_MAX_UPLOAD_SIZE } }))
+  uploadQaTicketEvidence(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("ticketRef") ticketRef: string,
+    @Query("kind") evidenceKind: string | undefined,
+    @UploadedFiles() files: Array<{ buffer: Buffer; originalname: string; mimetype: string; size: number }>,
+  ) {
+    return this.legacy.uploadTicketEvidenceForUser(req.userId, projectId, ticketRef, files, evidenceKind);
+  }
+
+  @Get("/api/projects/:projectId/qa-tickets/:ticketRef/evidence/:attachmentId/download")
+  async downloadQaTicketEvidence(
+    @Req() req: AuthenticatedRequest,
+    @Res() res: Response,
+    @Param("projectId") projectId: string,
+    @Param("ticketRef") ticketRef: string,
+    @Param("attachmentId") attachmentId: string,
+    @Query("inline") inlineQuery?: string,
+  ) {
+    const inline = inlineQuery === "1" || inlineQuery === "true";
+    const access = await this.legacy.getTicketEvidenceAccess(
+      projectId,
+      req.userId,
+      ticketRef,
+      attachmentId,
+      inline,
+    );
+    if ("redirectUrl" in access) return res.redirect(302, access.redirectUrl);
+    res.setHeader("Content-Type", access.mimeType);
+    res.setHeader(
+      "Content-Disposition",
+      `${access.inline ? "inline" : "attachment"}; filename="${encodeURIComponent(access.originalFileName)}"`,
+    );
+    if ("buffer" in access && access.buffer) return res.send(access.buffer);
+    if ("localPath" in access && access.localPath) return res.sendFile(access.localPath);
+    throw new Error("Evidence content unavailable");
   }
 
   @Get("/api/bugs/:bugId")

@@ -2673,9 +2673,11 @@ export const getCycle = getTestRun;
 export interface BugLink {
   id: string;
   testcaseId: string | null;
+  testcaseHumanId?: string | null;
   testcaseTitle: string | null;
   testcaseExternalId: string | null;
   cycleId: string | null;
+  cycleHumanId?: string | null;
   cycleName: string | null;
   executionId: string | null;
 }
@@ -2691,6 +2693,7 @@ export interface BugAttachment {
   fileName: string;
   contentType: string;
   fileSize: number;
+  evidenceKind?: "screenshot" | "video" | "trace" | "log" | null;
   createdAt: string;
 }
 
@@ -2705,6 +2708,7 @@ export type BugPriority = "P0" | "P1" | "P2" | "P3";
 
 export interface BugItem {
   id: string;
+  humanId?: string;
   /** Per-project sequential key, e.g. "E2E-BUG-14" — always present, unlike integrationIssueKey
    *  which is only set once the bug is linked to an external tracker (Jira/Linear). */
   externalId: string;
@@ -2837,6 +2841,278 @@ export async function deleteBugAttachment(attachmentId: string): Promise<void> {
 export function getBugAttachmentDownloadUrl(projectId: string, attachmentId: string): string {
   return `${API_BASE}/api/projects/${projectId}/bugs/attachments/${attachmentId}/download`;
 }
+
+
+// QA ticket workspace / traceability / evidence
+export interface QaRequirementLink {
+  id: string;
+  humanId: string;
+  title: string;
+  description?: string | null;
+  status: string;
+  priority?: string | null;
+  ownerName?: string | null;
+  linkedAt?: string;
+  testcases?: Array<{
+    id: string;
+    humanId?: string | null;
+    externalId?: string | null;
+    title: string;
+    status?: string | null;
+  }>;
+}
+
+export interface QaTicketComment {
+  id: string;
+  body: string;
+  source: string;
+  createdAt: string;
+  authorActorId?: string | null;
+  authorName?: string | null;
+  authorEmail?: string | null;
+  authorType?: string | null;
+}
+
+export interface QaTicketEvidence {
+  id: string;
+  projectId: string;
+  entityType: string;
+  entityId: string;
+  fileName: string;
+  contentType: string;
+  fileSize: number;
+  evidenceKind: "screenshot" | "video" | "trace" | "log" | null;
+  createdAt: string;
+  sourceType: "ticket" | "execution";
+  runId?: string | null;
+  runHumanId?: string | null;
+  runName?: string | null;
+  testcaseId?: string | null;
+  testcaseHumanId?: string | null;
+  testcaseTitle?: string | null;
+  executionId?: string | null;
+  executionStatus?: string | null;
+}
+
+export interface QaTraceNode {
+  id: string;
+  kind: "ticket" | "requirement" | "testcase" | "run" | "execution" | "evidence";
+  entityId: string;
+  humanId?: string | null;
+  title?: string | null;
+  status?: string | null;
+  sourceType?: string | null;
+  actualResult?: string | null;
+  executedAt?: string | null;
+}
+
+export interface QaTraceEdge {
+  from: string;
+  to: string;
+  relation: string;
+}
+
+export interface QaTicketTestcaseLink {
+  linkId: string;
+  testcaseId?: string | null;
+  testcaseHumanId?: string | null;
+  testcaseExternalId?: string | null;
+  testcaseTitle?: string | null;
+  testcaseStatus?: string | null;
+  runId?: string | null;
+  runHumanId?: string | null;
+  runName?: string | null;
+  runStatus?: string | null;
+  executionId?: string | null;
+  executionStatus?: string | null;
+  actualResult?: string | null;
+  executedAt?: string | null;
+}
+
+export interface QaTicketActivity {
+  id: string;
+  action: string;
+  entityType: string;
+  entityId: string;
+  entityName?: string | null;
+  diff?: Record<string, unknown> | null;
+  createdAt: string;
+  actorId?: string | null;
+  actorName?: string | null;
+  actorEmail?: string | null;
+  actorType?: string | null;
+}
+
+export interface QaTicketWorkspace {
+  ticket: BugItem;
+  requirements: QaRequirementLink[];
+  testcaseLinks: QaTicketTestcaseLink[];
+  evidence: QaTicketEvidence[];
+  graph: { nodes: QaTraceNode[]; edges: QaTraceEdge[] };
+  comments: QaTicketComment[];
+  activity: QaTicketActivity[];
+}
+
+export interface QaReferenceMatch {
+  kind: "ticket" | "testcase" | "requirement" | "run";
+  id: string;
+  humanId: string;
+  title: string;
+  alternateId?: string | null;
+  href: string;
+}
+
+export interface QaTicketAnalysisContext {
+  ticket: Pick<BugItem, "id" | "title" | "description" | "status" | "severity" | "priority"> & { humanId?: string };
+  facts: {
+    linkedRequirements: number;
+    linkedTestcases: number;
+    linkedRuns: number;
+    failedExecutions: number;
+    blockedExecutions: number;
+    evidenceItems: number;
+    comments: number;
+  };
+  attention: string[];
+  traceability: { nodes: QaTraceNode[]; edges: QaTraceEdge[] };
+  latestComments: QaTicketComment[];
+  evidence: QaTicketEvidence[];
+  analysisGuidance: string[];
+}
+
+export async function listQaTickets(
+  projectId: string,
+  params?: { status?: string; assigneeId?: string; testcaseId?: string; cycleId?: string }
+): Promise<BugItem[]> {
+  const sp = new URLSearchParams();
+  if (params?.status) sp.set("status", params.status);
+  if (params?.assigneeId) sp.set("assigneeId", params.assigneeId);
+  if (params?.testcaseId) sp.set("testcaseId", params.testcaseId);
+  if (params?.cycleId) sp.set("cycleId", params.cycleId);
+  const query = sp.toString();
+  return api(`/api/projects/${projectId}/qa-tickets${query ? `?${query}` : ""}`);
+}
+
+export async function getQaTicketWorkspace(projectId: string, ticketRef: string): Promise<QaTicketWorkspace> {
+  return api(`/api/projects/${projectId}/qa-tickets/${encodeURIComponent(ticketRef)}/workspace`);
+}
+
+export async function getQaTicketTraceability(
+  projectId: string,
+  ticketRef: string
+): Promise<Omit<QaTicketWorkspace, "comments" | "activity">> {
+  return api(`/api/projects/${projectId}/qa-tickets/${encodeURIComponent(ticketRef)}/traceability`);
+}
+
+export async function getQaTicketAnalysisContext(
+  projectId: string,
+  ticketRef: string
+): Promise<QaTicketAnalysisContext> {
+  return api(`/api/projects/${projectId}/qa-tickets/${encodeURIComponent(ticketRef)}/analysis-context`);
+}
+
+export async function searchQaReferences(projectId: string, q: string): Promise<{ matches: QaReferenceMatch[] }> {
+  return api(`/api/projects/${projectId}/qa/search?q=${encodeURIComponent(q)}`);
+}
+
+export async function addQaTicketComment(projectId: string, ticketRef: string, body: string): Promise<QaTicketComment> {
+  return api(`/api/projects/${projectId}/qa-tickets/${encodeURIComponent(ticketRef)}/comments`, {
+    method: "POST",
+    body: { body },
+  });
+}
+
+export async function linkQaTicketRequirement(
+  projectId: string,
+  ticketRef: string,
+  requirementRef: string
+): Promise<unknown> {
+  return api(`/api/projects/${projectId}/qa-tickets/${encodeURIComponent(ticketRef)}/requirements`, {
+    method: "POST",
+    body: { requirementRef },
+  });
+}
+
+export async function unlinkQaTicketRequirement(
+  projectId: string,
+  ticketRef: string,
+  requirementRef: string
+): Promise<unknown> {
+  return api(
+    `/api/projects/${projectId}/qa-tickets/${encodeURIComponent(ticketRef)}/requirements/${encodeURIComponent(requirementRef)}`,
+    { method: "DELETE" }
+  );
+}
+
+export async function linkQaTicketTestcase(
+  projectId: string,
+  ticketRef: string,
+  testcaseRef: string,
+  runRef?: string
+): Promise<unknown> {
+  return api(`/api/projects/${projectId}/qa-tickets/${encodeURIComponent(ticketRef)}/testcases`, {
+    method: "POST",
+    body: { testcaseRef, ...(runRef ? { runRef } : {}) },
+  });
+}
+
+export async function unlinkQaTicketTestcase(
+  projectId: string,
+  ticketRef: string,
+  testcaseRef: string
+): Promise<unknown> {
+  return api(
+    `/api/projects/${projectId}/qa-tickets/${encodeURIComponent(ticketRef)}/testcases/${encodeURIComponent(testcaseRef)}`,
+    { method: "DELETE" }
+  );
+}
+
+export async function requestQaTicketRetest(
+  projectId: string,
+  ticketRef: string,
+  data: { name?: string; environment?: string; buildVersion?: string } = {}
+): Promise<unknown> {
+  return api(`/api/projects/${projectId}/qa-tickets/${encodeURIComponent(ticketRef)}/retest`, {
+    method: "POST",
+    body: data,
+  });
+}
+
+export async function uploadQaTicketEvidence(
+  projectId: string,
+  ticketRef: string,
+  files: File[],
+  evidenceKind?: QaTicketEvidence["evidenceKind"]
+): Promise<{ list: QaTicketEvidence[]; total: number }> {
+  const all: QaTicketEvidence[] = [];
+  for (let i = 0; i < files.length; i += EVIDENCE_MAX_FILES_PER_REQUEST) {
+    const batch = files.slice(i, i + EVIDENCE_MAX_FILES_PER_REQUEST);
+    const form = new FormData();
+    for (const file of batch) form.append("files", file);
+    const kind = evidenceKind ? `?kind=${encodeURIComponent(evidenceKind)}` : "";
+    const res = await fetch(
+      `${API_BASE}/api/projects/${projectId}/qa-tickets/${encodeURIComponent(ticketRef)}/evidence${kind}`,
+      { method: "POST", credentials: "include", body: form }
+    );
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.statusText }));
+      throw new Error((err as { error?: string }).error || genericStatusMessage(res.status));
+    }
+    const result = (await res.json()) as { list: QaTicketEvidence[]; total: number };
+    all.push(...result.list);
+  }
+  return { list: all, total: all.length };
+}
+
+export function getQaTicketEvidenceDownloadUrl(
+  projectId: string,
+  ticketRef: string,
+  attachmentId: string,
+  inline = false
+): string {
+  return `${API_BASE}/api/projects/${projectId}/qa-tickets/${encodeURIComponent(ticketRef)}/evidence/${attachmentId}/download${inline ? "?inline=1" : ""}`;
+}
+
 
 // Workspace analytics (dashboard – all projects in workspace)
 export interface WorkspaceAnalytics {

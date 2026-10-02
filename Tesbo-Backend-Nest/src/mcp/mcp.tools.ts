@@ -1317,6 +1317,153 @@ export function buildMcpTools(): McpTool[] {
       },
       handler: async (args, ctx) => ctx.legacy.getTicketByRef(ctx.projectId, requireString(args, "ticketRef"))
     },
+
+    {
+      name: "get_ticket_workspace",
+      description:
+        "Return the complete QA ticket workspace for a QA-n/legacy/UUID reference: ticket, comments, audit activity, linked requirements, test cases/runs/executions, evidence, and traceability graph. Required: ticketRef.",
+      requiredScope: "read",
+      inputSchema: {
+        type: "object",
+        properties: { ticketRef: { type: "string" } },
+        required: ["ticketRef"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) =>
+        ctx.legacy.getTicketWorkspace(ctx.userId, ctx.projectId, requireString(args, "ticketRef"))
+    },
+    {
+      name: "get_ticket_traceability",
+      description:
+        "Return the governed traceability graph for a QA ticket: QA ticket -> REQ requirements -> TC test cases -> RUN runs -> executions -> evidence. Required: ticketRef.",
+      requiredScope: "read",
+      inputSchema: {
+        type: "object",
+        properties: { ticketRef: { type: "string" } },
+        required: ["ticketRef"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) =>
+        ctx.legacy.getTicketTraceabilityForUser(ctx.userId, ctx.projectId, requireString(args, "ticketRef"))
+    },
+    {
+      name: "list_ticket_evidence",
+      description:
+        "List direct ticket evidence plus evidence captured by executions linked to the QA ticket. Returns source type and linked TC/RUN context where available. Required: ticketRef.",
+      requiredScope: "read",
+      inputSchema: {
+        type: "object",
+        properties: { ticketRef: { type: "string" } },
+        required: ["ticketRef"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) =>
+        ctx.legacy.listTicketEvidenceForUser(ctx.userId, ctx.projectId, requireString(args, "ticketRef"))
+    },
+    {
+      name: "attach_ticket_evidence",
+      description:
+        "Attach a small evidence file directly to a QA ticket through governed platform storage. Required: ticketRef, fileName, contentBase64. Optional: contentType, evidenceKind (screenshot, video, trace, log). MCP payloads are limited to 5MB; use the workspace upload for larger evidence.",
+      requiredScope: "write",
+      inputSchema: {
+        type: "object",
+        properties: {
+          ticketRef: { type: "string" },
+          fileName: { type: "string" },
+          contentBase64: { type: "string" },
+          contentType: { type: "string" },
+          evidenceKind: { type: "string" }
+        },
+        required: ["ticketRef", "fileName", "contentBase64"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) => {
+        const ticketRef = requireString(args, "ticketRef");
+        return ctx.legacy.attachTicketEvidenceBase64(
+          ctx.projectId,
+          ticketRef,
+          ctx.userId,
+          ctx.actorId,
+          args,
+        );
+      }
+    },
+    {
+      name: "get_ticket_analysis_context",
+      description:
+        "Return a fact-only, source-grounded analysis context for ChatGPT: ticket state, linked QA counts, failed/blocked executions, evidence metadata, comments, traceability, and factual attention flags. This tool does not mutate the ticket or claim a root cause. Required: ticketRef.",
+      requiredScope: "read",
+      inputSchema: {
+        type: "object",
+        properties: { ticketRef: { type: "string" } },
+        required: ["ticketRef"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) =>
+        ctx.legacy.getTicketAnalysisContext(ctx.userId, ctx.projectId, requireString(args, "ticketRef"))
+    },
+    {
+      name: "link_ticket_to_requirement",
+      description:
+        "Link a QA ticket to an internal QA requirement using QA/REQ human ids, source keys, or UUIDs. Required: ticketRef, requirementRef.",
+      requiredScope: "write",
+      inputSchema: {
+        type: "object",
+        properties: {
+          ticketRef: { type: "string" },
+          requirementRef: { type: "string" }
+        },
+        required: ["ticketRef", "requirementRef"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) => {
+        await ctx.legacy.getTicketByRefForUser(ctx.userId, ctx.projectId, requireString(args, "ticketRef"));
+        return ctx.legacy.linkTicketToRequirement(
+          ctx.projectId,
+          requireString(args, "ticketRef"),
+          requireString(args, "requirementRef"),
+          ctx.actorId,
+        );
+      }
+    },
+    {
+      name: "unlink_ticket_from_requirement",
+      description:
+        "Remove the governed QA ticket <-> internal requirement relationship without deleting either record. Required: ticketRef, requirementRef.",
+      requiredScope: "write",
+      inputSchema: {
+        type: "object",
+        properties: {
+          ticketRef: { type: "string" },
+          requirementRef: { type: "string" }
+        },
+        required: ["ticketRef", "requirementRef"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) => {
+        await ctx.legacy.getTicketByRefForUser(ctx.userId, ctx.projectId, requireString(args, "ticketRef"));
+        return ctx.legacy.unlinkTicketFromRequirement(
+          ctx.projectId,
+          requireString(args, "ticketRef"),
+          requireString(args, "requirementRef"),
+          ctx.actorId,
+        );
+      }
+    },
+    {
+      name: "search_qa_references",
+      description:
+        "Resolve or search human-readable QA references and titles across QA tickets, TC test cases, REQ requirements, and RUN test runs in the token project. Required: q.",
+      requiredScope: "read",
+      inputSchema: {
+        type: "object",
+        properties: { q: { type: "string" } },
+        required: ["q"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) =>
+        ctx.legacy.searchQaReferences(ctx.userId, ctx.projectId, requireString(args, "q"))
+    },
     {
       name: "update_ticket",
       description:

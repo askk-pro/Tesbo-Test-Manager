@@ -39,6 +39,37 @@ function makeLegacy(overrides: Partial<Record<string, jest.Mock>> = {}) {
     updateBug: jest.fn().mockResolvedValue({ id: "bug-1", title: "Updated bug", links: [], attachments: [] }),
     addBugLink: jest.fn().mockResolvedValue({ id: "bug-1", title: "Bug 1", links: [{ id: "link-1", testcaseId: "tc-1", cycleId: null }] }),
     removeBugLink: jest.fn().mockResolvedValue({ id: "bug-1", title: "Bug 1", links: [] }),
+    getTicketByRefForUser: jest.fn().mockResolvedValue({ id: "bug-1", humanId: "QA-1", title: "Bug 1" }),
+    getTicketWorkspace: jest.fn().mockResolvedValue({
+      ticket: { id: "bug-1", humanId: "QA-1", title: "Bug 1" },
+      requirements: [],
+      testcaseLinks: [],
+      evidence: [],
+      graph: { nodes: [], edges: [] },
+      comments: [],
+      activity: []
+    }),
+    getTicketTraceabilityForUser: jest.fn().mockResolvedValue({
+      ticket: { id: "bug-1", humanId: "QA-1", title: "Bug 1" },
+      requirements: [],
+      testcaseLinks: [],
+      evidence: [],
+      graph: { nodes: [], edges: [] }
+    }),
+    listTicketEvidenceForUser: jest.fn().mockResolvedValue({ list: [] }),
+    attachTicketEvidenceBase64: jest.fn().mockResolvedValue({ list: [{ id: "att-1", fileName: "shot.png" }], total: 1 }),
+    getTicketAnalysisContext: jest.fn().mockResolvedValue({
+      ticket: { id: "bug-1", humanId: "QA-1", title: "Bug 1" },
+      facts: { linkedRequirements: 0, linkedTestcases: 0, linkedRuns: 0, failedExecutions: 0, blockedExecutions: 0, evidenceItems: 0, comments: 0 },
+      attention: [],
+      traceability: { nodes: [], edges: [] },
+      latestComments: [],
+      evidence: [],
+      analysisGuidance: []
+    }),
+    linkTicketToRequirement: jest.fn().mockResolvedValue({ ticket: { id: "bug-1", humanId: "QA-1" }, requirements: [] }),
+    unlinkTicketFromRequirement: jest.fn().mockResolvedValue({ ticket: { id: "bug-1", humanId: "QA-1" }, requirements: [], wasLinked: true }),
+    searchQaReferences: jest.fn().mockResolvedValue({ matches: [{ kind: "ticket", id: "bug-1", humanId: "QA-1", title: "Bug 1" }] }),
     requirementMatrix: jest.fn().mockResolvedValue({ rows: [] }),
     searchKnowledgeBase: jest.fn().mockResolvedValue({ list: [], total: 0 }),
     listKnowledgeDocuments: jest.fn().mockResolvedValue({ list: [{ id: "kb-doc-1", title: "Doc 1" }], total: 1 }),
@@ -242,6 +273,14 @@ describe("McpService", () => {
           "get_bug",
           "create_bug",
           "update_bug",
+          "get_ticket_workspace",
+          "get_ticket_traceability",
+          "list_ticket_evidence",
+          "attach_ticket_evidence",
+          "get_ticket_analysis_context",
+          "link_ticket_to_requirement",
+          "unlink_ticket_from_requirement",
+          "search_qa_references",
           "link_testcase_to_bug",
           "unlink_testcase_from_bug",
           "get_requirement_matrix",
@@ -2508,6 +2547,118 @@ describe("McpService", () => {
       );
       expect(res.error.code).toBe(RpcCode.ProjectScopeDenied);
       expect((legacy as any).executionReport).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("Phase 2 QA ticket workspace MCP tools", () => {
+    it("returns a ticket workspace scoped by token user and project", async () => {
+      const { db } = makeDb();
+      const legacy = makeLegacy();
+      const svc = new McpService(legacy, db);
+      const res: any = await svc.handleRequest(
+        rpc("tools/call", { name: "get_ticket_workspace", arguments: { ticketRef: "QA-1" } }),
+        principal({ userId: "user-7" }),
+        "proj-1"
+      );
+      expect(res.result.isError).toBe(false);
+      expect((legacy as any).getTicketWorkspace).toHaveBeenCalledWith("user-7", "proj-1", "QA-1");
+      expect(JSON.parse(res.result.content[0].text).ticket.humanId).toBe("QA-1");
+    });
+
+    it("allows traceability and analysis-context reads with a read-only token", async () => {
+      const { db } = makeDb();
+      const legacy = makeLegacy();
+      const svc = new McpService(legacy, db);
+      const readOnly = principal({ userId: "user-7", scopes: ["read"] });
+
+      const trace: any = await svc.handleRequest(
+        rpc("tools/call", { name: "get_ticket_traceability", arguments: { ticketRef: "QA-1" } }),
+        readOnly,
+        "proj-1"
+      );
+      const analysis: any = await svc.handleRequest(
+        rpc("tools/call", { name: "get_ticket_analysis_context", arguments: { ticketRef: "QA-1" } }),
+        readOnly,
+        "proj-1"
+      );
+
+      expect(trace.result.isError).toBe(false);
+      expect(analysis.result.isError).toBe(false);
+      expect((legacy as any).getTicketTraceabilityForUser).toHaveBeenCalledWith("user-7", "proj-1", "QA-1");
+      expect((legacy as any).getTicketAnalysisContext).toHaveBeenCalledWith("user-7", "proj-1", "QA-1");
+    });
+
+    it("attributes MCP evidence upload to the agent while authorizing as the token user", async () => {
+      const { db } = makeDb({ mcpActorId: "mcp-actor-1" });
+      const legacy = makeLegacy();
+      const svc = new McpService(legacy, db);
+      const args = {
+        ticketRef: "QA-1",
+        fileName: "failure.png",
+        contentBase64: "aGVsbG8=",
+        contentType: "image/png",
+        evidenceKind: "screenshot"
+      };
+      const res: any = await svc.handleRequest(
+        rpc("tools/call", { name: "attach_ticket_evidence", arguments: args }),
+        principal({ userId: "user-7" }),
+        "proj-1"
+      );
+      expect(res.result.isError).toBe(false);
+      expect((legacy as any).attachTicketEvidenceBase64).toHaveBeenCalledWith(
+        "proj-1",
+        "QA-1",
+        "user-7",
+        "mcp-actor-1",
+        args
+      );
+    });
+
+    it("authorizes ticket access before linking a requirement and records the MCP actor", async () => {
+      const { db } = makeDb({ mcpActorId: "mcp-actor-1" });
+      const legacy = makeLegacy();
+      const svc = new McpService(legacy, db);
+      const res: any = await svc.handleRequest(
+        rpc("tools/call", {
+          name: "link_ticket_to_requirement",
+          arguments: { ticketRef: "QA-1", requirementRef: "REQ-1" }
+        }),
+        principal({ userId: "user-7" }),
+        "proj-1"
+      );
+      expect(res.result.isError).toBe(false);
+      expect((legacy as any).getTicketByRefForUser).toHaveBeenCalledWith("user-7", "proj-1", "QA-1");
+      expect((legacy as any).linkTicketToRequirement).toHaveBeenCalledWith("proj-1", "QA-1", "REQ-1", "mcp-actor-1");
+    });
+
+    it("blocks Phase 2 write tools for a read-only token", async () => {
+      const { db } = makeDb({ mcpActorId: "mcp-actor-1" });
+      const legacy = makeLegacy();
+      const svc = new McpService(legacy, db);
+      const res: any = await svc.handleRequest(
+        rpc("tools/call", {
+          name: "link_ticket_to_requirement",
+          arguments: { ticketRef: "QA-1", requirementRef: "REQ-1" }
+        }),
+        principal({ scopes: ["read"] }),
+        "proj-1"
+      );
+      expect(res.error.code).toBe(RpcCode.ScopeDenied);
+      expect((legacy as any).linkTicketToRequirement).not.toHaveBeenCalled();
+    });
+
+    it("searches QA human references only inside the token project", async () => {
+      const { db } = makeDb();
+      const legacy = makeLegacy();
+      const svc = new McpService(legacy, db);
+      const res: any = await svc.handleRequest(
+        rpc("tools/call", { name: "search_qa_references", arguments: { q: "QA-1" } }),
+        principal({ userId: "user-7", scopes: ["read"] }),
+        "proj-1"
+      );
+      expect(res.result.isError).toBe(false);
+      expect((legacy as any).searchQaReferences).toHaveBeenCalledWith("user-7", "proj-1", "QA-1");
+      expect(JSON.parse(res.result.content[0].text).matches[0].humanId).toBe("QA-1");
     });
   });
 

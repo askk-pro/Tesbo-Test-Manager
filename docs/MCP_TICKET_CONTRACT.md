@@ -1,162 +1,152 @@
-# MCP Ticket Operations Contract v1
+# MCP Ticket Operations Contract v2
 
 ## Goal
 
-This contract defines how ChatGPT or another MCP client may operate the QA platform without bypassing application authorization, workflow rules, or audit logging.
+This contract defines how ChatGPT or another MCP client may operate the QA platform without bypassing application authorization, workflow rules, storage controls, or audit logging.
 
-Endpoint:
-
-`POST /api/projects/:projectId/mcp`
+Endpoint: `POST /api/projects/:projectId/mcp`
 
 Authentication remains project-scoped bearer API tokens.
 
 ## Security model
 
-Every MCP request is constrained by:
-- project scope from the URL/token;
-- token validity;
-- token read/write scope;
-- the token owner's application permissions;
-- application service validation;
-- audit attribution to an MCP actor.
+Every MCP request is constrained by project scope, token validity, token read/write scope, the token owner's application permissions, application-service validation, and audit attribution to an MCP actor.
 
-The token owner is the authorization principal. The MCP actor is the audit principal.
-
-No MCP tool receives raw SQL capability.
+The token owner is the authorization principal. The MCP actor is the audit principal. MCP clients never receive raw SQL, unrestricted filesystem, or infrastructure-shell capability.
 
 ## Human references
 
-Where a `ref` is accepted, the client should prefer human IDs:
+Prefer governed human IDs wherever a `ref` is accepted:
+
 - tickets: `QA-184`
 - test cases: `TC-291`
 - requirements: `REQ-93`
 - runs: `RUN-42`
 
-UUIDs and supported legacy/external IDs remain valid for compatibility.
+UUIDs and supported legacy/external identifiers remain valid for compatibility.
 
-## Implemented Phase-1 tools
+## Implemented ticket workspace tools
 
 ### Read
 
 - `get_ticket` — resolve and return a QA ticket.
-- `list_ticket_comments` — return ticket discussion history.
-- `get_testcase_by_ref` — resolve TC/UUID/legacy test-case references.
-- `get_test_run_by_ref` — resolve RUN/UUID/legacy run references.
+- `get_ticket_workspace` — return ticket, requirements, linked tests/runs/results, evidence, comments, activity and graph.
+- `get_ticket_traceability` — return ticket ↔ requirement ↔ test case ↔ run ↔ execution ↔ evidence graph.
+- `list_ticket_comments` — return discussion history.
+- `list_ticket_evidence` — return direct ticket evidence plus evidence inherited from linked executions.
+- `get_ticket_analysis_context` — return fact-grounded context for ChatGPT-assisted analysis without mutating the ticket.
+- `search_qa_references` — search QA/TC/REQ/RUN IDs, legacy IDs and titles within the token project.
+- `get_testcase_by_ref`
+- `get_test_run_by_ref`
 - `list_internal_requirements`
 - `get_internal_requirement`
 
-Existing Tesbo MCP read tools for test cases, suites, cycles/executions, defects, requirement matrix, knowledge base, and related entities remain available.
+Existing MCP reads for test cases, suites, cycles/executions, bugs, requirement matrix and knowledge base remain available.
 
 ### Write
 
-- `update_ticket` — governed ticket mutation through application services.
+- `update_ticket`
 - `add_ticket_comment`
 - `link_ticket_to_testcase`
+- `link_ticket_to_requirement`
+- `unlink_ticket_from_requirement`
 - `request_ticket_retest`
+- `attach_ticket_evidence`
 - `create_internal_requirement`
 - `update_internal_requirement`
 - `link_internal_requirement_to_testcase`
 - `unlink_internal_requirement_from_testcase`
 
-Existing write tools for test cases, suites, cycles/runs, execution results, bugs and bug links continue to work.
+Existing write tools for test cases, suites, cycles/runs, execution results, bugs and links remain available.
+
+## Evidence contract
+
+`attach_ticket_evidence` accepts:
+- `ticketRef`
+- `fileName`
+- `contentBase64`
+- optional `contentType`
+- optional `evidenceKind`: `screenshot`, `video`, `trace`, or `log`
+
+MCP uploads are limited to 5 MB per file. Larger files use the authenticated workspace multipart upload route.
+
+Evidence is stored through the normal attachment/storage service, not directly in the database. Ticket evidence views include:
+- evidence attached directly to the ticket;
+- evidence attached to linked executions, with test-case and run context.
+
+## Traceability contract
+
+The Phase-2 graph can express:
+
+`QA ticket → requirement → test case → run → execution → evidence`
+
+It also preserves direct ticket→testcase relationships.
+
+Common relations are:
+- `requires`
+- `covered_by`
+- `verified_by`
+- `executed_in`
+- `contains_result`
+- `evidenced_by`
+
+Every governed QA entity should expose a human ID when available.
+
+## ChatGPT-assisted analysis
+
+`get_ticket_analysis_context` intentionally returns evidence and facts rather than an autonomous root-cause verdict.
+
+It includes:
+- ticket state;
+- linked requirement/test/run counts;
+- failed and blocked execution counts;
+- evidence and comment counts;
+- traceability graph;
+- recent comments;
+- evidence metadata;
+- structural attention flags.
+
+Analysis guidance requires the client to distinguish observed facts from hypotheses and to treat root cause as unknown unless evidence supports it.
 
 ## Expected ChatGPT workflow
 
-A typical issue flow is:
+A normal workflow can be:
 
-1. User says: "Open QA-184."
-2. ChatGPT calls `get_ticket`.
-3. ChatGPT may inspect linked tests and comments.
-4. With user intent and write scope, ChatGPT can call `update_ticket` or `add_ticket_comment`.
-5. ChatGPT can link an existing test with `link_ticket_to_testcase`.
-6. ChatGPT can request a governed retest with `request_ticket_retest`.
-7. Execution tools record test outcomes.
-8. The resulting audit/activity history attributes writes to the MCP actor while preserving the authorizing user.
-
-## Ticket mutation semantics
-
-`update_ticket` is the general mutation surface for ticket fields supported by the existing ticket service, including fields such as:
-- title/description
-- status
-- severity
-- priority
-- assignee when supported by the underlying DTO/service
-
-MCP must not synthesize unsupported enum values or bypass service validation.
+1. User: “Open QA-184.”
+2. ChatGPT calls `get_ticket_workspace`.
+3. It inspects requirements, tests, runs, results, comments and evidence.
+4. It may call `get_ticket_analysis_context` for a fact-grounded analysis view.
+5. With explicit user intent and write scope, it may add a comment, link REQ/TC records, attach evidence or request a retest.
+6. Execution tools record retest outcomes.
+7. The audit trail records the MCP actor while preserving the token owner as the authorizing user.
 
 ## Approval boundaries
 
-Read operations may run immediately when the token has read scope.
+Read operations may run with read scope.
 
 Write operations require:
-- an MCP token with write scope;
-- user-level permission to perform the underlying operation;
-- explicit user intent in the conversation for consequential mutation.
+- write scope;
+- the token owner's underlying application permission;
+- explicit user intent for consequential mutation.
 
-Destructive operations should remain separately explicit even when a token has write scope.
+Destructive operations remain separately explicit even with write scope.
 
-## Reserved contract for later phases
+## Still reserved for later phases
 
-The following capabilities are intentionally defined as future MCP operations rather than being represented as direct database access:
+The following remain future operations:
 
-### `create_ticket`
-Create a QA ticket using the canonical ticket service. Existing `create_bug` functionality is available today; a QA-domain alias should normalize naming.
+- `create_ticket` QA-domain alias over canonical ticket creation.
+- `assign_ticket` convenience alias over `update_ticket`.
+- `generate_testcases_for_ticket` — reviewable/source-grounded candidate generation.
+- `analyze_ticket_failure` — richer AI analysis over evidence and linked knowledge.
+- `record_retest_result` — convenience workflow over execution-result tools.
+- `get_release_readiness` — factual readiness evidence and blockers.
+- `close_ticket_after_retest` — guarded closure only after required retest state is verified.
 
-### `assign_ticket`
-Convenience alias for assignment through `update_ticket`.
+## Output and audit contract
 
-### `generate_testcases_for_ticket`
-Generate candidate test cases from ticket/requirement context. Creation should remain reviewable and source-grounded.
+Read/write responses should return stable canonical IDs, human IDs when available, project context, current state, timestamps, linked human references and structured not-found/permission/validation/conflict errors.
 
-### `attach_ticket_evidence`
-Attach screenshots, logs, traces, files, video, or other governed evidence using the attachment/storage service. It must return stable evidence metadata and checksums where available.
+For every MCP mutation, record the authorizing user, MCP actor/channel, project, entity identity, action, timestamp and meaningful resulting state/delta where supported.
 
-### `analyze_ticket_failure`
-Read execution results, logs, evidence and linked knowledge; return source-grounded failure analysis. It must not silently mutate the ticket.
-
-### `record_retest_result`
-Convenience workflow over existing execution-result tools, preserving the run/test linkage and audit identity.
-
-### `get_ticket_traceability`
-Return ticket ↔ requirement ↔ test case ↔ run/result ↔ evidence relationships.
-
-### `get_release_readiness`
-Return factual release/readiness evidence based on current test/run/ticket state. It should expose evidence and blockers rather than make an autonomous release decision.
-
-### `close_ticket_after_retest`
-A guarded workflow that verifies required retest state before invoking the normal ticket update path. Closure should not be inferred merely from an AI analysis.
-
-## Output contract
-
-MCP tools should return:
-- canonical UUID
-- human-readable ID
-- project ID
-- relevant current state
-- timestamps
-- linked entity human IDs where practical
-- clear structured errors for not-found, permission, validation, and conflict states
-
-Write responses should also return the resulting entity state so ChatGPT can confirm what actually changed.
-
-## Audit contract
-
-For every MCP mutation, record:
-- authorizing user
-- MCP actor/channel
-- project
-- entity UUID and human ID
-- operation/action
-- timestamp
-- resulting state or meaningful delta where supported
-
-Secrets, bearer tokens, and provider credentials must never be written into activity payloads.
-
-## Non-goals
-
-MCP v1 does not provide:
-- arbitrary SQL
-- unrestricted filesystem access
-- infrastructure shell access
-- automatic production-release approval
-- unreviewed deletion of QA history
+Secrets, bearer tokens and provider credentials must never enter activity/audit payloads.

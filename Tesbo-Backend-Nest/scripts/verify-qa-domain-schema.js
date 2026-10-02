@@ -21,8 +21,8 @@ async function main() {
     const migration = await scalar(
       "select count(*)::int as count, max(version)::int as max_version from schema_migrations",
     );
-    if (migration.count < 129 || migration.max_version < 129) {
-      throw new Error(`Expected migration 129; got count=${migration.count}, max=${migration.max_version}`);
+    if (migration.count < 130 || migration.max_version < 130) {
+      throw new Error(`Expected migration 130; got count=${migration.count}, max=${migration.max_version}`);
     }
 
     await client.query("BEGIN");
@@ -89,6 +89,23 @@ async function main() {
       [projectId],
     );
 
+    await client.query(
+      `insert into ticket_requirements (project_id, ticket_id, requirement_id)
+       select $1, b.id, r.id
+       from bugs b
+       join requirements r on r.project_id=$1 and r.human_id='REQ-1'
+       where b.project_id=$1 and b.human_id='QA-1'`,
+      [projectId],
+    );
+
+    await client.query(
+      `insert into attachments
+         (project_id, entity_type, entity_id, file_name, content_type, file_size, storage_path, evidence_kind)
+       select $1, 'bug', b.id, 'phase2.png', 'image/png', 42, 'ci/phase2.png', 'screenshot'
+       from bugs b where b.project_id=$1 and b.human_id='QA-1'`,
+      [projectId],
+    );
+
     const comment = await scalar(
       "select count(*)::int as count from ticket_comments where project_id=$1 and source='mcp'",
       [projectId],
@@ -100,8 +117,25 @@ async function main() {
        where r.project_id=$1 and rt.deleted_at is null`,
       [projectId],
     );
-    if (comment.count !== 1 || link.count !== 1) {
-      throw new Error(`QA relation acceptance failed: comments=${comment.count}, links=${link.count}`);
+    const ticketRequirement = await scalar(
+      `select count(*)::int as count
+       from ticket_requirements tr
+       join bugs b on b.id=tr.ticket_id
+       where tr.project_id=$1 and b.human_id='QA-1' and tr.deleted_at is null`,
+      [projectId],
+    );
+    const ticketEvidence = await scalar(
+      `select count(*)::int as count
+       from attachments a
+       join bugs b on b.id=a.entity_id
+       where a.project_id=$1 and a.entity_type='bug' and b.human_id='QA-1'
+         and a.evidence_kind='screenshot' and a.deleted_at is null`,
+      [projectId],
+    );
+    if (comment.count !== 1 || link.count !== 1 || ticketRequirement.count !== 1 || ticketEvidence.count !== 1) {
+      throw new Error(
+        `QA relation acceptance failed: comments=${comment.count}, requirement_testcases=${link.count}, ticket_requirements=${ticketRequirement.count}, ticket_evidence=${ticketEvidence.count}`,
+      );
     }
 
     await client.query(
@@ -128,7 +162,7 @@ async function main() {
     }
 
     await client.query("ROLLBACK");
-    console.log("QA domain schema acceptance passed: migration 129, QA/TC/REQ/RUN IDs, comments, links, sequence.");
+    console.log("QA domain schema acceptance passed: migration 130, QA/TC/REQ/RUN IDs, comments, ticket/requirement/test links, evidence, sequence.");
   } catch (error) {
     try {
       await client.query("ROLLBACK");

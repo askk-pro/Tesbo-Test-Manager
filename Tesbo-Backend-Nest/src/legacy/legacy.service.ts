@@ -6515,6 +6515,662 @@ export class LegacyService implements OnModuleInit {
     return this.updateInternalRequirement(projectId, requirementRef, uid, body);
   }
 
+
+  // ── Phase 2: QA ticket workspace, traceability and evidence ────────────────────────────────
+
+  async listTicketRequirements(projectId: string, ticketId: string) {
+    const res = await this.db.query(
+      `SELECT r.*, tr.created_at AS linked_at, COALESCE(ap.display_name, ap.email) AS owner_name,
+              COALESCE((
+                SELECT json_agg(json_build_object(
+                  'id', t.id,
+                  'humanId', t.human_id,
+                  'externalId', t.external_id,
+                  'title', t.title,
+                  'status', t.status
+                ) ORDER BY t.updated_at DESC)
+                FROM requirement_testcases rt
+                JOIN testcases t ON t.id = rt.testcase_id
+                WHERE rt.requirement_id = r.id AND rt.deleted_at IS NULL AND t.deleted_at IS NULL
+              ), '[]'::json) AS testcases
+         FROM ticket_requirements tr
+         JOIN requirements r ON r.id = tr.requirement_id
+         LEFT JOIN actor_profiles ap ON ap.id = r.owner_id
+        WHERE tr.project_id = $1
+          AND tr.ticket_id = $2
+          AND tr.deleted_at IS NULL
+          AND r.deleted_at IS NULL
+        ORDER BY r.updated_at DESC`,
+      [projectId, ticketId],
+    );
+    return res.rows.map((row) => ({
+      ...toCamel(row),
+      testcases: normalizeJsonArray(row.testcases).map(toCamel),
+    }));
+  }
+
+  async linkTicketToRequirement(
+    projectId: string,
+    ticketRef: string,
+    requirementRef: string,
+    actorId: string | null,
+  ) {
+    const ticketId = await this.resolveTicketRef(projectId, ticketRef);
+    const requirementId = await this.resolveRequirementRef(projectId, requirementRef);
+
+    const active = await this.db.query<{ id: string }>(
+      `SELECT id FROM ticket_requirements
+        WHERE project_id = $1 AND ticket_id = $2 AND requirement_id = $3 AND deleted_at IS NULL
+        LIMIT 1`,
+      [projectId, ticketId, requirementId],
+    );
+
+    if (!active.rows[0]) {
+      const inactive = await this.db.query<{ id: string }>(
+        `SELECT id FROM ticket_requirements
+          WHERE project_id = $1 AND ticket_id = $2 AND requirement_id = $3 AND deleted_at IS NOT NULL
+          ORDER BY created_at DESC LIMIT 1`,
+        [projectId, ticketId, requirementId],
+      );
+      if (inactive.rows[0]) {
+        await this.db.query(
+          `UPDATE ticket_requirements
+              SET deleted_at = NULL, deleted_by = NULL, created_by = $2, created_at = now()
+            WHERE id = $1`,
+          [inactive.rows[0].id, actorId],
+        );
+      } else {
+        await this.db.query(
+          `INSERT INTO ticket_requirements (project_id, ticket_id, requirement_id, created_by)
+           VALUES ($1,$2,$3,$4)`,
+          [projectId, ticketId, requirementId, actorId],
+        );
+      }
+    }
+
+    const ticket = await this.getBug(ticketId);
+    const requirement = await this.getInternalRequirement(projectId, requirementId);
+    await this.logProjectActivity(
+      projectId,
+      actorId,
+      "ticket_requirement_linked",
+      "ticket",
+      ticketId,
+      `${(ticket as Body).humanId || (ticket as Body).externalId || ticketId} - ${(ticket as Body).title || "Ticket"}`,
+      { requirementId, requirementHumanId: (requirement as Body).humanId },
+    );
+    return { ticket, requirements: await this.listTicketRequirements(projectId, ticketId) };
+  }
+
+  async unlinkTicketFromRequirement(
+    projectId: string,
+    ticketRef: string,
+    requirementRef: string,
+    actorId: string | null,
+  ) {
+    const ticketId = await this.resolveTicketRef(projectId, ticketRef);
+    const requirementId = await this.resolveRequirementRef(projectId, requirementRef);
+    const result = await this.db.query(
+      `UPDATE ticket_requirements
+          SET deleted_at = now(), deleted_by = $4
+        WHERE project_id = $1 AND ticket_id = $2 AND requirement_id = $3 AND deleted_at IS NULL
+        RETURNING id`,
+      [projectId, ticketId, requirementId, actorId],
+    );
+
+    const ticket = await this.getBug(ticketId);
+    if (result.rows[0]) {
+      const requirement = await this.getInternalRequirement(projectId, requirementId);
+      await this.logProjectActivity(
+        projectId,
+        actorId,
+        "ticket_requirement_unlinked",
+        "ticket",
+        ticketId,
+        `${(ticket as Body).humanId || (ticket as Body).externalId || ticketId} - ${(ticket as Body).title || "Ticket"}`,
+        { requirementId, requirementHumanId: (requirement as Body).humanId },
+      );
+    }
+
+    return {
+      ticket,
+      wasLinked: Boolean(result.rows[0]),
+      requirements: await this.listTicketRequirements(projectId, ticketId),
+    };
+  }
+
+  async linkTicketToRequirementForUser(
+    userId: string | null | undefined,
+    projectId: string,
+    ticketRef: string,
+    requirementRef: string,
+  ) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    return this.linkTicketToRequirement(projectId, ticketRef, requirementRef, uid);
+  }
+
+  async unlinkTicketFromRequirementForUser(
+    userId: string | null | undefined,
+    projectId: string,
+    ticketRef: string,
+    requirementRef: string,
+  ) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    return this.unlinkTicketFromRequirement(projectId, ticketRef, requirementRef, uid);
+  }
+
+  async linkTicketToTestcaseForUser(
+    userId: string | null | undefined,
+    projectId: string,
+    ticketRef: string,
+    body: Body,
+    auditActorId?: string | null,
+  ) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const ticketId = await this.resolveTicketRef(projectId, ticketRef);
+    const testcaseRef = String(body.testcaseRef || body.testcaseId || "");
+    const testcaseId = await this.resolveTestcaseRef(projectId, testcaseRef);
+    const cycleId = body.runRef
+      ? await this.resolveRunRef(projectId, String(body.runRef))
+      : (body.cycleId || undefined);
+    return this.addBugLink(
+      uid,
+      ticketId,
+      { testcaseId, cycleId, executionId: body.executionId || undefined },
+      auditActorId ?? uid,
+    );
+  }
+
+  async unlinkTicketFromTestcaseForUser(
+    userId: string | null | undefined,
+    projectId: string,
+    ticketRef: string,
+    testcaseRef: string,
+    auditActorId?: string | null,
+  ) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const ticketId = await this.resolveTicketRef(projectId, ticketRef);
+    const testcaseId = await this.resolveTestcaseRef(projectId, testcaseRef);
+    const links = await this.db.query<{ id: string }>(
+      `SELECT id FROM bug_links
+        WHERE bug_id = $1 AND testcase_id = $2 AND deleted_at IS NULL
+        ORDER BY created_at`,
+      [ticketId, testcaseId],
+    );
+    for (const link of links.rows) {
+      await this.removeBugLink(uid, ticketId, link.id, auditActorId ?? uid);
+    }
+    return { ticket: await this.getBug(ticketId), removed: links.rowCount || 0 };
+  }
+
+
+  private ticketEvidenceKind(value: unknown): "screenshot" | "video" | "trace" | "log" | null {
+    if (value === undefined || value === null || value === "") return null;
+    const normalized = String(value).trim().toLowerCase();
+    if (!["screenshot", "video", "trace", "log"].includes(normalized)) {
+      throw new BadRequestException({ error: "evidenceKind must be screenshot, video, trace, or log" });
+    }
+    return normalized as "screenshot" | "video" | "trace" | "log";
+  }
+
+  async listTicketEvidence(projectId: string, ticketId: string) {
+    const res = await this.db.query(
+      `WITH linked_executions AS (
+         SELECT DISTINCT bl.execution_id, bl.cycle_id, bl.testcase_id
+           FROM bug_links bl
+          WHERE bl.bug_id = $2 AND bl.deleted_at IS NULL AND bl.execution_id IS NOT NULL
+       )
+       SELECT *
+         FROM (
+           SELECT
+             a.id, a.project_id, a.entity_type, a.entity_id, a.file_name, a.content_type,
+             a.file_size, a.evidence_kind, a.uploaded_by, a.created_at,
+             'ticket'::text AS source_type,
+             NULL::uuid AS run_id, NULL::varchar AS run_human_id, NULL::varchar AS run_name,
+             NULL::uuid AS testcase_id, NULL::varchar AS testcase_human_id, NULL::varchar AS testcase_title,
+             NULL::uuid AS execution_id, NULL::varchar AS execution_status
+           FROM attachments a
+          WHERE a.project_id = $1
+            AND a.entity_type = 'bug'
+            AND a.entity_id = $2
+            AND a.deleted_at IS NULL
+
+          UNION ALL
+
+          SELECT
+             a.id, a.project_id, a.entity_type, a.entity_id, a.file_name, a.content_type,
+             a.file_size, a.evidence_kind, a.uploaded_by, a.created_at,
+             'execution'::text AS source_type,
+             c.id AS run_id, c.human_id AS run_human_id, c.name AS run_name,
+             t.id AS testcase_id, t.human_id AS testcase_human_id, t.title AS testcase_title,
+             e.id AS execution_id, e.status AS execution_status
+           FROM linked_executions le
+           JOIN executions e ON e.id = le.execution_id AND e.deleted_at IS NULL
+           JOIN cycles c ON c.id = le.cycle_id
+           LEFT JOIN testcases t ON t.id = le.testcase_id
+           JOIN attachments a ON a.entity_type = 'execution' AND a.entity_id = e.id
+          WHERE a.project_id = $1 AND a.deleted_at IS NULL
+         ) evidence
+        ORDER BY created_at DESC`,
+      [projectId, ticketId],
+    );
+    return res.rows.map(toCamel);
+  }
+
+  async listTicketEvidenceForUser(
+    userId: string | null | undefined,
+    projectId: string,
+    ticketRef: string,
+  ) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const ticketId = await this.resolveTicketRef(projectId, ticketRef);
+    return { list: await this.listTicketEvidence(projectId, ticketId) };
+  }
+
+  async getTicketEvidenceAccess(
+    projectId: string,
+    userId: string | null | undefined,
+    ticketRef: string,
+    attachmentId: string,
+    inline: boolean,
+  ) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const ticketId = await this.resolveTicketRef(projectId, ticketRef);
+    if (!isUuid(attachmentId)) throw new NotFoundException({ error: "Evidence not found" });
+
+    const res = await this.db.query(
+      `SELECT a.*
+         FROM attachments a
+        WHERE a.id = $1
+          AND a.project_id = $2
+          AND a.deleted_at IS NULL
+          AND (
+            (a.entity_type = 'bug' AND a.entity_id = $3)
+            OR
+            (a.entity_type = 'execution' AND EXISTS (
+              SELECT 1
+                FROM bug_links bl
+               WHERE bl.bug_id = $3
+                 AND bl.execution_id = a.entity_id
+                 AND bl.deleted_at IS NULL
+            ))
+          )
+        LIMIT 1`,
+      [attachmentId, projectId, ticketId],
+    );
+    const file = res.rows[0];
+    if (!file) throw new NotFoundException({ error: "Evidence not found" });
+    if (!file.storage_path || !(await this.storage.exists(file.storage_path))) {
+      throw new NotFoundException({ error: "File content is not available" });
+    }
+    const mimeType = file.content_type || "application/octet-stream";
+    const safeInline = inline && /^(image|video)\//.test(mimeType);
+    const access = await this.storage.getAccessUrl(file.storage_path, {
+      filename: file.file_name,
+      inline: safeInline,
+      contentType: mimeType,
+    });
+    return {
+      ...access,
+      mimeType,
+      originalFileName: file.file_name,
+      inline: safeInline,
+    };
+  }
+
+  async uploadTicketEvidenceForUser(
+    userId: string | null | undefined,
+    projectId: string,
+    ticketRef: string,
+    files: Array<{ buffer: Buffer; originalname: string; mimetype: string; size: number }>,
+    evidenceKind?: string | null,
+    auditActorId?: string | null,
+  ) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const ticketId = await this.resolveTicketRef(projectId, ticketRef);
+    return this.uploadBugAttachments(
+      projectId,
+      uid,
+      ticketId,
+      files,
+      this.ticketEvidenceKind(evidenceKind),
+      auditActorId ?? uid,
+    );
+  }
+
+  async attachTicketEvidenceBase64(
+    projectId: string,
+    ticketRef: string,
+    userId: string | null | undefined,
+    actorId: string | null,
+    body: Body,
+  ) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const fileName = String(body.fileName || "").trim();
+    const contentBase64 = String(body.contentBase64 || "").replace(/\s+/g, "");
+    if (!fileName) throw new BadRequestException({ error: "fileName is required" });
+    if (!contentBase64) throw new BadRequestException({ error: "contentBase64 is required" });
+
+    let buffer: Buffer;
+    try {
+      buffer = Buffer.from(contentBase64, "base64");
+    } catch {
+      throw new BadRequestException({ error: "contentBase64 is invalid" });
+    }
+    if (!buffer.length) throw new BadRequestException({ error: "Evidence content is empty or invalid base64" });
+
+    const mcpLimit = 5 * 1024 * 1024;
+    if (buffer.length > mcpLimit) {
+      throw new BadRequestException({
+        error: "MCP evidence is limited to 5MB per file; use the workspace upload for larger evidence.",
+      });
+    }
+
+    return this.uploadTicketEvidenceForUser(
+      uid,
+      projectId,
+      ticketRef,
+      [{
+        buffer,
+        originalname: fileName,
+        mimetype: String(body.contentType || "application/octet-stream"),
+        size: buffer.length,
+      }],
+      body.evidenceKind ? String(body.evidenceKind) : null,
+      actorId,
+    );
+  }
+
+
+  async ticketTraceability(projectId: string, ticketRef: string) {
+    const ticketId = await this.resolveTicketRef(projectId, ticketRef);
+    const ticket = await this.getBug(ticketId);
+    const requirements = await this.listTicketRequirements(projectId, ticketId);
+    const relationRows = await this.db.query(
+      `SELECT
+         bl.id AS link_id,
+         t.id AS testcase_id,
+         t.human_id AS testcase_human_id,
+         t.external_id AS testcase_external_id,
+         t.title AS testcase_title,
+         t.status AS testcase_status,
+         c.id AS run_id,
+         c.human_id AS run_human_id,
+         c.name AS run_name,
+         c.status AS run_status,
+         e.id AS execution_id,
+         e.status AS execution_status,
+         e.actual_result,
+         e.executed_at
+       FROM bug_links bl
+       LEFT JOIN testcases t ON t.id = bl.testcase_id
+       LEFT JOIN cycles c ON c.id = bl.cycle_id
+       LEFT JOIN executions e ON e.id = bl.execution_id AND e.deleted_at IS NULL
+       WHERE bl.bug_id = $1 AND bl.deleted_at IS NULL
+       ORDER BY bl.created_at`,
+      [ticketId],
+    );
+    const testcaseLinks = relationRows.rows.map(toCamel);
+    const evidence = await this.listTicketEvidence(projectId, ticketId);
+
+    const nodeMap = new Map<string, Body>();
+    const edgeKeys = new Set<string>();
+    const edges: Body[] = [];
+    const addEdge = (from: string, to: string, relation: string) => {
+      const key = `${from}|${to}|${relation}`;
+      if (edgeKeys.has(key)) return;
+      edgeKeys.add(key);
+      edges.push({ from, to, relation });
+    };
+
+    const ticketKey = `ticket:${ticketId}`;
+    nodeMap.set(ticketKey, {
+      id: ticketKey,
+      kind: "ticket",
+      entityId: ticketId,
+      humanId: (ticket as Body).humanId,
+      title: (ticket as Body).title,
+      status: (ticket as Body).status,
+    });
+
+    for (const requirement of requirements as Body[]) {
+      const requirementKey = `requirement:${requirement.id}`;
+      nodeMap.set(requirementKey, {
+        id: requirementKey,
+        kind: "requirement",
+        entityId: requirement.id,
+        humanId: requirement.humanId,
+        title: requirement.title,
+        status: requirement.status,
+      });
+      addEdge(ticketKey, requirementKey, "requires");
+
+      for (const testcase of normalizeJsonArray(requirement.testcases)) {
+        const testcaseKey = `testcase:${testcase.id}`;
+        nodeMap.set(testcaseKey, {
+          id: testcaseKey,
+          kind: "testcase",
+          entityId: testcase.id,
+          humanId: testcase.humanId,
+          title: testcase.title,
+          status: testcase.status,
+        });
+        addEdge(requirementKey, testcaseKey, "covered_by");
+      }
+    }
+
+    for (const link of testcaseLinks as Body[]) {
+      if (!link.testcaseId) continue;
+      const testcaseKey = `testcase:${link.testcaseId}`;
+      nodeMap.set(testcaseKey, {
+        id: testcaseKey,
+        kind: "testcase",
+        entityId: link.testcaseId,
+        humanId: link.testcaseHumanId,
+        title: link.testcaseTitle,
+        status: link.testcaseStatus,
+      });
+      addEdge(ticketKey, testcaseKey, "verified_by");
+
+      if (!link.runId) continue;
+      const runKey = `run:${link.runId}`;
+      nodeMap.set(runKey, {
+        id: runKey,
+        kind: "run",
+        entityId: link.runId,
+        humanId: link.runHumanId,
+        title: link.runName,
+        status: link.runStatus,
+      });
+      addEdge(testcaseKey, runKey, "executed_in");
+
+      if (!link.executionId) continue;
+      const executionKey = `execution:${link.executionId}`;
+      nodeMap.set(executionKey, {
+        id: executionKey,
+        kind: "execution",
+        entityId: link.executionId,
+        title: link.testcaseTitle,
+        status: link.executionStatus,
+        actualResult: link.actualResult,
+        executedAt: link.executedAt,
+      });
+      addEdge(runKey, executionKey, "contains_result");
+    }
+
+    for (const item of evidence as Body[]) {
+      const evidenceKey = `evidence:${item.id}`;
+      nodeMap.set(evidenceKey, {
+        id: evidenceKey,
+        kind: "evidence",
+        entityId: item.id,
+        title: item.fileName,
+        status: item.evidenceKind || item.contentType,
+        sourceType: item.sourceType,
+      });
+      addEdge(item.executionId ? `execution:${item.executionId}` : ticketKey, evidenceKey, "evidenced_by");
+    }
+
+    return {
+      ticket,
+      requirements,
+      testcaseLinks,
+      evidence,
+      graph: { nodes: [...nodeMap.values()], edges },
+    };
+  }
+
+  async getTicketWorkspace(
+    userId: string | null | undefined,
+    projectId: string,
+    ticketRef: string,
+  ) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const ticketId = await this.resolveTicketRef(projectId, ticketRef);
+    const traceability = await this.ticketTraceability(projectId, ticketId);
+    const comments = await this.listTicketComments(projectId, ticketId);
+    const activity = await this.db.query(
+      `SELECT a.id, a.action, a.entity_type, a.entity_id, a.entity_name, a.diff, a.created_at,
+              a.actor_id, ap.display_name AS actor_name, ap.email AS actor_email, ap.actor_type
+         FROM audit_logs a
+         LEFT JOIN actor_profiles ap ON ap.id = a.actor_id
+        WHERE a.project_id = $1
+          AND a.entity_id = $2
+          AND a.entity_type IN ('ticket', 'bug')
+        ORDER BY a.created_at DESC
+        LIMIT 100`,
+      [projectId, ticketId],
+    );
+    return { ...traceability, comments, activity: activity.rows.map(toCamel) };
+  }
+
+  async getTicketTraceabilityForUser(
+    userId: string | null | undefined,
+    projectId: string,
+    ticketRef: string,
+  ) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    return this.ticketTraceability(projectId, ticketRef);
+  }
+
+  async getTicketAnalysisContext(
+    userId: string | null | undefined,
+    projectId: string,
+    ticketRef: string,
+  ) {
+    const workspace = await this.getTicketWorkspace(userId, projectId, ticketRef);
+    const ticket = workspace.ticket as Body;
+    const links = workspace.testcaseLinks as Body[];
+    const evidence = workspace.evidence as Body[];
+    const failedExecutions = links.filter((link) => link.executionStatus === "Failed");
+    const blockedExecutions = links.filter((link) => link.executionStatus === "Blocked");
+    const attention: string[] = [];
+
+    if (!(workspace.requirements as Body[]).length) attention.push("Ticket has no linked QA requirement.");
+    if (!links.some((link) => link.testcaseId)) attention.push("Ticket has no linked test case.");
+    if (!evidence.length) attention.push("Ticket has no direct or execution evidence.");
+    if (failedExecutions.length && !evidence.some((item) => item.sourceType === "execution")) {
+      attention.push("Failed execution exists without execution evidence.");
+    }
+    if (ticket.status === "Closed" && failedExecutions.length) {
+      attention.push("Ticket is closed while at least one linked execution is still Failed.");
+    }
+
+    return {
+      ticket: {
+        id: ticket.id,
+        humanId: ticket.humanId,
+        title: ticket.title,
+        description: ticket.description,
+        status: ticket.status,
+        severity: ticket.severity,
+        priority: ticket.priority,
+      },
+      facts: {
+        linkedRequirements: (workspace.requirements as Body[]).length,
+        linkedTestcases: new Set(links.map((link) => link.testcaseId).filter(Boolean)).size,
+        linkedRuns: new Set(links.map((link) => link.runId).filter(Boolean)).size,
+        failedExecutions: failedExecutions.length,
+        blockedExecutions: blockedExecutions.length,
+        evidenceItems: evidence.length,
+        comments: (workspace.comments as Body[]).length,
+      },
+      attention,
+      traceability: workspace.graph,
+      latestComments: (workspace.comments as Body[]).slice(-10),
+      evidence: evidence.slice(0, 50),
+      analysisGuidance: [
+        "Ground every conclusion in the returned ticket, execution, comment, requirement, or evidence metadata.",
+        "Treat root cause as unknown unless evidence supports it.",
+        "Distinguish observed failure facts from hypotheses.",
+        "Use QA/REQ/TC/RUN human IDs when referring to governed QA records.",
+      ],
+    };
+  }
+
+  async searchQaReferences(
+    userId: string | null | undefined,
+    projectId: string,
+    query: string,
+  ) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const q = String(query || "").trim();
+    if (!q) return { matches: [] };
+    const like = `%${q.toLowerCase()}%`;
+    const res = await this.db.query(
+      `SELECT *
+         FROM (
+           SELECT 'ticket'::text AS kind, id, human_id, title, external_id AS alternate_id, 1 AS kind_order
+             FROM bugs
+            WHERE project_id = $1 AND deleted_at IS NULL
+              AND (lower(human_id) LIKE $2 OR lower(external_id) LIKE $2 OR lower(title) LIKE $2)
+           UNION ALL
+           SELECT 'testcase', id, human_id, title, external_id, 2
+             FROM testcases
+            WHERE project_id = $1 AND deleted_at IS NULL
+              AND (lower(human_id) LIKE $2 OR lower(external_id) LIKE $2 OR lower(title) LIKE $2)
+           UNION ALL
+           SELECT 'requirement', id, human_id, title, source_key, 3
+             FROM requirements
+            WHERE project_id = $1 AND deleted_at IS NULL
+              AND (lower(human_id) LIKE $2 OR lower(COALESCE(source_key,'')) LIKE $2 OR lower(title) LIKE $2)
+           UNION ALL
+           SELECT 'run', id, human_id, name AS title, external_id, 4
+             FROM cycles
+            WHERE project_id = $1 AND deleted_at IS NULL
+              AND (lower(human_id) LIKE $2 OR lower(COALESCE(external_id,'')) LIKE $2 OR lower(name) LIKE $2)
+         ) refs
+        ORDER BY CASE WHEN lower(human_id) = lower($3) THEN 0 ELSE 1 END, kind_order, human_id
+        LIMIT 20`,
+      [projectId, like, q],
+    );
+    return {
+      matches: res.rows.map((row) => {
+        const item = toCamel(row) as Body;
+        const href =
+          item.kind === "ticket"
+            ? `/projects/${projectId}/qa-tickets/${encodeURIComponent(String(item.humanId))}`
+            : item.kind === "testcase"
+              ? `/projects/${projectId}/testcases/${item.id}`
+              : item.kind === "run"
+                ? `/projects/${projectId}/cycles/${item.id}`
+                : `/projects/${projectId}/requirements?ref=${encodeURIComponent(String(item.humanId))}`;
+        return { ...item, href };
+      }),
+    };
+  }
+
   private async requireBugAccess(userId: string | null | undefined, bugId: string): Promise<string> {
     const uid = this.requireUser(userId);
     if (!isUuid(bugId)) throw new NotFoundException({ error: "Bug not found" });
@@ -7059,8 +7715,12 @@ export class LegacyService implements OnModuleInit {
    * calling storage.put per file, so rejecting halfway would leave the accepted ones written and
    * billed while the request answers 400. All-or-nothing is the only defensible outcome.
    */
-  private static assertValidEvidenceFiles(files: Array<{ originalname: string; size: number }>) {
-    const supported = [...LegacyService.KB_ALLOWED_EXTENSIONS].sort().join(", ");
+  private static assertValidEvidenceFiles(
+    files: Array<{ originalname: string; size: number; mimetype?: string }>,
+    evidenceKind: "screenshot" | "video" | "trace" | "log" | null = null,
+  ) {
+    const extra = evidenceKind === "trace" ? ["zip"] : [];
+    const supported = [...LegacyService.KB_ALLOWED_EXTENSIONS, ...extra].sort().join(", ");
     for (const file of files) {
       const name = LegacyService.displayFileName(file.originalname);
       const ext = path.extname(file.originalname).replace(/^\./, "").toLowerCase();
@@ -7069,8 +7729,12 @@ export class LegacyService implements OnModuleInit {
           error: `${name} has no file extension, so its type can't be determined. Supported types: ${supported}.`
         });
       }
-      if (!LegacyService.KB_ALLOWED_EXTENSIONS.has(ext)) {
+      const traceArchive = evidenceKind === "trace" && ext === "zip";
+      if (!LegacyService.KB_ALLOWED_EXTENSIONS.has(ext) && !traceArchive) {
         throw new BadRequestException({ error: `${name}: .${ext} files aren't supported. Supported types: ${supported}.` });
+      }
+      if (ext === "zip" && !traceArchive) {
+        throw new BadRequestException({ error: `${name}: .zip is accepted only when evidenceKind is trace.` });
       }
       // A zero-byte file is almost always a failed drag-and-drop or a still-being-written file, and
       // it stores nothing useful while still consuming an attachment row and a storage key.
@@ -7092,7 +7756,9 @@ export class LegacyService implements OnModuleInit {
     projectId: string,
     userId: string | null | undefined,
     bugId: string,
-    files: Array<{ buffer: Buffer; originalname: string; mimetype: string; size: number }>
+    files: Array<{ buffer: Buffer; originalname: string; mimetype: string; size: number }>,
+    evidenceKind: "screenshot" | "video" | "trace" | "log" | null = null,
+    auditActorId?: string | null,
   ) {
     // Uploading writes a file into the workspace's storage and bills it to that workspace's plan
     // allowance, so it needs a caller who is a member of this project — existence of the bug row
@@ -7103,7 +7769,7 @@ export class LegacyService implements OnModuleInit {
     if (!isUuid(bugId)) throw new NotFoundException({ error: "Bug not found" });
     const bug = await this.db.query("SELECT b.id FROM bugs b WHERE b.id = $1 AND b.project_id = $2 AND b.deleted_at IS NULL", [bugId, projectId]);
     if (!bug.rows[0]) throw new NotFoundException({ error: "Bug not found" });
-    LegacyService.assertValidEvidenceFiles(files);
+    LegacyService.assertValidEvidenceFiles(files, evidenceKind);
     await this.planLimits.assertStorageAvailable(
       project.organization_id,
       files.reduce((sum, file) => sum + file.size, 0)
@@ -7115,12 +7781,22 @@ export class LegacyService implements OnModuleInit {
       const storageKey = `bugs/${projectId}/${bugId}/${randomUUID()}${ext ? `.${ext}` : ""}`;
       await this.storage.put(storageKey, file.buffer, file.mimetype);
       const res = await this.db.query(
-        `INSERT INTO attachments (project_id, entity_type, entity_id, file_name, content_type, file_size, storage_path, uploaded_by)
-         VALUES ($1, 'bug', $2, $3, $4, $5, $6, $7) RETURNING *`,
-        [projectId, bugId, LegacyService.displayFileName(file.originalname), file.mimetype, file.size, storageKey, uid]
+        `INSERT INTO attachments (project_id, entity_type, entity_id, file_name, content_type, file_size, storage_path, uploaded_by, evidence_kind)
+         VALUES ($1, 'bug', $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+        [projectId, bugId, LegacyService.displayFileName(file.originalname), file.mimetype, file.size, storageKey, uid, evidenceKind]
       );
       created.push(toCamel(res.rows[0]));
     }
+    const ticket = await this.getBug(bugId);
+    await this.logProjectActivity(
+      projectId,
+      auditActorId ?? uid,
+      "ticket_evidence_uploaded",
+      "ticket",
+      bugId,
+      `${(ticket as Body).humanId || (ticket as Body).externalId || bugId} - ${(ticket as Body).title || "Ticket"}`,
+      { files: created.map((file) => ({ id: file.id, fileName: file.fileName, evidenceKind: file.evidenceKind || null })) },
+    );
     return { list: created, total: created.length };
   }
 
