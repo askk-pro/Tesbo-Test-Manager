@@ -35,6 +35,7 @@ import { TestcasesListCacheService } from "../cache/testcases-list-cache.service
 import { ProjectOverviewCacheService } from "../cache/project-overview-cache.service";
 import { ZYRA_TRACE_CURRENT_STEP, ZyraTurnTraceRecorder, type ZyraOnStage, type ZyraTurnTrace } from "./zyra-turn-trace";
 import { classifyExecutionHistory, clusterFailures, evaluateReleaseGate, evidenceDigest, failureSignatureFor, type FailureExecutionInput } from "./qa-failure-intelligence";
+import { assessBuildRisk, matchImpactRules, normalizeRegressionMatrix, selectRegressionTests, type ChangeFile, type ImpactRuleInput, type RegressionCandidateInput } from "./qa-regression-intelligence";
 
 type Body = Record<string, any>;
 
@@ -7624,6 +7625,1813 @@ export class LegacyService implements OnModuleInit {
       params,
     );
     return res.rows.map(toCamel);
+  }
+
+  // ── Phase 5: build registry, change-impact rules and regression planning ──────────────────
+
+  private phase5BoundedString(value: unknown, field: string, max: number, required = false): string {
+    const text = String(value ?? "").trim();
+    if (required && !text) throw new BadRequestException({ error: `${field} is required` });
+    if (text.length > max) throw new BadRequestException({ error: `${field} must be ${max} characters or fewer` });
+    return text;
+  }
+
+  private phase5ChangedFiles(raw: unknown): ChangeFile[] {
+    const rows = normalizeJsonArray(raw);
+    if (rows.length > 5000) throw new BadRequestException({ error: "changedFiles is limited to 5000 files per build" });
+    const seen = new Set<string>();
+    const files: ChangeFile[] = [];
+    for (const row of rows) {
+      const item = typeof row === "string" ? { path: row } : row && typeof row === "object" ? row as Body : {};
+      const filePath = String(item.path || item.file || item.filename || "").replace(/\\/g, "/").replace(/^\.\//, "").trim();
+      if (!filePath) continue;
+      if (filePath.length > 1024) throw new BadRequestException({ error: "Changed file paths must be 1024 characters or fewer" });
+      if (filePath.includes("\0")) throw new BadRequestException({ error: "Changed file path contains an invalid character" });
+      const key = filePath.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const additions = item.additions == null ? undefined : Number(item.additions);
+      const deletions = item.deletions == null ? undefined : Number(item.deletions);
+      if ((additions != null && (!Number.isFinite(additions) || additions < 0)) ||
+          (deletions != null && (!Number.isFinite(deletions) || deletions < 0))) {
+        throw new BadRequestException({ error: "changedFiles additions/deletions must be non-negative numbers" });
+      }
+      files.push({
+        path: filePath,
+        status: item.status == null ? undefined : String(item.status).slice(0, 32),
+        additions: additions == null ? undefined : Math.floor(additions),
+        deletions: deletions == null ? undefined : Math.floor(deletions),
+      });
+    }
+    return files;
+  }
+
+  private phase5JsonArray(value: unknown, field: string, max = 1000): unknown[] {
+    const rows = normalizeJsonArray(value);
+    if (rows.length > max) throw new BadRequestException({ error: `${field} is limited to ${max} entries` });
+    return rows;
+  }
+
+  private async requirePhase5Manager(userId: string, projectId: string) {
+    const project = await this.requireProjectAccess(userId, projectId);
+    if (this.normalizeRole(project.caller_role) === "qa_engineer") {
+      throw new ForbiddenException({ error: "Only a project owner or manager can change impact rules or certify releases" });
+    }
+    return project;
+  }
+
+  private async requirePhase5Build(userId: string, projectId: string, buildId: string): Promise<Body> {
+    await this.requireProjectAccess(userId, projectId);
+    if (!isUuid(buildId)) throw new NotFoundException({ error: "Build not found" });
+    const res = await this.db.query(
+      `SELECT * FROM qa_build_registry WHERE id=$1 AND project_id=$2`,
+      [buildId, projectId],
+    );
+    if (!res.rows[0]) throw new NotFoundException({ error: "Build not found" });
+    return toCamel(res.rows[0]) as Body;
+  }
+
+  private async requirePhase5Plan(userId: string, projectId: string, planId: string): Promise<Body> {
+    await this.requireProjectAccess(userId, projectId);
+    if (!isUuid(planId)) throw new NotFoundException({ error: "Regression plan not found" });
+    const res = await this.db.query(
+      `SELECT rp.*, b.repository, b.git_sha, b.base_sha, b.branch_name, b.release_name,
+              b.build_version, b.environment, b.config_fingerprint, b.deployment_timestamp,
+              b.source_url, b.changed_files, b.dependency_changes, b.change_stats
+         FROM qa_regression_plans rp
+         JOIN qa_build_registry b ON b.id=rp.build_id
+        WHERE rp.id=$1 AND rp.project_id=$2 AND rp.deleted_at IS NULL`,
+      [planId, projectId],
+    );
+    if (!res.rows[0]) throw new NotFoundException({ error: "Regression plan not found" });
+    const row = toCamel(res.rows[0]) as Body;
+    row.changedFiles = normalizeJsonArray(res.rows[0].changed_files).map(toCamel);
+    row.dependencyChanges = normalizeJsonArray(res.rows[0].dependency_changes).map(toCamel);
+    return row;
+  }
+
+  async registerQaBuild(
+    userId: string | null | undefined,
+    projectId: string,
+    body: Body,
+    auditActorId?: string | null,
+  ) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+
+    const repository = this.phase5BoundedString(body.repository, "repository", 1024, true);
+    const gitSha = this.phase5BoundedString(body.gitSha, "gitSha", 64, true).toLowerCase();
+    if (!/^[0-9a-f]{7,64}$/.test(gitSha)) {
+      throw new BadRequestException({ error: "gitSha must be a 7-64 character hexadecimal Git SHA" });
+    }
+    const baseSha = this.phase5BoundedString(body.baseSha, "baseSha", 64);
+    if (baseSha && !/^[0-9a-f]{7,64}$/i.test(baseSha)) {
+      throw new BadRequestException({ error: "baseSha must be a 7-64 character hexadecimal Git SHA" });
+    }
+    const branchName = this.phase5BoundedString(body.branchName, "branchName", 255);
+    const releaseName = this.phase5BoundedString(body.releaseName, "releaseName", 128);
+    const buildVersion = this.phase5BoundedString(body.buildVersion, "buildVersion", 128);
+    const environment = this.phase5BoundedString(body.environment, "environment", 128);
+    const configFingerprint = this.phase5BoundedString(body.configFingerprint, "configFingerprint", 64);
+    const sourceUrl = this.phase5BoundedString(body.sourceUrl, "sourceUrl", 1024);
+    const allowedProviders = new Set(["manual", "github", "gitlab", "bitbucket", "ci", "api", "mcp", "other"]);
+    const sourceProvider = String(body.sourceProvider || (auditActorId ? "mcp" : "manual")).trim().toLowerCase();
+    if (!allowedProviders.has(sourceProvider)) throw new BadRequestException({ error: "Unsupported sourceProvider" });
+    const prNumber = body.prNumber == null || body.prNumber === "" ? null : Number(body.prNumber);
+    if (prNumber != null && (!Number.isInteger(prNumber) || prNumber <= 0)) {
+      throw new BadRequestException({ error: "prNumber must be a positive integer" });
+    }
+    const changedFiles = this.phase5ChangedFiles(body.changedFiles);
+    const dependencyChanges = this.phase5JsonArray(body.dependencyChanges, "dependencyChanges", 1000);
+    const changeStats = body.changeStats && typeof body.changeStats === "object" && !Array.isArray(body.changeStats) ? body.changeStats : {};
+    const metadata = body.metadata && typeof body.metadata === "object" && !Array.isArray(body.metadata) ? body.metadata : {};
+    const deploymentTimestamp = body.deploymentTimestamp ? new Date(String(body.deploymentTimestamp)) : null;
+    if (deploymentTimestamp && Number.isNaN(deploymentTimestamp.valueOf())) {
+      throw new BadRequestException({ error: "deploymentTimestamp must be a valid date/time" });
+    }
+
+    const res = await this.db.query(
+      `INSERT INTO qa_build_registry
+         (project_id, repository, source_provider, source_url, git_sha, base_sha, branch_name,
+          pr_number, release_name, build_version, environment, config_fingerprint,
+          deployment_timestamp, changed_files, dependency_changes, change_stats, metadata, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15::jsonb,$16::jsonb,$17::jsonb,$18)
+       ON CONFLICT (project_id, repository, git_sha, build_version, environment, config_fingerprint)
+       DO UPDATE SET
+         base_sha=COALESCE(EXCLUDED.base_sha, qa_build_registry.base_sha),
+         branch_name=COALESCE(EXCLUDED.branch_name, qa_build_registry.branch_name),
+         pr_number=COALESCE(EXCLUDED.pr_number, qa_build_registry.pr_number),
+         release_name=CASE WHEN EXCLUDED.release_name<>'' THEN EXCLUDED.release_name ELSE qa_build_registry.release_name END,
+         source_provider=EXCLUDED.source_provider,
+         source_url=COALESCE(EXCLUDED.source_url, qa_build_registry.source_url),
+         deployment_timestamp=COALESCE(EXCLUDED.deployment_timestamp, qa_build_registry.deployment_timestamp),
+         changed_files=CASE WHEN jsonb_array_length(EXCLUDED.changed_files)>0 THEN EXCLUDED.changed_files ELSE qa_build_registry.changed_files END,
+         dependency_changes=EXCLUDED.dependency_changes,
+         change_stats=EXCLUDED.change_stats,
+         metadata=qa_build_registry.metadata || EXCLUDED.metadata,
+         updated_at=now()
+       RETURNING *`,
+      [
+        projectId,
+        repository,
+        sourceProvider,
+        sourceUrl || null,
+        gitSha,
+        baseSha || null,
+        branchName || null,
+        prNumber,
+        releaseName,
+        buildVersion,
+        environment,
+        configFingerprint,
+        deploymentTimestamp ? deploymentTimestamp.toISOString() : null,
+        JSON.stringify(changedFiles),
+        JSON.stringify(dependencyChanges),
+        JSON.stringify(changeStats),
+        JSON.stringify(metadata),
+        auditActorId ?? uid,
+      ],
+    );
+    const build = toCamel(res.rows[0]) as Body;
+    build.changedFiles = changedFiles;
+    build.dependencyChanges = dependencyChanges;
+    await this.logProjectActivity(projectId, auditActorId ?? uid, "qa_build_registered", "qa_build", build.id, buildVersion || gitSha.slice(0, 12), {
+      repository,
+      gitSha,
+      baseSha: baseSha || null,
+      releaseName,
+      buildVersion,
+      environment,
+      changedFileCount: changedFiles.length,
+      dependencyChangeCount: dependencyChanges.length,
+      deployed: Boolean(deploymentTimestamp),
+    });
+    return build;
+  }
+
+  async markQaBuildDeployed(
+    userId: string | null | undefined,
+    projectId: string,
+    buildId: string,
+    body: Body = {},
+    auditActorId?: string | null,
+  ) {
+    const uid = this.requireUser(userId);
+    const build = await this.requirePhase5Build(uid, projectId, buildId);
+    const timestamp = body.deploymentTimestamp ? new Date(String(body.deploymentTimestamp)) : new Date();
+    if (Number.isNaN(timestamp.valueOf())) throw new BadRequestException({ error: "deploymentTimestamp must be a valid date/time" });
+    const res = await this.db.query(
+      `UPDATE qa_build_registry SET deployment_timestamp=$3, updated_at=now()
+        WHERE id=$1 AND project_id=$2
+        RETURNING *`,
+      [buildId, projectId, timestamp.toISOString()],
+    );
+    await this.logProjectActivity(projectId, auditActorId ?? uid, "qa_build_deployed", "qa_build", buildId, build.buildVersion || build.gitSha?.slice(0, 12), {
+      deploymentTimestamp: timestamp.toISOString(),
+    });
+    return toCamel(res.rows[0]);
+  }
+
+  async listQaBuilds(userId: string | null | undefined, projectId: string, limit = 100) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const safeLimit = Math.max(1, Math.min(250, Number(limit) || 100));
+    const res = await this.db.query(
+      `SELECT b.*,
+              (SELECT COUNT(*)::int FROM qa_regression_plans rp WHERE rp.build_id=b.id AND rp.deleted_at IS NULL) AS plan_count,
+              (SELECT state FROM release_certifications rc WHERE rc.build_id=b.id) AS certification_state,
+              (SELECT validity_status FROM release_certifications rc WHERE rc.build_id=b.id) AS certification_validity
+         FROM qa_build_registry b
+        WHERE b.project_id=$1
+        ORDER BY COALESCE(b.deployment_timestamp,b.created_at) DESC
+        LIMIT $2`,
+      [projectId, safeLimit],
+    );
+    return res.rows.map((row) => {
+      const item = toCamel(row) as Body;
+      item.changedFiles = normalizeJsonArray(row.changed_files).map(toCamel);
+      item.dependencyChanges = normalizeJsonArray(row.dependency_changes).map(toCamel);
+      return item;
+    });
+  }
+
+  async getQaBuild(userId: string | null | undefined, projectId: string, buildId: string) {
+    const uid = this.requireUser(userId);
+    const build = await this.requirePhase5Build(uid, projectId, buildId);
+    const res = await this.db.query(
+      `SELECT * FROM qa_build_registry WHERE id=$1 AND project_id=$2`,
+      [buildId, projectId],
+    );
+    const row = res.rows[0];
+    const item = toCamel(row) as Body;
+    item.changedFiles = normalizeJsonArray(row.changed_files).map(toCamel);
+    item.dependencyChanges = normalizeJsonArray(row.dependency_changes).map(toCamel);
+    item.changeStats = row.change_stats || {};
+    item.metadata = row.metadata || {};
+    return item;
+  }
+
+  async listChangeImpactRules(userId: string | null | undefined, projectId: string) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const res = await this.db.query(
+      `SELECT r.*, s.name AS suite_name, req.human_id AS requirement_human_id,
+              req.title AS requirement_title, t.human_id AS testcase_human_id,
+              t.external_id AS testcase_external_id, t.title AS testcase_title
+         FROM change_impact_rules r
+         LEFT JOIN suites s ON s.id=r.suite_id
+         LEFT JOIN requirements req ON req.id=r.requirement_id AND req.deleted_at IS NULL
+         LEFT JOIN testcases t ON t.id=r.testcase_id AND t.deleted_at IS NULL
+        WHERE r.project_id=$1 AND r.deleted_at IS NULL
+        ORDER BY r.active DESC, r.risk_weight DESC, r.name ASC`,
+      [projectId],
+    );
+    return res.rows.map(toCamel);
+  }
+
+  private async phase5ResolveImpactTargets(projectId: string, body: Body, current: Body = {}) {
+    let suiteId = current.suiteId || null;
+    let requirementId = current.requirementId || null;
+    let testcaseId = current.testcaseId || null;
+
+    if (Object.prototype.hasOwnProperty.call(body, "suiteId")) {
+      suiteId = body.suiteId ? String(body.suiteId) : null;
+      if (suiteId) {
+        if (!isUuid(suiteId)) throw new NotFoundException({ error: "Suite not found" });
+        const suite = await this.db.query("SELECT id FROM suites WHERE id=$1 AND project_id=$2 AND deleted_at IS NULL", [suiteId, projectId]);
+        if (!suite.rows[0]) throw new NotFoundException({ error: "Suite not found" });
+      }
+    }
+    if (Object.prototype.hasOwnProperty.call(body, "requirementRef") || Object.prototype.hasOwnProperty.call(body, "requirementId")) {
+      const ref = body.requirementRef || body.requirementId;
+      requirementId = ref ? await this.resolveRequirementRef(projectId, String(ref)) : null;
+    }
+    if (Object.prototype.hasOwnProperty.call(body, "testcaseRef") || Object.prototype.hasOwnProperty.call(body, "testcaseId")) {
+      const ref = body.testcaseRef || body.testcaseId;
+      testcaseId = ref ? await this.resolveTestcaseRef(projectId, String(ref)) : null;
+    }
+    return { suiteId, requirementId, testcaseId };
+  }
+
+  async createChangeImpactRule(
+    userId: string | null | undefined,
+    projectId: string,
+    body: Body,
+    auditActorId?: string | null,
+  ) {
+    const uid = this.requireUser(userId);
+    await this.requirePhase5Manager(uid, projectId);
+    const name = this.phase5BoundedString(body.name, "name", 255, true);
+    const pathPattern = this.phase5BoundedString(body.pathPattern, "pathPattern", 512, true);
+    const component = this.phase5BoundedString(body.component, "component", 255) || null;
+    const targets = await this.phase5ResolveImpactTargets(projectId, body);
+    if (!component && !targets.suiteId && !targets.requirementId && !targets.testcaseId) {
+      throw new BadRequestException({ error: "Impact rule must target a component, suite, requirement, or testcase" });
+    }
+    const riskWeight = body.riskWeight == null ? 5 : Number(body.riskWeight);
+    if (!Number.isInteger(riskWeight) || riskWeight < 0 || riskWeight > 30) {
+      throw new BadRequestException({ error: "riskWeight must be an integer from 0 to 30" });
+    }
+    const res = await this.db.query(
+      `INSERT INTO change_impact_rules
+         (project_id,name,path_pattern,component,suite_id,requirement_id,testcase_id,risk_weight,mandatory,active,created_by,updated_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11)
+       RETURNING *`,
+      [
+        projectId, name, pathPattern, component, targets.suiteId, targets.requirementId, targets.testcaseId,
+        riskWeight, Boolean(body.mandatory), body.active !== false, auditActorId ?? uid,
+      ],
+    );
+    await this.logProjectActivity(projectId, auditActorId ?? uid, "change_impact_rule_created", "change_impact_rule", res.rows[0].id, name, {
+      pathPattern, component, ...targets, riskWeight, mandatory: Boolean(body.mandatory),
+    });
+    return toCamel(res.rows[0]);
+  }
+
+  async updateChangeImpactRule(
+    userId: string | null | undefined,
+    projectId: string,
+    ruleId: string,
+    body: Body,
+    auditActorId?: string | null,
+  ) {
+    const uid = this.requireUser(userId);
+    await this.requirePhase5Manager(uid, projectId);
+    if (!isUuid(ruleId)) throw new NotFoundException({ error: "Impact rule not found" });
+    const currentRes = await this.db.query(
+      `SELECT * FROM change_impact_rules WHERE id=$1 AND project_id=$2 AND deleted_at IS NULL`,
+      [ruleId, projectId],
+    );
+    if (!currentRes.rows[0]) throw new NotFoundException({ error: "Impact rule not found" });
+    const current = toCamel(currentRes.rows[0]) as Body;
+    const name = Object.prototype.hasOwnProperty.call(body, "name")
+      ? this.phase5BoundedString(body.name, "name", 255, true)
+      : current.name;
+    const pathPattern = Object.prototype.hasOwnProperty.call(body, "pathPattern")
+      ? this.phase5BoundedString(body.pathPattern, "pathPattern", 512, true)
+      : current.pathPattern;
+    const component = Object.prototype.hasOwnProperty.call(body, "component")
+      ? (this.phase5BoundedString(body.component, "component", 255) || null)
+      : current.component;
+    const targets = await this.phase5ResolveImpactTargets(projectId, body, current);
+    if (!component && !targets.suiteId && !targets.requirementId && !targets.testcaseId) {
+      throw new BadRequestException({ error: "Impact rule must target a component, suite, requirement, or testcase" });
+    }
+    const riskWeight = Object.prototype.hasOwnProperty.call(body, "riskWeight") ? Number(body.riskWeight) : Number(current.riskWeight);
+    if (!Number.isInteger(riskWeight) || riskWeight < 0 || riskWeight > 30) {
+      throw new BadRequestException({ error: "riskWeight must be an integer from 0 to 30" });
+    }
+    const mandatory = Object.prototype.hasOwnProperty.call(body, "mandatory") ? Boolean(body.mandatory) : Boolean(current.mandatory);
+    const active = Object.prototype.hasOwnProperty.call(body, "active") ? Boolean(body.active) : Boolean(current.active);
+    const res = await this.db.query(
+      `UPDATE change_impact_rules
+          SET name=$3,path_pattern=$4,component=$5,suite_id=$6,requirement_id=$7,testcase_id=$8,
+              risk_weight=$9,mandatory=$10,active=$11,updated_by=$12,updated_at=now()
+        WHERE id=$1 AND project_id=$2 AND deleted_at IS NULL
+        RETURNING *`,
+      [
+        ruleId, projectId, name, pathPattern, component, targets.suiteId, targets.requirementId,
+        targets.testcaseId, riskWeight, mandatory, active, auditActorId ?? uid,
+      ],
+    );
+    await this.logProjectActivity(projectId, auditActorId ?? uid, "change_impact_rule_updated", "change_impact_rule", ruleId, name, {
+      pathPattern, component, ...targets, riskWeight, mandatory, active,
+    });
+    return toCamel(res.rows[0]);
+  }
+
+  async deleteChangeImpactRule(
+    userId: string | null | undefined,
+    projectId: string,
+    ruleId: string,
+    auditActorId?: string | null,
+  ) {
+    const uid = this.requireUser(userId);
+    await this.requirePhase5Manager(uid, projectId);
+    if (!isUuid(ruleId)) throw new NotFoundException({ error: "Impact rule not found" });
+    const res = await this.db.query(
+      `UPDATE change_impact_rules SET deleted_at=now(), active=false, updated_by=$3, updated_at=now()
+        WHERE id=$1 AND project_id=$2 AND deleted_at IS NULL
+        RETURNING id,name`,
+      [ruleId, projectId, auditActorId ?? uid],
+    );
+    if (!res.rows[0]) throw new NotFoundException({ error: "Impact rule not found" });
+    await this.logProjectActivity(projectId, auditActorId ?? uid, "change_impact_rule_deleted", "change_impact_rule", ruleId, res.rows[0].name, {});
+    return { ok: true, id: ruleId };
+  }
+
+  private async phase5RegressionCandidates(projectId: string): Promise<RegressionCandidateInput[]> {
+    const res = await this.db.query(
+      `SELECT t.id, t.human_id, t.external_id, t.title, t.type, t.priority, t.severity,
+              t.component, t.suite_id, t.automation_status, t.automation_path, t.automation_tags,
+              COALESCE(tag_rows.items, '[]'::json) AS custom_tags,
+              COALESCE(req_rows.items, '[]'::json) AS requirement_ids,
+              COALESCE(defect_rows.historical_count,0)::int AS historical_defect_count,
+              COALESCE(defect_rows.open_high_count,0)::int AS open_defect_count
+         FROM testcases t
+         LEFT JOIN LATERAL (
+           SELECT json_agg(ct.name ORDER BY lower(ct.name)) AS items
+             FROM testcase_custom_tags tct
+             JOIN custom_tags ct ON ct.id=tct.tag_id
+            WHERE tct.testcase_id=t.id
+         ) tag_rows ON true
+         LEFT JOIN LATERAL (
+           SELECT json_agg(rt.requirement_id::text ORDER BY rt.created_at) AS items
+             FROM requirement_testcases rt
+             JOIN requirements req ON req.id=rt.requirement_id AND req.deleted_at IS NULL
+            WHERE rt.testcase_id=t.id AND rt.deleted_at IS NULL
+         ) req_rows ON true
+         LEFT JOIN LATERAL (
+           SELECT COUNT(DISTINCT bl.bug_id)::int AS historical_count,
+                  COUNT(DISTINCT bl.bug_id) FILTER (
+                    WHERE b.status IN ('Open','Reopened')
+                      AND (b.severity IN ('Critical','High') OR b.priority IN ('P0','P1'))
+                  )::int AS open_high_count
+             FROM bug_links bl
+             JOIN bugs b ON b.id=bl.bug_id AND b.project_id=t.project_id AND b.deleted_at IS NULL
+            WHERE bl.testcase_id=t.id AND bl.deleted_at IS NULL
+         ) defect_rows ON true
+        WHERE t.project_id=$1 AND t.deleted_at IS NULL
+        ORDER BY t.created_at ASC`,
+      [projectId],
+    );
+    const ids = res.rows.map((row) => String(row.id));
+    const historyRows = await this.phase4ExecutionHistory(projectId, ids, 10);
+    const byTestcase = this.phase4HistoryByTestcase(historyRows);
+    return res.rows.map((row) => {
+      const history = byTestcase.get(String(row.id)) || [];
+      const classification = classifyExecutionHistory(history as FailureExecutionInput[]);
+      return {
+        id: String(row.id),
+        humanId: row.human_id || null,
+        externalId: row.external_id || null,
+        title: String(row.title || "Untitled test case"),
+        type: row.type || null,
+        priority: row.priority || null,
+        severity: row.severity || null,
+        component: row.component || null,
+        suiteId: row.suite_id || null,
+        automationStatus: row.automation_status || null,
+        automationPath: row.automation_path || null,
+        automationTags: row.automation_tags || null,
+        customTags: normalizeJsonArray(row.custom_tags).map(String),
+        requirementIds: normalizeJsonArray(row.requirement_ids).map(String),
+        openDefectCount: Number(row.open_defect_count || 0),
+        historicalDefectCount: Number(row.historical_defect_count || 0),
+        recentFailureCount: history.filter((item) => ["Failed", "Blocked"].includes(String(item.status || ""))).length,
+        flakeClassification: classification.classification,
+        flakeScore: classification.flakeScore,
+      };
+    });
+  }
+
+  private async phase5ImpactRulesForEngine(projectId: string): Promise<ImpactRuleInput[]> {
+    const res = await this.db.query(
+      `SELECT id,path_pattern,component,suite_id,requirement_id,testcase_id,risk_weight,mandatory
+         FROM change_impact_rules
+        WHERE project_id=$1 AND active=true AND deleted_at IS NULL
+        ORDER BY risk_weight DESC, created_at ASC`,
+      [projectId],
+    );
+    return res.rows.map((row) => ({
+      id: String(row.id),
+      pathPattern: String(row.path_pattern),
+      component: row.component || null,
+      suiteId: row.suite_id || null,
+      requirementId: row.requirement_id || null,
+      testcaseId: row.testcase_id || null,
+      riskWeight: Number(row.risk_weight || 0),
+      mandatory: Boolean(row.mandatory),
+    }));
+  }
+
+  private async phase5RepeatedChangedFileCount(projectId: string, buildId: string, files: ChangeFile[]): Promise<number> {
+    if (!files.length) return 0;
+    const res = await this.db.query(
+      `SELECT changed_files
+         FROM qa_build_registry
+        WHERE project_id=$1 AND id<>$2
+        ORDER BY COALESCE(deployment_timestamp,created_at) DESC
+        LIMIT 10`,
+      [projectId, buildId],
+    );
+    const recent = new Set<string>();
+    for (const row of res.rows) {
+      for (const file of normalizeJsonArray(row.changed_files)) {
+        const filePath = String((file as Body)?.path || file || "").replace(/\\/g, "/").toLowerCase();
+        if (filePath) recent.add(filePath);
+      }
+    }
+    return files.filter((file) => recent.has(String(file.path).replace(/\\/g, "/").toLowerCase())).length;
+  }
+
+  private async phase5OpenHighDefectsForTests(projectId: string, testcaseIds: string[]): Promise<number> {
+    if (!testcaseIds.length) return 0;
+    const res = await this.db.query<{ count: number }>(
+      `SELECT COUNT(DISTINCT b.id)::int AS count
+         FROM bugs b
+         JOIN bug_links bl ON bl.bug_id=b.id AND bl.deleted_at IS NULL
+        WHERE b.project_id=$1 AND b.deleted_at IS NULL
+          AND bl.testcase_id = ANY($2::uuid[])
+          AND b.status IN ('Open','Reopened')
+          AND (b.severity IN ('Critical','High') OR b.priority IN ('P0','P1'))`,
+      [projectId, testcaseIds],
+    );
+    return Number(res.rows[0]?.count || 0);
+  }
+
+  async getQaBuildImpact(userId: string | null | undefined, projectId: string, buildId: string) {
+    const uid = this.requireUser(userId);
+    const build = await this.requirePhase5Build(uid, projectId, buildId);
+    const rawBuild = await this.db.query("SELECT * FROM qa_build_registry WHERE id=$1 AND project_id=$2", [buildId, projectId]);
+    const row = rawBuild.rows[0];
+    const changedFiles = normalizeJsonArray(row.changed_files).map((file) => ({
+      path: String((file as Body)?.path || file || ""),
+      status: (file as Body)?.status,
+      additions: (file as Body)?.additions,
+      deletions: (file as Body)?.deletions,
+    })) as ChangeFile[];
+    const dependencyChanges = normalizeJsonArray(row.dependency_changes);
+    const rules = await this.phase5ImpactRulesForEngine(projectId);
+    const candidates = await this.phase5RegressionCandidates(projectId);
+    const selection = selectRegressionTests({
+      changedFiles,
+      rules,
+      candidates,
+      explicitDependencyChanges: dependencyChanges,
+    });
+
+    const candidateById = new Map(candidates.map((candidate) => [candidate.id, candidate]));
+    const selectedIds = selection.selected.map((item) => item.testcaseId);
+    const selectedCandidates = selection.selected.map((item) => candidateById.get(item.testcaseId)).filter(Boolean) as RegressionCandidateInput[];
+
+    const impactedRequirementIds = new Set<string>(selection.impact.requirementIds);
+    for (const item of selection.selected.filter((item) => item.sources.includes("impacted"))) {
+      const candidate = candidateById.get(item.testcaseId);
+      for (const reqId of candidate?.requirementIds || []) impactedRequirementIds.add(String(reqId));
+    }
+    const coveredRequirementIds = new Set<string>();
+    for (const candidate of selectedCandidates) {
+      for (const reqId of candidate.requirementIds || []) {
+        if (impactedRequirementIds.has(String(reqId))) coveredRequirementIds.add(String(reqId));
+      }
+    }
+
+    const openHighDefects = await this.phase5OpenHighDefectsForTests(projectId, selectedIds);
+    const repeatedChangeFiles = await this.phase5RepeatedChangedFileCount(projectId, buildId, changedFiles);
+    const impactedHighRiskTests = selection.selected.filter((item) => {
+      if (!item.sources.includes("impacted")) return false;
+      const candidate = candidateById.get(item.testcaseId);
+      const priority = String(candidate?.priority || "").toUpperCase();
+      const severity = String(candidate?.severity || "").toLowerCase();
+      return priority === "P0" || priority === "P1" || severity === "critical" || severity === "high";
+    }).length;
+    const recentFailures = selectedCandidates.reduce((sum, candidate) => sum + Number(candidate.recentFailureCount || 0), 0);
+    const risk = assessBuildRisk({
+      changedFiles,
+      dependencyChangeCount: dependencyChanges.length + selection.impact.dependencyFiles.length,
+      impactedHighRiskTests,
+      openHighDefects,
+      recentFailures,
+      impactedRequirementCount: impactedRequirementIds.size,
+      coveredRequirementCount: coveredRequirementIds.size,
+      repeatedChangeFiles,
+    });
+
+    const requirementCoveragePct = impactedRequirementIds.size
+      ? Number(((coveredRequirementIds.size / impactedRequirementIds.size) * 100).toFixed(2))
+      : 100;
+    const recommendedCount = selection.selected.length;
+    const impactSnapshot = {
+      changedFiles,
+      dependencyChanges,
+      matchedRules: selection.impact.matchedRules,
+      components: selection.impact.components,
+      suiteIds: selection.impact.suiteIds,
+      requirementIds: [...impactedRequirementIds],
+      testcaseIds: selection.impact.testcaseIds,
+      dependencyFiles: selection.impact.dependencyFiles,
+      requirementCoverage: {
+        impacted: impactedRequirementIds.size,
+        covered: coveredRequirementIds.size,
+        percent: requirementCoveragePct,
+      },
+      repeatedChangeFiles,
+    };
+
+    return {
+      build,
+      risk,
+      impact: impactSnapshot,
+      recommendation: {
+        ...selection.summary,
+        recommendedCount,
+        tests: selection.selected,
+      },
+      policy: {
+        deterministic: true,
+        aiControlsSelection: false,
+        mandatoryTestsCannotBeExcluded: true,
+      },
+    };
+  }
+
+  async generateRegressionPlan(
+    userId: string | null | undefined,
+    projectId: string,
+    buildId: string,
+    body: Body = {},
+    auditActorId?: string | null,
+  ) {
+    const uid = this.requireUser(userId);
+    const analysis = await this.getQaBuildImpact(uid, projectId, buildId);
+    const build = analysis.build as Body;
+    const tests = normalizeJsonArray((analysis.recommendation as Body).tests);
+    if (!tests.length) {
+      throw new ConflictException({
+        error: "No regression tests were selected. Add smoke tests or change-impact rules before generating the plan.",
+      });
+    }
+    const versionRes = await this.db.query<{ version: number }>(
+      `SELECT COALESCE(MAX(version),0)::int + 1 AS version
+         FROM qa_regression_plans
+        WHERE build_id=$1`,
+      [buildId],
+    );
+    const version = Number(versionRes.rows[0]?.version || 1);
+    const matrix = normalizeRegressionMatrix(body.matrix, build.environment || "staging");
+    const label = build.releaseName || build.buildVersion || String(build.gitSha || "").slice(0, 12);
+    const name = this.phase5BoundedString(body.name || `Regression ${label} v${version}`, "name", 255, true);
+    const coveragePct = 100;
+
+    const plan = await this.db.transaction(async (client) => {
+      const planRes = await client.query(
+        `INSERT INTO qa_regression_plans
+           (project_id,build_id,version,name,status,risk_score,risk_band,risk_factors,impact_snapshot,
+            selection_summary,matrix,selected_test_count,coverage_pct,generated_by)
+         VALUES ($1,$2,$3,$4,'DRAFT',$5,$6,$7::jsonb,$8::jsonb,$9::jsonb,$10::jsonb,$11,$12,$13)
+         RETURNING *`,
+        [
+          projectId,
+          buildId,
+          version,
+          name,
+          Number((analysis.risk as Body).score || 0),
+          String((analysis.risk as Body).band || "LOW"),
+          JSON.stringify((analysis.risk as Body).factors || []),
+          JSON.stringify(analysis.impact || {}),
+          JSON.stringify(analysis.recommendation || {}),
+          JSON.stringify(matrix),
+          tests.length,
+          coveragePct,
+          auditActorId ?? uid,
+        ],
+      );
+      const planId = planRes.rows[0].id;
+      for (const test of tests) {
+        await client.query(
+          `INSERT INTO qa_regression_plan_items
+             (plan_id,testcase_id,selection_sources,reasons,risk_weight,mandatory,selected)
+           VALUES ($1,$2,$3::jsonb,$4::jsonb,$5,$6,true)`,
+          [
+            planId,
+            test.testcaseId,
+            JSON.stringify(test.sources || []),
+            JSON.stringify(test.reasons || []),
+            Number(test.riskWeight || 0),
+            Boolean(test.mandatory),
+          ],
+        );
+      }
+      return toCamel(planRes.rows[0]) as Body;
+    });
+    await this.logProjectActivity(projectId, auditActorId ?? uid, "regression_plan_generated", "qa_regression_plan", plan.id, name, {
+      buildId,
+      version,
+      selectedTestCount: tests.length,
+      riskScore: (analysis.risk as Body).score,
+      riskBand: (analysis.risk as Body).band,
+      matrixTargets: matrix.length,
+    });
+    return this.getRegressionPlan(uid, projectId, plan.id);
+  }
+
+  async listRegressionPlans(userId: string | null | undefined, projectId: string, buildId?: string) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const params: unknown[] = [projectId];
+    const where = ["rp.project_id=$1", "rp.deleted_at IS NULL"];
+    if (buildId) {
+      if (!isUuid(buildId)) throw new NotFoundException({ error: "Build not found" });
+      params.push(buildId);
+      where.push(`rp.build_id=$${params.length}`);
+    }
+    const res = await this.db.query(
+      `SELECT rp.*, b.repository,b.git_sha,b.branch_name,b.release_name,b.build_version,b.environment,
+              (SELECT COUNT(*)::int FROM qa_regression_plan_runs pr WHERE pr.plan_id=rp.id) AS run_count
+         FROM qa_regression_plans rp
+         JOIN qa_build_registry b ON b.id=rp.build_id
+        WHERE ${where.join(" AND ")}
+        ORDER BY rp.generated_at DESC
+        LIMIT 200`,
+      params,
+    );
+    return res.rows.map(toCamel);
+  }
+
+  async getRegressionPlan(userId: string | null | undefined, projectId: string, planId: string) {
+    const uid = this.requireUser(userId);
+    const plan = await this.requirePhase5Plan(uid, projectId, planId);
+    const [itemsRes, runsRes, overridesRes] = await Promise.all([
+      this.db.query(
+        `SELECT i.*, t.human_id,t.external_id,t.title,t.type,t.priority,t.severity,t.component,
+                t.automation_status,t.automation_path,t.automation_framework,
+                s.name AS suite_name
+           FROM qa_regression_plan_items i
+           JOIN testcases t ON t.id=i.testcase_id
+           LEFT JOIN suites s ON s.id=t.suite_id
+          WHERE i.plan_id=$1
+          ORDER BY i.mandatory DESC,i.selected DESC,i.risk_weight DESC,t.title ASC`,
+        [planId],
+      ),
+      this.db.query(
+        `SELECT pr.*, c.human_id AS run_human_id,c.name AS run_name,c.status AS run_status,
+                c.build_version,c.release_name,c.started_at,c.ended_at,
+                COUNT(e.id)::int AS total,
+                COUNT(e.id) FILTER (WHERE e.status='Passed')::int AS passed,
+                COUNT(e.id) FILTER (WHERE e.status='Failed')::int AS failed,
+                COUNT(e.id) FILTER (WHERE e.status='Blocked')::int AS blocked,
+                COUNT(e.id) FILTER (WHERE e.status='Skipped')::int AS skipped,
+                COUNT(e.id) FILTER (WHERE e.status IN ('Untested','Retest'))::int AS pending
+           FROM qa_regression_plan_runs pr
+           JOIN cycles c ON c.id=pr.cycle_id
+           LEFT JOIN cycle_items ci ON ci.cycle_id=c.id AND ci.deleted_at IS NULL
+           LEFT JOIN executions e ON e.cycle_item_id=ci.id AND e.deleted_at IS NULL
+          WHERE pr.plan_id=$1
+          GROUP BY pr.id,c.id
+          ORDER BY pr.created_at ASC`,
+        [planId],
+      ),
+      this.db.query(
+        `SELECT o.*, t.human_id,t.external_id,t.title
+           FROM qa_regression_plan_overrides o
+           JOIN testcases t ON t.id=o.testcase_id
+          WHERE o.plan_id=$1
+          ORDER BY o.created_at DESC`,
+        [planId],
+      ),
+    ]);
+    return {
+      ...plan,
+      items: itemsRes.rows.map((row) => {
+        const item = toCamel(row) as Body;
+        item.selectionSources = normalizeJsonArray(row.selection_sources);
+        item.reasons = normalizeJsonArray(row.reasons);
+        return item;
+      }),
+      runs: runsRes.rows.map(toCamel),
+      overrides: overridesRes.rows.map((row) => {
+        const item = toCamel(row) as Body;
+        item.previousState = row.previous_state || {};
+        item.newState = row.new_state || {};
+        return item;
+      }),
+    };
+  }
+
+  private async phase5RecomputePlanCoverage(planId: string) {
+    const res = await this.db.query<{ total: number; selected: number }>(
+      `SELECT COUNT(*)::int AS total,
+              COUNT(*) FILTER (WHERE selected=true)::int AS selected
+         FROM qa_regression_plan_items
+        WHERE plan_id=$1`,
+      [planId],
+    );
+    const total = Number(res.rows[0]?.total || 0);
+    const selected = Number(res.rows[0]?.selected || 0);
+    const coverage = total ? Number(((selected / total) * 100).toFixed(2)) : 0;
+    await this.db.query(
+      `UPDATE qa_regression_plans
+          SET selected_test_count=$2,coverage_pct=$3,updated_at=now()
+        WHERE id=$1`,
+      [planId, selected, coverage],
+    );
+    return { total, selected, coveragePct: coverage };
+  }
+
+  async overrideRegressionPlanTest(
+    userId: string | null | undefined,
+    projectId: string,
+    planId: string,
+    testcaseRef: string,
+    body: Body,
+    auditActorId?: string | null,
+  ) {
+    const uid = this.requireUser(userId);
+    const plan = await this.requirePhase5Plan(uid, projectId, planId);
+    if (plan.status !== "DRAFT") {
+      throw new ConflictException({ error: "Regression scope can only be changed while the plan is DRAFT" });
+    }
+    const testcaseId = await this.resolveTestcaseRef(projectId, testcaseRef);
+    const selected = body.selected !== false;
+    const reason = String(body.reason || "").trim();
+    if (!reason) throw new BadRequestException({ error: "An override reason is required" });
+    if (reason.length > 5000) throw new BadRequestException({ error: "Override reason must be 5000 characters or fewer" });
+
+    const currentRes = await this.db.query(
+      `SELECT * FROM qa_regression_plan_items WHERE plan_id=$1 AND testcase_id=$2`,
+      [planId, testcaseId],
+    );
+    const current = currentRes.rows[0] ? toCamel(currentRes.rows[0]) as Body : null;
+    if (current?.mandatory && !selected) {
+      throw new ConflictException({ error: "Mandatory regression tests cannot be excluded" });
+    }
+
+    const previousState = current
+      ? { selected: Boolean(current.selected), overrideState: current.overrideState, mandatory: Boolean(current.mandatory) }
+      : { selected: false, overrideState: "none", mandatory: false, absent: true };
+    if (!current) {
+      if (!selected) throw new BadRequestException({ error: "A testcase that is not in the plan cannot be excluded" });
+      await this.db.query(
+        `INSERT INTO qa_regression_plan_items
+           (plan_id,testcase_id,selection_sources,reasons,risk_weight,mandatory,selected,override_state,override_note,override_by,override_at)
+         VALUES ($1,$2,'["manual-override"]'::jsonb,$3::jsonb,0,false,true,'included',$4,$5,now())`,
+        [planId, testcaseId, JSON.stringify([reason]), reason, auditActorId ?? uid],
+      );
+    } else {
+      await this.db.query(
+        `UPDATE qa_regression_plan_items
+            SET selected=$3,override_state=$4,override_note=$5,override_by=$6,override_at=now(),updated_at=now()
+          WHERE plan_id=$1 AND testcase_id=$2`,
+        [planId, testcaseId, selected, selected ? "included" : "excluded", reason, auditActorId ?? uid],
+      );
+    }
+    const newState = { selected, overrideState: selected ? "included" : "excluded", mandatory: Boolean(current?.mandatory) };
+    await this.db.query(
+      `INSERT INTO qa_regression_plan_overrides
+         (plan_id,testcase_id,previous_state,new_state,reason,actor_id)
+       VALUES ($1,$2,$3::jsonb,$4::jsonb,$5,$6)`,
+      [planId, testcaseId, JSON.stringify(previousState), JSON.stringify(newState), reason, auditActorId ?? uid],
+    );
+    const coverage = await this.phase5RecomputePlanCoverage(planId);
+    await this.logProjectActivity(projectId, auditActorId ?? uid, "regression_plan_scope_overridden", "qa_regression_plan", planId, plan.name, {
+      testcaseId,
+      selected,
+      reason,
+      coveragePct: coverage.coveragePct,
+    });
+    return this.getRegressionPlan(uid, projectId, planId);
+  }
+
+  private async phase5SelectedItemsForTarget(planId: string, target: Body) {
+    const res = await this.db.query(
+      `SELECT i.testcase_id,i.mandatory,i.selection_sources,
+              t.type,t.automation_status,t.automation_framework,t.automation_tags
+         FROM qa_regression_plan_items i
+         JOIN testcases t ON t.id=i.testcase_id AND t.deleted_at IS NULL
+        WHERE i.plan_id=$1 AND i.selected=true
+        ORDER BY i.mandatory DESC,i.risk_weight DESC,t.title ASC`,
+      [planId],
+    );
+    const targetType = String(target.targetType || "manual");
+    return res.rows
+      .filter((row) => {
+        const automationStatus = String(row.automation_status || "").toLowerCase();
+        const framework = String(row.automation_framework || "").toLowerCase();
+        const type = String(row.type || "").toLowerCase();
+        const tags = String(row.automation_tags || "").toLowerCase().split(",").map((tag) => tag.trim());
+        const sources = normalizeJsonArray(row.selection_sources).map(String);
+        if (targetType === "manual") return automationStatus !== "automated";
+        if (targetType === "api") {
+          return automationStatus === "automated" && (
+            type === "api" || type === "integration" || tags.includes("api") || framework.includes("api")
+          );
+        }
+        if (targetType === "production-safe") {
+          return Boolean(row.mandatory) || sources.includes("smoke");
+        }
+        // Browser targets intentionally exclude obvious API-only tests.
+        return automationStatus === "automated" &&
+          !(type === "api" || tags.includes("api") || framework.includes("api"));
+      })
+      .map((row) => String(row.testcase_id));
+  }
+
+  private phase5RunName(build: Body, target: Body, prefix = "Regression") {
+    const label = build.releaseName || build.buildVersion || String(build.gitSha || "").slice(0, 12);
+    const parts = [prefix, label, target.environment || build.environment || "staging"];
+    if (target.browser) parts.push(String(target.browser));
+    else parts.push(String(target.targetType || "manual"));
+    return parts.join(" · ").slice(0, 255);
+  }
+
+  private async phase5CreateRunForTarget(
+    uid: string,
+    projectId: string,
+    plan: Body,
+    target: Body,
+    testcaseIds: string[],
+    sourceKind: "initial" | "rerun",
+    auditActorId?: string | null,
+    failureSignature?: string | null,
+  ) {
+    if (!testcaseIds.length) return null;
+    const cycle = await this.createCycle(projectId, {
+      name: this.phase5RunName(plan, target, sourceKind === "rerun" ? "Selective rerun" : "Regression"),
+      description: `Generated from Phase-5 regression plan ${plan.name}`,
+      environment: target.environment || plan.environment || null,
+      buildVersion: plan.buildVersion || null,
+      releaseName: plan.releaseName || null,
+      ownerId: uid,
+    });
+    await this.db.query(
+      `UPDATE cycles
+          SET commit_sha=$2,branch_name=$3,build_url=$4,source='manual',updated_at=now()
+        WHERE id=$1`,
+      [cycle.id, plan.gitSha || null, plan.branchName || null, plan.sourceUrl || null],
+    );
+    const attached = await this.addCycleTestCases(cycle.id, uid, { testcaseIds });
+    if (Number(attached.added || 0) === 0) {
+      await this.db.query("UPDATE cycles SET deleted_at=now(),deleted_by=$2 WHERE id=$1", [cycle.id, uid]);
+      return null;
+    }
+    await this.db.query(
+      `INSERT INTO qa_regression_plan_runs
+         (plan_id,cycle_id,environment,browser,target_type,source_kind,failure_signature,created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [
+        plan.id,
+        cycle.id,
+        String(target.environment || plan.environment || ""),
+        String(target.browser || ""),
+        String(target.targetType || "manual"),
+        sourceKind,
+        failureSignature || null,
+        auditActorId ?? uid,
+      ],
+    );
+    return { cycleId: cycle.id, runHumanId: cycle.humanId, testcaseCount: Number(attached.added || 0), target };
+  }
+
+  async startRegressionPlan(
+    userId: string | null | undefined,
+    projectId: string,
+    planId: string,
+    body: Body = {},
+    auditActorId?: string | null,
+  ) {
+    const uid = this.requireUser(userId);
+    const plan = await this.requirePhase5Plan(uid, projectId, planId);
+    if (!["DRAFT", "TESTING"].includes(String(plan.status))) {
+      throw new ConflictException({ error: "Only a DRAFT or TESTING regression plan can start execution" });
+    }
+    const existing = await this.db.query<{ count: number }>(
+      "SELECT COUNT(*)::int AS count FROM qa_regression_plan_runs WHERE plan_id=$1 AND source_kind='initial'",
+      [planId],
+    );
+    if (Number(existing.rows[0]?.count || 0) > 0 && body.allowAdditionalTargets !== true) {
+      throw new ConflictException({ error: "Initial regression runs already exist for this plan" });
+    }
+
+    const matrix = normalizeJsonArray(plan.matrix);
+    const targetIndexes = normalizeJsonArray(body.targetIndexes)
+      .map(Number)
+      .filter((index) => Number.isInteger(index) && index >= 0 && index < matrix.length);
+    const targets = targetIndexes.length
+      ? [...new Set(targetIndexes)].map((index) => matrix[index])
+      : matrix;
+    const created: Body[] = [];
+    const skipped: Body[] = [];
+    for (const rawTarget of targets) {
+      const target = rawTarget as Body;
+      const testcaseIds = await this.phase5SelectedItemsForTarget(planId, target);
+      const run = await this.phase5CreateRunForTarget(uid, projectId, plan, target, testcaseIds, "initial", auditActorId);
+      if (run) created.push(run);
+      else skipped.push({ target, reason: "No selected testcase is applicable to this matrix target" });
+    }
+    if (!created.length) {
+      throw new ConflictException({ error: "No executable matrix target contained applicable selected testcases" });
+    }
+    await this.db.query(
+      `UPDATE qa_regression_plans SET status='TESTING',updated_at=now() WHERE id=$1`,
+      [planId],
+    );
+    await this.logProjectActivity(projectId, auditActorId ?? uid, "regression_plan_execution_started", "qa_regression_plan", planId, plan.name, {
+      createdRuns: created.map((item) => item.cycleId),
+      skippedTargets: skipped.length,
+    });
+    return { plan: await this.getRegressionPlan(uid, projectId, planId), created, skipped };
+  }
+
+  private async phase5FailedPlanExecutions(planId: string) {
+    const res = await this.db.query(
+      `SELECT pr.environment,pr.browser,pr.target_type,pr.cycle_id,
+              ci.testcase_id,t.human_id AS testcase_human_id,t.external_id AS testcase_external_id,t.title,
+              e.id AS execution_id,e.status,e.actual_result,e.error_message,e.error_stack,e.retry_count,e.executed_at,
+              COALESCE(step_rows.items,'[]'::json) AS steps
+         FROM qa_regression_plan_runs pr
+         JOIN cycle_items ci ON ci.cycle_id=pr.cycle_id AND ci.deleted_at IS NULL
+         JOIN executions e ON e.cycle_item_id=ci.id AND e.deleted_at IS NULL
+         JOIN testcases t ON t.id=ci.testcase_id
+         LEFT JOIN LATERAL (
+           SELECT json_agg(
+             json_build_object(
+               'stepNumber',es.step_number,'action',es.action,'status',es.status,
+               'actualResult',es.actual_result,'errorMessage',es.error_message
+             ) ORDER BY es.step_number
+           ) AS items
+             FROM execution_step_results es
+            WHERE es.execution_id=e.id
+         ) step_rows ON true
+        WHERE pr.plan_id=$1 AND e.status IN ('Failed','Blocked')
+        ORDER BY pr.created_at,e.executed_at`,
+      [planId],
+    );
+    return res.rows.map((row) => {
+      const item = toCamel(row) as Body;
+      item.steps = normalizeJsonArray(row.steps).map(toCamel);
+      item.failureSignature = failureSignatureFor(item as FailureExecutionInput).signature;
+      return item;
+    });
+  }
+
+  async createSelectiveRegressionRerun(
+    userId: string | null | undefined,
+    projectId: string,
+    planId: string,
+    body: Body = {},
+    auditActorId?: string | null,
+  ) {
+    const uid = this.requireUser(userId);
+    const plan = await this.requirePhase5Plan(uid, projectId, planId);
+    const mode = String(body.mode || "failed").toLowerCase();
+    if (!["failed", "cluster"].includes(mode)) {
+      throw new BadRequestException({ error: "mode must be failed or cluster" });
+    }
+    const signature = mode === "cluster"
+      ? this.phase5BoundedString(body.failureSignature, "failureSignature", 64, true)
+      : "";
+    if (signature && !/^[0-9a-f]{64}$/i.test(signature)) {
+      throw new BadRequestException({ error: "failureSignature must be a 64-character SHA-256 signature" });
+    }
+    let failures = await this.phase5FailedPlanExecutions(planId);
+    if (mode === "cluster") failures = failures.filter((item) => item.failureSignature === signature);
+    if (!failures.length) throw new ConflictException({ error: "No Failed/Blocked executions match this selective rerun" });
+
+    const groups = new Map<string, { target: Body; testcaseIds: Set<string> }>();
+    for (const failure of failures) {
+      const target = {
+        environment: failure.environment || plan.environment || "",
+        browser: failure.browser || "",
+        targetType: failure.targetType || "manual",
+      };
+      const key = [target.environment, target.browser, target.targetType].join("|");
+      const group = groups.get(key) || { target, testcaseIds: new Set<string>() };
+      group.testcaseIds.add(String(failure.testcaseId));
+      groups.set(key, group);
+    }
+    const created: Body[] = [];
+    for (const group of groups.values()) {
+      const run = await this.phase5CreateRunForTarget(
+        uid,
+        projectId,
+        plan,
+        group.target,
+        [...group.testcaseIds],
+        "rerun",
+        auditActorId,
+        signature || null,
+      );
+      if (run) created.push(run);
+    }
+    await this.logProjectActivity(projectId, auditActorId ?? uid, "regression_selective_rerun_created", "qa_regression_plan", planId, plan.name, {
+      mode,
+      failureSignature: signature || null,
+      failedExecutions: failures.length,
+      createdRuns: created.map((item) => item.cycleId),
+    });
+    return { created, plan: await this.getRegressionPlan(uid, projectId, planId) };
+  }
+
+  private async phase5PlanExecutionEvidence(planId: string) {
+    const planRes = await this.db.query(
+      `SELECT rp.id,rp.project_id,rp.build_id,rp.name,rp.status,rp.risk_score,rp.risk_band,
+              rp.coverage_pct,rp.selected_test_count,rp.matrix,rp.risk_factors,rp.impact_snapshot,
+              rp.selection_summary,
+              b.repository,b.git_sha,b.base_sha,b.branch_name,b.release_name,b.build_version,
+              b.environment,b.config_fingerprint,b.deployment_timestamp,b.changed_files,b.dependency_changes
+         FROM qa_regression_plans rp
+         JOIN qa_build_registry b ON b.id=rp.build_id
+        WHERE rp.id=$1 AND rp.deleted_at IS NULL`,
+      [planId],
+    );
+    if (!planRes.rows[0]) throw new NotFoundException({ error: "Regression plan not found" });
+    const plan = toCamel(planRes.rows[0]) as Body;
+    const runRes = await this.db.query(
+      `SELECT pr.id AS link_id,pr.environment,pr.browser,pr.target_type,pr.source_kind,pr.failure_signature,
+              c.id,c.human_id,c.name,c.status,c.commit_sha,c.release_name,c.build_version,c.started_at,c.ended_at,
+              COUNT(e.id)::int AS total,
+              COUNT(e.id) FILTER (WHERE e.status='Passed')::int AS passed,
+              COUNT(e.id) FILTER (WHERE e.status='Failed')::int AS failed,
+              COUNT(e.id) FILTER (WHERE e.status='Blocked')::int AS blocked,
+              COUNT(e.id) FILTER (WHERE e.status='Skipped')::int AS skipped,
+              COUNT(e.id) FILTER (WHERE e.status IN ('Untested','Retest'))::int AS pending
+         FROM qa_regression_plan_runs pr
+         JOIN cycles c ON c.id=pr.cycle_id AND c.deleted_at IS NULL
+         LEFT JOIN cycle_items ci ON ci.cycle_id=c.id AND ci.deleted_at IS NULL
+         LEFT JOIN executions e ON e.cycle_item_id=ci.id AND e.deleted_at IS NULL
+        WHERE pr.plan_id=$1
+        GROUP BY pr.id,c.id
+        ORDER BY pr.created_at`,
+      [planId],
+    );
+    const runs = runRes.rows.map(toCamel);
+    const initialRuns = runs.filter((run) => run.sourceKind === "initial");
+    const requiredTargets: Body[] = [];
+    for (const rawTarget of normalizeJsonArray(plan.matrix).filter((item: Body) => item.required !== false)) {
+      const target = rawTarget as Body;
+      const applicable = await this.phase5SelectedItemsForTarget(planId, target);
+      if (applicable.length) requiredTargets.push(target);
+    }
+    const matchedRequiredTargets = requiredTargets.filter((target: Body) =>
+      initialRuns.some((run) =>
+        String(run.environment || "") === String(target.environment || "") &&
+        String(run.browser || "") === String(target.browser || "") &&
+        String(run.targetType || "") === String(target.targetType || ""),
+      ),
+    ).length;
+    const totals = runs.reduce((acc, run) => {
+      for (const key of ["total", "passed", "failed", "blocked", "skipped", "pending"]) {
+        acc[key] += Number(run[key] || 0);
+      }
+      return acc;
+    }, { total: 0, passed: 0, failed: 0, blocked: 0, skipped: 0, pending: 0 } as Record<string, number>);
+    const allInitialComplete = initialRuns.length > 0 && initialRuns.every((run) => run.runStatus === "Completed" || run.status === "Completed");
+    return {
+      plan,
+      runs,
+      summary: {
+        requiredTargets: requiredTargets.length,
+        coveredRequiredTargets: matchedRequiredTargets,
+        initialRuns: initialRuns.length,
+        allInitialComplete,
+        ...totals,
+      },
+    };
+  }
+
+  private async phase5LatestCertificationRow(buildId: string): Promise<Body | null> {
+    const res = await this.db.query(
+      `SELECT * FROM release_certifications WHERE build_id=$1 ORDER BY version DESC LIMIT 1`,
+      [buildId],
+    );
+    return res.rows[0] ? toCamel(res.rows[0]) as Body : null;
+  }
+
+  private async phase5BuildIsSuperseded(projectId: string, build: Body): Promise<Body | null> {
+    const res = await this.db.query(
+      `SELECT id,git_sha,build_version,environment,deployment_timestamp
+         FROM qa_build_registry
+        WHERE project_id=$1
+          AND id<>$2
+          AND repository=$3
+          AND environment=$4
+          AND deployment_timestamp IS NOT NULL
+          AND (git_sha<>$5 OR config_fingerprint<>$6)
+          AND deployment_timestamp > COALESCE($7::timestamptz,'epoch'::timestamptz)
+        ORDER BY deployment_timestamp DESC
+        LIMIT 1`,
+      [
+        projectId,
+        build.id,
+        build.repository,
+        build.environment || "",
+        build.gitSha,
+        build.configFingerprint || "",
+        build.deploymentTimestamp || build.createdAt || null,
+      ],
+    );
+    return res.rows[0] ? toCamel(res.rows[0]) as Body : null;
+  }
+
+  private async phase5CertificationFacts(
+    uid: string,
+    projectId: string,
+    buildId: string,
+    planId?: string,
+  ) {
+    const build = await this.requirePhase5Build(uid, projectId, buildId);
+    let selectedPlanId = planId || "";
+    if (!selectedPlanId) {
+      const latestPlan = await this.db.query<{ id: string }>(
+        `SELECT id FROM qa_regression_plans
+          WHERE project_id=$1 AND build_id=$2 AND deleted_at IS NULL
+          ORDER BY version DESC LIMIT 1`,
+        [projectId, buildId],
+      );
+      selectedPlanId = latestPlan.rows[0]?.id || "";
+    }
+    if (!selectedPlanId) {
+      return {
+        build,
+        plan: null,
+        state: "DRAFT",
+        blockers: [{ code: "NO_REGRESSION_PLAN", message: "No regression plan exists for this build." }],
+        warnings: [],
+        evidence: {
+          build: {
+            id: build.id,
+            repository: build.repository,
+            gitSha: build.gitSha,
+            releaseName: build.releaseName || "",
+            buildVersion: build.buildVersion || "",
+            environment: build.environment || "",
+            configFingerprint: build.configFingerprint || "",
+          },
+          plan: null,
+          releaseGate: null,
+        },
+        evidenceDigest: evidenceDigest({
+          buildId: build.id,
+          gitSha: build.gitSha,
+          configFingerprint: build.configFingerprint || "",
+          state: "DRAFT",
+        }),
+        releaseGateId: null,
+      };
+    }
+
+    const plan = await this.requirePhase5Plan(uid, projectId, selectedPlanId);
+    if (String(plan.buildId) !== String(buildId)) {
+      throw new BadRequestException({ error: "Regression plan does not belong to this build" });
+    }
+    const execution = await this.phase5PlanExecutionEvidence(selectedPlanId);
+    const summary = execution.summary as Body;
+    const blockers: Body[] = [];
+    const warnings: Body[] = [];
+
+    if (Number(summary.initialRuns || 0) === 0) {
+      blockers.push({ code: "NO_REGRESSION_RUNS", message: "Regression execution has not started." });
+    }
+    if (Number(summary.coveredRequiredTargets || 0) < Number(summary.requiredTargets || 0)) {
+      blockers.push({
+        code: "MATRIX_COVERAGE_GAP",
+        message: "One or more applicable required environment/browser/API/manual targets have no generated run.",
+        count: Number(summary.requiredTargets || 0) - Number(summary.coveredRequiredTargets || 0),
+      });
+    }
+    if (!summary.allInitialComplete || Number(summary.pending || 0) > 0) {
+      blockers.push({
+        code: "REGRESSION_INCOMPLETE",
+        message: "Regression runs still contain incomplete or pending executions.",
+        count: Number(summary.pending || 0),
+      });
+    }
+    if (Number(summary.failed || 0) > 0) {
+      blockers.push({ code: "REGRESSION_FAILED", message: "Regression executions are failing.", count: Number(summary.failed || 0) });
+    }
+    if (Number(summary.blocked || 0) > 0) {
+      blockers.push({ code: "REGRESSION_BLOCKED", message: "Regression executions are blocked.", count: Number(summary.blocked || 0) });
+    }
+    if (Number(plan.coveragePct || 0) < 100) {
+      warnings.push({
+        code: "REGRESSION_SCOPE_OVERRIDE",
+        message: "The executed regression scope is smaller than the original recommended scope because of audited overrides.",
+        coveragePct: Number(plan.coveragePct || 0),
+      });
+    }
+
+    let latestGate: Body | null = null;
+    let gateEffectiveState = "not_evaluated";
+    let currentGateEvidence: Body | null = null;
+    let currentGateEvaluation: Body | null = null;
+    if (build.releaseName && build.buildVersion) {
+      const gateState = await this.getLatestReleaseQaGate(
+        uid,
+        projectId,
+        String(build.releaseName),
+        String(build.buildVersion),
+        String(build.environment || ""),
+      );
+      latestGate = (gateState as Body).gate || null;
+      gateEffectiveState = String((gateState as Body).effectiveState || "not_evaluated");
+      currentGateEvidence = await this.buildReleaseGateEvidence(
+        projectId,
+        String(build.releaseName),
+        String(build.buildVersion),
+        String(build.environment || ""),
+      );
+      currentGateEvaluation = evaluateReleaseGate((currentGateEvidence as Body).metrics);
+      for (const blocker of normalizeJsonArray((currentGateEvaluation as Body).blockers)) {
+        blockers.push({ ...blocker, source: "phase4-release-gate" });
+      }
+      for (const warning of normalizeJsonArray((currentGateEvaluation as Body).warnings)) {
+        warnings.push({ ...warning, source: "phase4-release-gate" });
+      }
+      if (gateEffectiveState === "needs_re_evaluation") {
+        blockers.push({ code: "QA_GATE_STALE", message: "The approved/evaluated QA gate evidence changed and must be re-evaluated." });
+      } else if (gateEffectiveState === "rejected") {
+        blockers.push({ code: "QA_GATE_REJECTED", message: "The latest human QA gate decision rejected this release." });
+      }
+    } else {
+      warnings.push({ code: "RELEASE_METADATA_MISSING", message: "Release name/build version is missing, so a Phase-4 QA gate cannot be bound yet." });
+    }
+
+    let state = "DRAFT";
+    if (Number(summary.initialRuns || 0) > 0) state = "TESTING";
+    const executionHardBlockers = blockers.filter((item) =>
+      ["MATRIX_COVERAGE_GAP", "REGRESSION_INCOMPLETE", "REGRESSION_FAILED", "REGRESSION_BLOCKED"].includes(String(item.code)),
+    );
+    if (executionHardBlockers.length || blockers.some((item) => String(item.source || "") === "phase4-release-gate") ||
+        blockers.some((item) => ["QA_GATE_STALE", "QA_GATE_REJECTED"].includes(String(item.code)))) {
+      state = "BLOCKED";
+    } else if (Number(summary.initialRuns || 0) > 0 && summary.allInitialComplete && Number(summary.pending || 0) === 0) {
+      state = gateEffectiveState === "approved" ? "APPROVED" : "READY";
+    }
+
+    const evidence = {
+      build: {
+        id: build.id,
+        repository: build.repository,
+        gitSha: build.gitSha,
+        baseSha: build.baseSha || null,
+        branchName: build.branchName || null,
+        releaseName: build.releaseName || "",
+        buildVersion: build.buildVersion || "",
+        environment: build.environment || "",
+        configFingerprint: build.configFingerprint || "",
+        deploymentTimestamp: build.deploymentTimestamp || null,
+      },
+      plan: {
+        id: plan.id,
+        version: Number(plan.version),
+        name: plan.name,
+        riskScore: Number(plan.riskScore || 0),
+        riskBand: plan.riskBand,
+        selectedTestCount: Number(plan.selectedTestCount || 0),
+        coveragePct: Number(plan.coveragePct || 0),
+        matrix: plan.matrix || [],
+        riskFactors: plan.riskFactors || [],
+        impactSnapshot: plan.impactSnapshot || {},
+        selectionSummary: plan.selectionSummary || {},
+      },
+      execution: {
+        summary,
+        runs: execution.runs,
+      },
+      releaseGate: {
+        id: latestGate?.id || null,
+        effectiveState: gateEffectiveState,
+        readiness: latestGate?.readiness || currentGateEvaluation?.readiness || null,
+        decision: latestGate?.decision || null,
+        evidenceDigest: latestGate?.evidenceDigest || null,
+        currentEvaluation: currentGateEvaluation,
+        currentMetrics: currentGateEvidence?.metrics || null,
+      },
+      blockers,
+      warnings,
+    };
+
+    return {
+      build,
+      plan,
+      state,
+      blockers,
+      warnings,
+      evidence,
+      evidenceDigest: evidenceDigest(evidence),
+      releaseGateId: latestGate?.id || null,
+      gateEffectiveState,
+    };
+  }
+
+  private async phase5CertificationEvents(certificationId: string) {
+    const res = await this.db.query(
+      `SELECT * FROM release_certification_events
+        WHERE certification_id=$1
+        ORDER BY created_at ASC`,
+      [certificationId],
+    );
+    return res.rows.map(toCamel);
+  }
+
+  async refreshReleaseCertification(
+    userId: string | null | undefined,
+    projectId: string,
+    buildId: string,
+    auditActorId?: string | null,
+  ) {
+    const uid = this.requireUser(userId);
+    const build = await this.requirePhase5Build(uid, projectId, buildId);
+    const latest = await this.phase5LatestCertificationRow(buildId);
+    if (!latest) return { certification: null, events: [], status: "not_prepared" };
+
+    if (latest.validityStatus === "superseded") {
+      return {
+        certification: latest,
+        events: await this.phase5CertificationEvents(latest.id),
+        status: "superseded",
+      };
+    }
+    if (latest.expiresAt && new Date(String(latest.expiresAt)).valueOf() <= Date.now() && latest.validityStatus === "current") {
+      await this.db.query(
+        `UPDATE release_certifications
+            SET validity_status='expired',invalidated_at=now(),
+                invalidation_reason=COALESCE(invalidation_reason,'Certification expiry reached'),updated_at=now()
+          WHERE id=$1`,
+        [latest.id],
+      );
+      await this.db.query(
+        `INSERT INTO release_certification_events(certification_id,event_type,details,actor_id)
+         VALUES ($1,'expired',$2::jsonb,$3)`,
+        [latest.id, JSON.stringify({ expiresAt: latest.expiresAt }), auditActorId ?? uid],
+      );
+      const expired = await this.phase5LatestCertificationRow(buildId);
+      return {
+        certification: expired,
+        events: await this.phase5CertificationEvents(latest.id),
+        status: "expired",
+      };
+    }
+    if (latest.state === "REVOKED" || latest.validityStatus === "expired") {
+      return {
+        certification: latest,
+        events: await this.phase5CertificationEvents(latest.id),
+        status: String(latest.state || latest.validityStatus).toLowerCase(),
+      };
+    }
+
+    const supersedingBuild = await this.phase5BuildIsSuperseded(projectId, build);
+    if (supersedingBuild && latest.state === "CERTIFIED" && latest.validityStatus === "current") {
+      await this.db.query(
+        `UPDATE release_certifications
+            SET validity_status='superseded',invalidated_at=now(),
+                invalidation_reason=$2,updated_at=now()
+          WHERE id=$1`,
+        [latest.id, `Superseded by deployed build ${supersedingBuild.buildVersion || String(supersedingBuild.gitSha).slice(0, 12)}`],
+      );
+      await this.db.query(
+        `INSERT INTO release_certification_events(certification_id,event_type,details,actor_id)
+         VALUES ($1,'superseded',$2::jsonb,$3)`,
+        [latest.id, JSON.stringify({ supersedingBuildId: supersedingBuild.id }), auditActorId ?? uid],
+      );
+      const updated = await this.phase5LatestCertificationRow(buildId);
+      return { certification: updated, events: await this.phase5CertificationEvents(latest.id), status: "superseded" };
+    }
+
+    const facts = await this.phase5CertificationFacts(uid, projectId, buildId, latest.planId);
+    if (latest.state === "CERTIFIED") {
+      if (String(latest.evidenceDigest || "") !== String(facts.evidenceDigest)) {
+        if (facts.state === "BLOCKED") {
+          const reason = "Certification revoked because current QA evidence contains a release blocker";
+          await this.db.query(
+            `UPDATE release_certifications
+                SET state='REVOKED',revoked_at=now(),revoked_reason=$2,
+                    invalidated_at=COALESCE(invalidated_at,now()),invalidation_reason=COALESCE(invalidation_reason,$2),updated_at=now()
+              WHERE id=$1`,
+            [latest.id, reason],
+          );
+          await this.db.query(
+            `INSERT INTO release_certification_events(certification_id,event_type,details,actor_id)
+             VALUES ($1,'revoked',$2::jsonb,$3)`,
+            [latest.id, JSON.stringify({ reason, blockers: facts.blockers, currentEvidenceDigest: facts.evidenceDigest }), auditActorId ?? uid],
+          );
+        } else {
+          await this.db.query(
+            `UPDATE release_certifications
+                SET validity_status='stale',invalidated_at=now(),
+                    invalidation_reason='QA evidence changed after certification',updated_at=now()
+              WHERE id=$1`,
+            [latest.id],
+          );
+          await this.db.query(
+            `INSERT INTO release_certification_events(certification_id,event_type,details,actor_id)
+             VALUES ($1,'stale',$2::jsonb,$3)`,
+            [latest.id, JSON.stringify({ previousEvidenceDigest: latest.evidenceDigest, currentEvidenceDigest: facts.evidenceDigest }), auditActorId ?? uid],
+          );
+        }
+      }
+      const updated = await this.phase5LatestCertificationRow(buildId);
+      return {
+        certification: updated,
+        events: await this.phase5CertificationEvents(latest.id),
+        status: updated?.validityStatus !== "current" ? updated?.validityStatus : String(updated?.state || "").toLowerCase(),
+      };
+    }
+
+    await this.db.query(
+      `UPDATE release_certifications
+          SET plan_id=$2,release_gate_id=$3,state=$4,evidence_snapshot=$5::jsonb,
+              evidence_digest=$6,updated_at=now()
+        WHERE id=$1`,
+      [
+        latest.id,
+        facts.plan?.id || latest.planId,
+        facts.releaseGateId,
+        facts.state,
+        JSON.stringify(facts.evidence),
+        facts.evidenceDigest,
+      ],
+    );
+    await this.db.query(
+      `UPDATE qa_regression_plans
+          SET status=$2,updated_at=now()
+        WHERE id=$1 AND status<>'COMPLETED'`,
+      [
+        facts.plan?.id || latest.planId,
+        facts.state === "BLOCKED" ? "BLOCKED" :
+        facts.state === "READY" || facts.state === "APPROVED" ? "READY" :
+        facts.state === "TESTING" ? "TESTING" : "DRAFT",
+      ],
+    );
+    const updated = await this.phase5LatestCertificationRow(buildId);
+    return {
+      certification: updated,
+      events: await this.phase5CertificationEvents(latest.id),
+      status: String(updated?.state || "").toLowerCase(),
+      blockers: facts.blockers,
+      warnings: facts.warnings,
+    };
+  }
+
+  async prepareReleaseCertification(
+    userId: string | null | undefined,
+    projectId: string,
+    buildId: string,
+    body: Body = {},
+    auditActorId?: string | null,
+  ) {
+    const uid = this.requireUser(userId);
+    const build = await this.requirePhase5Build(uid, projectId, buildId);
+    const supersedingBuild = await this.phase5BuildIsSuperseded(projectId, build);
+    if (supersedingBuild) {
+      throw new ConflictException({ error: "This build has already been superseded by a newer deployed build" });
+    }
+
+    let latest = await this.phase5LatestCertificationRow(buildId);
+    if (latest) {
+      await this.refreshReleaseCertification(uid, projectId, buildId, auditActorId);
+      latest = await this.phase5LatestCertificationRow(buildId);
+      if (latest?.state === "CERTIFIED" && latest.validityStatus === "current") {
+        return {
+          certification: latest,
+          events: await this.phase5CertificationEvents(latest.id),
+          status: "certified",
+        };
+      }
+    }
+
+    const planId = body.planId ? String(body.planId) : undefined;
+    const facts = await this.phase5CertificationFacts(uid, projectId, buildId, planId);
+    if (!facts.plan) {
+      throw new ConflictException({ error: "Generate a regression plan before preparing release certification" });
+    }
+
+    const mustCreateVersion =
+      !latest ||
+      latest.state === "CERTIFIED" ||
+      latest.state === "REVOKED" ||
+      latest.validityStatus !== "current";
+    if (mustCreateVersion) {
+      const versionRes = await this.db.query<{ version: number }>(
+        "SELECT COALESCE(MAX(version),0)::int + 1 AS version FROM release_certifications WHERE build_id=$1",
+        [buildId],
+      );
+      const version = Number(versionRes.rows[0]?.version || 1);
+      const inserted = await this.db.query(
+        `INSERT INTO release_certifications
+           (project_id,build_id,version,plan_id,release_gate_id,state,validity_status,
+            evidence_snapshot,evidence_digest)
+         VALUES ($1,$2,$3,$4,$5,$6,'current',$7::jsonb,$8)
+         RETURNING *`,
+        [
+          projectId,
+          buildId,
+          version,
+          facts.plan.id,
+          facts.releaseGateId,
+          facts.state,
+          JSON.stringify(facts.evidence),
+          facts.evidenceDigest,
+        ],
+      );
+      latest = toCamel(inserted.rows[0]) as Body;
+      await this.db.query(
+        `INSERT INTO release_certification_events(certification_id,event_type,details,actor_id)
+         VALUES ($1,'prepared',$2::jsonb,$3)`,
+        [latest.id, JSON.stringify({ state: facts.state, evidenceDigest: facts.evidenceDigest }), auditActorId ?? uid],
+      );
+    } else {
+      await this.db.query(
+        `UPDATE release_certifications
+            SET plan_id=$2,release_gate_id=$3,state=$4,evidence_snapshot=$5::jsonb,evidence_digest=$6,updated_at=now()
+          WHERE id=$1`,
+        [latest!.id, facts.plan.id, facts.releaseGateId, facts.state, JSON.stringify(facts.evidence), facts.evidenceDigest],
+      );
+      latest = await this.phase5LatestCertificationRow(buildId);
+    }
+
+    if (!latest) {
+      throw new ConflictException({ error: "Release certification could not be prepared" });
+    }
+
+    await this.logProjectActivity(projectId, auditActorId ?? uid, "release_certification_prepared", "release_certification", latest.id, build.buildVersion || String(build.gitSha).slice(0, 12), {
+      buildId,
+      version: latest.version,
+      state: facts.state,
+      evidenceDigest: facts.evidenceDigest,
+    });
+    return {
+      certification: latest,
+      events: await this.phase5CertificationEvents(latest.id),
+      status: String(latest.state || "").toLowerCase(),
+      blockers: facts.blockers,
+      warnings: facts.warnings,
+    };
+  }
+
+  async certifyRelease(
+    userId: string | null | undefined,
+    projectId: string,
+    buildId: string,
+    body: Body = {},
+  ) {
+    const uid = this.requireUser(userId);
+    await this.requirePhase5Manager(uid, projectId);
+    const prepared = await this.prepareReleaseCertification(uid, projectId, buildId, body, uid);
+    const certification = prepared.certification as Body;
+    if (!certification) throw new ConflictException({ error: "Release certification is not prepared" });
+    if (certification.validityStatus !== "current") {
+      throw new ConflictException({ error: "Release certification evidence is stale/superseded and must be prepared again" });
+    }
+    if (certification.state !== "APPROVED") {
+      throw new ConflictException({
+        error: "Release can only be certified after clean regression evidence and a human-approved Phase-4 QA gate",
+        state: certification.state,
+        blockers: prepared.blockers || [],
+      });
+    }
+    const latestGate = certification.releaseGateId
+      ? await this.db.query("SELECT decision FROM release_quality_gates WHERE id=$1", [certification.releaseGateId])
+      : { rows: [] as Body[] };
+    if (String(latestGate.rows[0]?.decision || "") !== "approved") {
+      throw new ConflictException({ error: "The bound Phase-4 release QA gate is not approved" });
+    }
+
+    const expiresAt = body.expiresAt ? new Date(String(body.expiresAt)) : null;
+    if (expiresAt && (Number.isNaN(expiresAt.valueOf()) || expiresAt.valueOf() <= Date.now())) {
+      throw new BadRequestException({ error: "expiresAt must be a future date/time" });
+    }
+    const certifiedAt = new Date().toISOString();
+    const certificateDigest = evidenceDigest({
+      evidenceDigest: certification.evidenceDigest,
+      certificationId: certification.id,
+      version: certification.version,
+      buildId,
+      planId: certification.planId,
+      releaseGateId: certification.releaseGateId,
+      signedBy: uid,
+      certifiedAt,
+    });
+    const updated = await this.db.query(
+      `UPDATE release_certifications
+          SET state='CERTIFIED',certificate_digest=$2,signed_by=$3,approved_at=COALESCE(approved_at,now()),
+              certified_at=$4,expires_at=$5,updated_at=now()
+        WHERE id=$1 AND state='APPROVED' AND validity_status='current'
+        RETURNING *`,
+      [certification.id, certificateDigest, uid, certifiedAt, expiresAt ? expiresAt.toISOString() : null],
+    );
+    if (!updated.rows[0]) throw new ConflictException({ error: "Certification state changed; refresh and try again" });
+    await this.db.query(
+      "UPDATE qa_regression_plans SET status='COMPLETED',updated_at=now() WHERE id=$1",
+      [certification.planId],
+    );
+    await this.db.query(
+      `INSERT INTO release_certification_events(certification_id,event_type,details,actor_id)
+       VALUES ($1,'certified',$2::jsonb,$3)`,
+      [certification.id, JSON.stringify({ certificateDigest, evidenceDigest: certification.evidenceDigest, certifiedAt, expiresAt: expiresAt?.toISOString() || null }), uid],
+    );
+    await this.logProjectActivity(projectId, uid, "release_certified", "release_certification", certification.id, String(certification.version), {
+      buildId,
+      evidenceDigest: certification.evidenceDigest,
+      certificateDigest,
+      certifiedAt,
+    });
+    return {
+      certification: toCamel(updated.rows[0]),
+      events: await this.phase5CertificationEvents(certification.id),
+      status: "certified",
+    };
+  }
+
+  async revokeReleaseCertification(
+    userId: string | null | undefined,
+    projectId: string,
+    certificationId: string,
+    body: Body,
+  ) {
+    const uid = this.requireUser(userId);
+    await this.requirePhase5Manager(uid, projectId);
+    if (!isUuid(certificationId)) throw new NotFoundException({ error: "Certification not found" });
+    const reason = String(body.reason || "").trim();
+    if (!reason) throw new BadRequestException({ error: "A revocation reason is required" });
+    if (reason.length > 5000) throw new BadRequestException({ error: "Revocation reason must be 5000 characters or fewer" });
+    const res = await this.db.query(
+      `UPDATE release_certifications
+          SET state='REVOKED',revoked_at=now(),revoked_reason=$3,
+              invalidated_at=COALESCE(invalidated_at,now()),invalidation_reason=COALESCE(invalidation_reason,$3),
+              updated_at=now()
+        WHERE id=$1 AND project_id=$2 AND state='CERTIFIED'
+        RETURNING *`,
+      [certificationId, projectId, reason],
+    );
+    if (!res.rows[0]) throw new ConflictException({ error: "Only a current CERTIFIED record can be revoked" });
+    await this.db.query(
+      `INSERT INTO release_certification_events(certification_id,event_type,details,actor_id)
+       VALUES ($1,'revoked',$2::jsonb,$3)`,
+      [certificationId, JSON.stringify({ reason, manual: true }), uid],
+    );
+    await this.logProjectActivity(projectId, uid, "release_certification_revoked", "release_certification", certificationId, null, { reason });
+    return { certification: toCamel(res.rows[0]), events: await this.phase5CertificationEvents(certificationId), status: "revoked" };
+  }
+
+  async getReleaseCertification(
+    userId: string | null | undefined,
+    projectId: string,
+    buildId: string,
+  ) {
+    const uid = this.requireUser(userId);
+    await this.requirePhase5Build(uid, projectId, buildId);
+    const refreshed = await this.refreshReleaseCertification(uid, projectId, buildId);
+    return refreshed;
+  }
+
+  async listReleaseCertifications(userId: string | null | undefined, projectId: string) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const res = await this.db.query(
+      `SELECT rc.*, b.repository,b.git_sha,b.release_name,b.build_version,b.environment,b.deployment_timestamp,
+              rp.name AS plan_name,rp.risk_score,rp.risk_band,rp.coverage_pct
+         FROM release_certifications rc
+         JOIN qa_build_registry b ON b.id=rc.build_id
+         JOIN qa_regression_plans rp ON rp.id=rc.plan_id
+        WHERE rc.project_id=$1
+        ORDER BY rc.created_at DESC
+        LIMIT 250`,
+      [projectId],
+    );
+    return res.rows.map(toCamel);
+  }
+
+  async getPhase5ReleaseDashboard(
+    userId: string | null | undefined,
+    projectId: string,
+    buildId: string,
+  ) {
+    const uid = this.requireUser(userId);
+    const build = await this.requirePhase5Build(uid, projectId, buildId);
+    const latestPlanRes = await this.db.query<{ id: string }>(
+      `SELECT id FROM qa_regression_plans
+        WHERE project_id=$1 AND build_id=$2 AND deleted_at IS NULL
+        ORDER BY version DESC LIMIT 1`,
+      [projectId, buildId],
+    );
+    const planId = latestPlanRes.rows[0]?.id || null;
+    const plan = planId ? await this.getRegressionPlan(uid, projectId, planId) : null;
+    const execution = planId ? await this.phase5PlanExecutionEvidence(planId) : null;
+    let gate: Body | null = null;
+    if (build.releaseName && build.buildVersion) {
+      gate = await this.getLatestReleaseQaGate(
+        uid,
+        projectId,
+        String(build.releaseName),
+        String(build.buildVersion),
+        String(build.environment || ""),
+      ) as Body;
+    }
+    const certification = await this.getReleaseCertification(uid, projectId, buildId);
+    const gateMetrics = (gate?.gate?.evidenceSnapshot?.metrics || gate?.gate?.evidence_snapshot?.metrics || {}) as Body;
+    return {
+      build,
+      risk: plan ? { score: Number((plan as Body).riskScore || 0), band: (plan as Body).riskBand } : null,
+      plan: plan ? {
+        id: (plan as Body).id,
+        version: (plan as Body).version,
+        name: (plan as Body).name,
+        status: (plan as Body).status,
+        selected: Number((plan as Body).selectedTestCount || 0),
+        coveragePct: Number((plan as Body).coveragePct || 0),
+        matrix: (plan as Body).matrix || [],
+      } : null,
+      execution: execution?.summary || null,
+      flaky: Number(gateMetrics.highConfidenceFlaky || 0),
+      qaGate: gate ? {
+        effectiveState: gate.effectiveState,
+        stale: Boolean(gate.stale),
+        gate: gate.gate || null,
+      } : null,
+      certification,
+    };
   }
 
   async resolveRequirementRef(projectId: string, requirementRef: string): Promise<string> {

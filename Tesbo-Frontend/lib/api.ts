@@ -3454,6 +3454,389 @@ export async function decideReleaseQaGate(
   return api(`/api/projects/${projectId}/release-qa-gates/${gateId}/decision`, { method: "POST", body: data });
 }
 
+
+export interface QaBuildRecord {
+  id: string;
+  projectId: string;
+  repository: string;
+  sourceProvider: string;
+  sourceUrl?: string | null;
+  gitSha: string;
+  baseSha?: string | null;
+  branchName?: string | null;
+  prNumber?: number | null;
+  releaseName: string;
+  buildVersion: string;
+  environment: string;
+  configFingerprint: string;
+  deploymentTimestamp?: string | null;
+  changedFiles: Array<{ path: string; status?: string | null; additions?: number | null; deletions?: number | null }>;
+  dependencyChanges: unknown[];
+  changeStats?: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
+  planCount?: number;
+  certificationState?: string | null;
+  certificationValidity?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ChangeImpactRule {
+  id: string;
+  projectId: string;
+  name: string;
+  pathPattern: string;
+  component?: string | null;
+  suiteId?: string | null;
+  suiteName?: string | null;
+  requirementId?: string | null;
+  requirementHumanId?: string | null;
+  requirementTitle?: string | null;
+  testcaseId?: string | null;
+  testcaseHumanId?: string | null;
+  testcaseExternalId?: string | null;
+  testcaseTitle?: string | null;
+  riskWeight: number;
+  mandatory: boolean;
+  active: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface QaBuildImpact {
+  build: QaBuildRecord;
+  risk: {
+    score: number;
+    band: "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
+    factors: Array<{ code: string; points: number; explanation: string }>;
+  };
+  impact: {
+    changedFiles: QaBuildRecord["changedFiles"];
+    dependencyChanges: unknown[];
+    matchedRules: Array<ChangeImpactRule & { matchedFiles?: string[] }>;
+    components: string[];
+    suiteIds: string[];
+    requirementIds: string[];
+    testcaseIds: string[];
+    dependencyFiles: string[];
+    requirementCoverage: { impacted: number; covered: number; percent: number };
+    repeatedChangeFiles: number;
+  };
+  recommendation: {
+    totalCandidates: number;
+    selected: number;
+    smoke: number;
+    impacted: number;
+    historicalFailure: number;
+    flaky: number;
+    priorDefect: number;
+    dependency: number;
+    manual: number;
+    recommendedCount: number;
+    tests: Array<{
+      testcaseId: string;
+      humanId?: string | null;
+      title: string;
+      sources: string[];
+      reasons: string[];
+      riskWeight: number;
+      mandatory: boolean;
+      selected: boolean;
+    }>;
+  };
+  policy: {
+    deterministic: boolean;
+    aiControlsSelection: boolean;
+    mandatoryTestsCannotBeExcluded: boolean;
+  };
+}
+
+export interface RegressionMatrixTarget {
+  environment: string;
+  browser: string;
+  targetType: "browser" | "api" | "manual" | "production-safe";
+  required: boolean;
+}
+
+export interface RegressionPlanItem {
+  id: string;
+  testcaseId: string;
+  humanId?: string | null;
+  externalId?: string | null;
+  title: string;
+  type?: string | null;
+  priority?: string | null;
+  severity?: string | null;
+  component?: string | null;
+  suiteName?: string | null;
+  automationStatus?: string | null;
+  automationPath?: string | null;
+  automationFramework?: string | null;
+  selectionSources: string[];
+  reasons: string[];
+  riskWeight: number;
+  mandatory: boolean;
+  selected: boolean;
+  overrideState: "none" | "included" | "excluded";
+  overrideNote?: string | null;
+}
+
+export interface RegressionPlan {
+  id: string;
+  projectId: string;
+  buildId: string;
+  version: number;
+  name: string;
+  status: "DRAFT" | "TESTING" | "BLOCKED" | "READY" | "COMPLETED";
+  riskScore: number;
+  riskBand: "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
+  riskFactors: Array<{ code: string; points: number; explanation: string }>;
+  impactSnapshot: Record<string, unknown>;
+  selectionSummary: Record<string, unknown>;
+  matrix: RegressionMatrixTarget[];
+  selectedTestCount: number;
+  coveragePct: number;
+  repository?: string;
+  gitSha?: string;
+  baseSha?: string | null;
+  branchName?: string | null;
+  releaseName?: string;
+  buildVersion?: string;
+  environment?: string;
+  items?: RegressionPlanItem[];
+  runs?: Array<{
+    id: string;
+    cycleId: string;
+    environment: string;
+    browser: string;
+    targetType: string;
+    sourceKind: string;
+    runHumanId?: string | null;
+    runName?: string | null;
+    runStatus?: string | null;
+    total: number;
+    passed: number;
+    failed: number;
+    blocked: number;
+    skipped: number;
+    pending: number;
+  }>;
+  overrides?: Array<Record<string, unknown>>;
+}
+
+export interface ReleaseCertification {
+  id: string;
+  projectId: string;
+  buildId: string;
+  version: number;
+  planId: string;
+  releaseGateId?: string | null;
+  state: "DRAFT" | "TESTING" | "BLOCKED" | "READY" | "APPROVED" | "CERTIFIED" | "REVOKED";
+  validityStatus: "current" | "stale" | "superseded" | "expired";
+  evidenceSnapshot: Record<string, unknown>;
+  evidenceDigest?: string | null;
+  certificateDigest?: string | null;
+  signedBy?: string | null;
+  approvedAt?: string | null;
+  certifiedAt?: string | null;
+  expiresAt?: string | null;
+  invalidatedAt?: string | null;
+  invalidationReason?: string | null;
+  revokedAt?: string | null;
+  revokedReason?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ReleaseCertificationResult {
+  certification: ReleaseCertification | null;
+  events: Array<{
+    id: string;
+    eventType: string;
+    details: Record<string, unknown>;
+    actorId?: string | null;
+    createdAt: string;
+  }>;
+  status: string;
+  blockers?: Array<{ code: string; message: string; count?: number }>;
+  warnings?: Array<{ code: string; message: string; count?: number }>;
+}
+
+export interface Phase5ReleaseDashboard {
+  build: QaBuildRecord;
+  risk: { score: number; band: string } | null;
+  plan: {
+    id: string;
+    version: number;
+    name: string;
+    status: string;
+    selected: number;
+    coveragePct: number;
+    matrix: RegressionMatrixTarget[];
+  } | null;
+  execution: {
+    requiredTargets: number;
+    coveredRequiredTargets: number;
+    initialRuns: number;
+    allInitialComplete: boolean;
+    total: number;
+    passed: number;
+    failed: number;
+    blocked: number;
+    skipped: number;
+    pending: number;
+  } | null;
+  flaky: number;
+  qaGate: {
+    effectiveState: string;
+    stale: boolean;
+    gate: ReleaseQualityGate | null;
+  } | null;
+  certification: ReleaseCertificationResult;
+}
+
+export async function listQaBuilds(projectId: string, limit = 100): Promise<QaBuildRecord[]> {
+  return api(`/api/projects/${projectId}/qa-builds?limit=${limit}`);
+}
+
+export async function registerQaBuild(
+  projectId: string,
+  data: {
+    repository: string;
+    gitSha: string;
+    baseSha?: string;
+    branchName?: string;
+    prNumber?: number;
+    releaseName?: string;
+    buildVersion?: string;
+    environment?: string;
+    configFingerprint?: string;
+    deploymentTimestamp?: string;
+    changedFiles?: QaBuildRecord["changedFiles"];
+    dependencyChanges?: unknown[];
+    changeStats?: Record<string, unknown>;
+    sourceUrl?: string;
+    metadata?: Record<string, unknown>;
+  }
+): Promise<QaBuildRecord> {
+  return api(`/api/projects/${projectId}/qa-builds`, { method: "POST", body: data });
+}
+
+export async function getQaBuild(projectId: string, buildId: string): Promise<QaBuildRecord> {
+  return api(`/api/projects/${projectId}/qa-builds/${buildId}`);
+}
+
+export async function markQaBuildDeployed(projectId: string, buildId: string, deploymentTimestamp?: string): Promise<QaBuildRecord> {
+  return api(`/api/projects/${projectId}/qa-builds/${buildId}/deployed`, {
+    method: "POST",
+    body: deploymentTimestamp ? { deploymentTimestamp } : {},
+  });
+}
+
+export async function getQaBuildImpact(projectId: string, buildId: string): Promise<QaBuildImpact> {
+  return api(`/api/projects/${projectId}/qa-builds/${buildId}/impact`);
+}
+
+export async function listChangeImpactRules(projectId: string): Promise<ChangeImpactRule[]> {
+  return api(`/api/projects/${projectId}/change-impact-rules`);
+}
+
+export async function createChangeImpactRule(projectId: string, data: {
+  name: string;
+  pathPattern: string;
+  component?: string;
+  suiteId?: string;
+  requirementRef?: string;
+  testcaseRef?: string;
+  riskWeight?: number;
+  mandatory?: boolean;
+  active?: boolean;
+}): Promise<ChangeImpactRule> {
+  return api(`/api/projects/${projectId}/change-impact-rules`, { method: "POST", body: data });
+}
+
+export async function updateChangeImpactRule(projectId: string, ruleId: string, data: Partial<{
+  name: string;
+  pathPattern: string;
+  component: string | null;
+  suiteId: string | null;
+  requirementRef: string | null;
+  testcaseRef: string | null;
+  riskWeight: number;
+  mandatory: boolean;
+  active: boolean;
+}>): Promise<ChangeImpactRule> {
+  return api(`/api/projects/${projectId}/change-impact-rules/${ruleId}`, { method: "PATCH", body: data });
+}
+
+export async function deleteChangeImpactRule(projectId: string, ruleId: string): Promise<{ ok: boolean; id: string }> {
+  return api(`/api/projects/${projectId}/change-impact-rules/${ruleId}`, { method: "DELETE" });
+}
+
+export async function listRegressionPlans(projectId: string, buildId?: string): Promise<RegressionPlan[]> {
+  return api(`/api/projects/${projectId}/regression-plans${buildId ? `?buildId=${encodeURIComponent(buildId)}` : ""}`);
+}
+
+export async function generateRegressionPlan(projectId: string, buildId: string, data: { name?: string; matrix?: RegressionMatrixTarget[] } = {}): Promise<RegressionPlan> {
+  return api(`/api/projects/${projectId}/qa-builds/${buildId}/regression-plans`, { method: "POST", body: data });
+}
+
+export async function getRegressionPlan(projectId: string, planId: string): Promise<RegressionPlan> {
+  return api(`/api/projects/${projectId}/regression-plans/${planId}`);
+}
+
+export async function overrideRegressionPlanTest(projectId: string, planId: string, testcaseRef: string, data: { selected: boolean; reason: string }): Promise<RegressionPlan> {
+  return api(`/api/projects/${projectId}/regression-plans/${planId}/tests/${encodeURIComponent(testcaseRef)}`, {
+    method: "PATCH",
+    body: data,
+  });
+}
+
+export async function startRegressionPlan(projectId: string, planId: string, data: { targetIndexes?: number[] } = {}): Promise<{ plan: RegressionPlan; created: Array<Record<string, unknown>>; skipped: Array<Record<string, unknown>> }> {
+  return api(`/api/projects/${projectId}/regression-plans/${planId}/start`, { method: "POST", body: data });
+}
+
+export async function createSelectiveRegressionRerun(projectId: string, planId: string, data: { mode?: "failed" | "cluster"; failureSignature?: string } = {}): Promise<{ created: Array<Record<string, unknown>>; plan: RegressionPlan }> {
+  return api(`/api/projects/${projectId}/regression-plans/${planId}/selective-rerun`, { method: "POST", body: data });
+}
+
+export async function getPhase5ReleaseDashboard(projectId: string, buildId: string): Promise<Phase5ReleaseDashboard> {
+  return api(`/api/projects/${projectId}/qa-builds/${buildId}/release-dashboard`);
+}
+
+export async function prepareReleaseCertification(projectId: string, buildId: string, data: { planId?: string } = {}): Promise<ReleaseCertificationResult> {
+  return api(`/api/projects/${projectId}/qa-builds/${buildId}/certification/prepare`, { method: "POST", body: data });
+}
+
+export async function getReleaseCertification(projectId: string, buildId: string): Promise<ReleaseCertificationResult> {
+  return api(`/api/projects/${projectId}/qa-builds/${buildId}/certification`);
+}
+
+export async function certifyRelease(projectId: string, buildId: string, data: { planId?: string; expiresAt?: string } = {}): Promise<ReleaseCertificationResult> {
+  return api(`/api/projects/${projectId}/qa-builds/${buildId}/certification/certify`, { method: "POST", body: data });
+}
+
+export async function listReleaseCertifications(projectId: string): Promise<Array<ReleaseCertification & {
+  repository?: string;
+  gitSha?: string;
+  releaseName?: string;
+  buildVersion?: string;
+  environment?: string;
+  planName?: string;
+  riskScore?: number;
+  riskBand?: string;
+  coveragePct?: number;
+}>> {
+  return api(`/api/projects/${projectId}/release-certifications`);
+}
+
+export async function revokeReleaseCertification(projectId: string, certificationId: string, reason: string): Promise<ReleaseCertificationResult> {
+  return api(`/api/projects/${projectId}/release-certifications/${certificationId}/revoke`, {
+    method: "POST",
+    body: { reason },
+  });
+}
+
 export async function decideQaTicketRetest(
   projectId: string,
   ticketRef: string,

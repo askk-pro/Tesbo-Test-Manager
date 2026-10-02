@@ -1654,6 +1654,365 @@ export function buildMcpTools(): McpTool[] {
         )
     },
     {
+      name: "list_qa_builds",
+      description:
+        "List Phase-5 registered builds/commits for the token project, newest first, including plan/certification state. Read-only.",
+      requiredScope: "read",
+      inputSchema: {
+        type: "object",
+        properties: { limit: { type: "number" } },
+        additionalProperties: false
+      },
+      handler: async (args, ctx) => ctx.legacy.listQaBuilds(ctx.userId, ctx.projectId, Number(args.limit || 100))
+    },
+    {
+      name: "register_qa_build",
+      description:
+        "Register or idempotently refresh one Git build/commit and its changed-file evidence. This is the Phase-5 entry point for change-aware regression. Required: repository, gitSha. Optional: baseSha, branchName, prNumber, releaseName, buildVersion, environment, configFingerprint, deploymentTimestamp, changedFiles, dependencyChanges, changeStats, sourceUrl. This does not certify a release.",
+      requiredScope: "write",
+      inputSchema: {
+        type: "object",
+        properties: {
+          repository: { type: "string" },
+          gitSha: { type: "string" },
+          baseSha: { type: "string" },
+          branchName: { type: "string" },
+          prNumber: { type: "number" },
+          releaseName: { type: "string" },
+          buildVersion: { type: "string" },
+          environment: { type: "string" },
+          configFingerprint: { type: "string" },
+          deploymentTimestamp: { type: "string" },
+          changedFiles: { type: "array", items: { type: "object" } },
+          dependencyChanges: { type: "array", items: {} },
+          changeStats: { type: "object" },
+          sourceUrl: { type: "string" }
+        },
+        required: ["repository", "gitSha"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) =>
+        ctx.legacy.registerQaBuild(
+          ctx.userId,
+          ctx.projectId,
+          { ...args, sourceProvider: "mcp" },
+          ctx.actorId
+        )
+    },
+    {
+      name: "mark_qa_build_deployed",
+      description:
+        "Mark a registered build as deployed. This may automatically supersede older current certifications for the same repository/environment when Git/config evidence changed. Required: buildId. Optional: deploymentTimestamp.",
+      requiredScope: "write",
+      inputSchema: {
+        type: "object",
+        properties: {
+          buildId: { type: "string" },
+          deploymentTimestamp: { type: "string" }
+        },
+        required: ["buildId"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) =>
+        ctx.legacy.markQaBuildDeployed(
+          ctx.userId,
+          ctx.projectId,
+          requireString(args, "buildId"),
+          { deploymentTimestamp: typeof args.deploymentTimestamp === "string" ? args.deploymentTimestamp : undefined },
+          ctx.actorId
+        )
+    },
+    {
+      name: "get_qa_build_impact",
+      description:
+        "Compute deterministic Phase-5 change impact, transparent risk factors and smart regression recommendations for one registered build. Uses explicit path-impact rules, smoke coverage, Phase-4 history, linked defects, dependency changes and requirement coverage. Required: buildId. Read-only.",
+      requiredScope: "read",
+      inputSchema: {
+        type: "object",
+        properties: { buildId: { type: "string" } },
+        required: ["buildId"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) =>
+        ctx.legacy.getQaBuildImpact(ctx.userId, ctx.projectId, requireString(args, "buildId"))
+    },
+    {
+      name: "list_change_impact_rules",
+      description:
+        "List reusable path-glob change-impact rules for the token project. Rules can target components, suites, REQ records or TC records. Read-only.",
+      requiredScope: "read",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      handler: async (_args, ctx) => ctx.legacy.listChangeImpactRules(ctx.userId, ctx.projectId)
+    },
+    {
+      name: "create_change_impact_rule",
+      description:
+        "Create a reusable Phase-5 path→QA impact rule. The token user must be a project Owner/Manager. Required: name, pathPattern and at least one target (component, suiteId, requirementRef or testcaseRef). Optional: riskWeight 0-30, mandatory.",
+      requiredScope: "write",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          pathPattern: { type: "string" },
+          component: { type: "string" },
+          suiteId: { type: "string" },
+          requirementRef: { type: "string" },
+          testcaseRef: { type: "string" },
+          riskWeight: { type: "number" },
+          mandatory: { type: "boolean" }
+        },
+        required: ["name", "pathPattern"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) =>
+        ctx.legacy.createChangeImpactRule(ctx.userId, ctx.projectId, args, ctx.actorId)
+    },
+    {
+      name: "update_change_impact_rule",
+      description:
+        "Update an existing Phase-5 path-impact rule. Owner/Manager only. Required: ruleId; all rule fields are optional patches.",
+      requiredScope: "write",
+      inputSchema: {
+        type: "object",
+        properties: {
+          ruleId: { type: "string" },
+          name: { type: "string" },
+          pathPattern: { type: "string" },
+          component: { type: "string" },
+          suiteId: { type: "string" },
+          requirementRef: { type: "string" },
+          testcaseRef: { type: "string" },
+          riskWeight: { type: "number" },
+          mandatory: { type: "boolean" },
+          active: { type: "boolean" }
+        },
+        required: ["ruleId"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) => {
+        const { ruleId, ...body } = args;
+        return ctx.legacy.updateChangeImpactRule(
+          ctx.userId,
+          ctx.projectId,
+          String(ruleId || ""),
+          body,
+          ctx.actorId
+        );
+      }
+    },
+    {
+      name: "delete_change_impact_rule",
+      description:
+        "Soft-delete a Phase-5 path-impact rule. Owner/Manager only. Required: ruleId.",
+      requiredScope: "write",
+      inputSchema: {
+        type: "object",
+        properties: { ruleId: { type: "string" } },
+        required: ["ruleId"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) =>
+        ctx.legacy.deleteChangeImpactRule(
+          ctx.userId,
+          ctx.projectId,
+          requireString(args, "ruleId"),
+          ctx.actorId
+        )
+    },
+    {
+      name: "generate_regression_plan",
+      description:
+        "Generate a versioned deterministic smart-regression plan for a registered build. Required: buildId. Optional: name and matrix targets. The result stores transparent risk/impact reasons; AI does not control the selection.",
+      requiredScope: "write",
+      inputSchema: {
+        type: "object",
+        properties: {
+          buildId: { type: "string" },
+          name: { type: "string" },
+          matrix: { type: "array", items: { type: "object" } }
+        },
+        required: ["buildId"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) =>
+        ctx.legacy.generateRegressionPlan(
+          ctx.userId,
+          ctx.projectId,
+          requireString(args, "buildId"),
+          {
+            name: typeof args.name === "string" ? args.name : undefined,
+            matrix: Array.isArray(args.matrix) ? args.matrix : undefined
+          },
+          ctx.actorId
+        )
+    },
+    {
+      name: "list_regression_plans",
+      description:
+        "List Phase-5 regression plans in the token project. Optional buildId filter. Read-only.",
+      requiredScope: "read",
+      inputSchema: {
+        type: "object",
+        properties: { buildId: { type: "string" } },
+        additionalProperties: false
+      },
+      handler: async (args, ctx) =>
+        ctx.legacy.listRegressionPlans(
+          ctx.userId,
+          ctx.projectId,
+          typeof args.buildId === "string" && args.buildId.trim() ? args.buildId : undefined
+        )
+    },
+    {
+      name: "get_regression_plan",
+      description:
+        "Read one regression plan with selected tests, reasons, overrides, generated RUN-n cycles and execution counts. Required: planId.",
+      requiredScope: "read",
+      inputSchema: {
+        type: "object",
+        properties: { planId: { type: "string" } },
+        required: ["planId"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) =>
+        ctx.legacy.getRegressionPlan(ctx.userId, ctx.projectId, requireString(args, "planId"))
+    },
+    {
+      name: "override_regression_plan_test",
+      description:
+        "Include or exclude one testcase from a DRAFT regression plan with an auditable human/agent reason. Mandatory tests cannot be excluded. Required: planId, testcaseRef, selected, reason.",
+      requiredScope: "write",
+      inputSchema: {
+        type: "object",
+        properties: {
+          planId: { type: "string" },
+          testcaseRef: { type: "string" },
+          selected: { type: "boolean" },
+          reason: { type: "string" }
+        },
+        required: ["planId", "testcaseRef", "selected", "reason"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) =>
+        ctx.legacy.overrideRegressionPlanTest(
+          ctx.userId,
+          ctx.projectId,
+          requireString(args, "planId"),
+          requireString(args, "testcaseRef"),
+          { selected: args.selected !== false, reason: requireString(args, "reason") },
+          ctx.actorId
+        )
+    },
+    {
+      name: "start_regression_plan",
+      description:
+        "Materialize a DRAFT smart-regression plan into normal RUN-n cycles for its applicable environment/browser/API/manual matrix targets. Existing cycle/execution/evidence workflows remain the source of truth. Required: planId. Optional targetIndexes.",
+      requiredScope: "write",
+      inputSchema: {
+        type: "object",
+        properties: {
+          planId: { type: "string" },
+          targetIndexes: { type: "array", items: { type: "number" } }
+        },
+        required: ["planId"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) =>
+        ctx.legacy.startRegressionPlan(
+          ctx.userId,
+          ctx.projectId,
+          requireString(args, "planId"),
+          { targetIndexes: Array.isArray(args.targetIndexes) ? args.targetIndexes : undefined },
+          ctx.actorId
+        )
+    },
+    {
+      name: "create_selective_regression_rerun",
+      description:
+        "Create normal RUN-n selective reruns from only Failed/Blocked executions in a Phase-5 plan, or from one Phase-4 failure signature cluster. Required: planId. Optional mode=failed|cluster; cluster mode requires failureSignature.",
+      requiredScope: "write",
+      inputSchema: {
+        type: "object",
+        properties: {
+          planId: { type: "string" },
+          mode: { type: "string" },
+          failureSignature: { type: "string" }
+        },
+        required: ["planId"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) =>
+        ctx.legacy.createSelectiveRegressionRerun(
+          ctx.userId,
+          ctx.projectId,
+          requireString(args, "planId"),
+          {
+            mode: typeof args.mode === "string" ? args.mode : "failed",
+            failureSignature: typeof args.failureSignature === "string" ? args.failureSignature : undefined
+          },
+          ctx.actorId
+        )
+    },
+    {
+      name: "prepare_release_certification",
+      description:
+        "Prepare or refresh an evidence-bound Phase-5 release certification version for a build. It derives DRAFT/TESTING/BLOCKED/READY/APPROVED from regression evidence and the human Phase-4 QA gate. This tool does NOT certify the release. Required: buildId. Optional: planId.",
+      requiredScope: "write",
+      inputSchema: {
+        type: "object",
+        properties: {
+          buildId: { type: "string" },
+          planId: { type: "string" }
+        },
+        required: ["buildId"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) =>
+        ctx.legacy.prepareReleaseCertification(
+          ctx.userId,
+          ctx.projectId,
+          requireString(args, "buildId"),
+          { planId: typeof args.planId === "string" && args.planId.trim() ? args.planId : undefined },
+          ctx.actorId
+        )
+    },
+    {
+      name: "get_release_certification",
+      description:
+        "Read and refresh the latest certification for a build. Current QA evidence may automatically mark a certificate stale/revoked; a newer deployed build may make it superseded. Required: buildId. Read-only from the client's perspective.",
+      requiredScope: "read",
+      inputSchema: {
+        type: "object",
+        properties: { buildId: { type: "string" } },
+        required: ["buildId"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) =>
+        ctx.legacy.getReleaseCertification(ctx.userId, ctx.projectId, requireString(args, "buildId"))
+    },
+    {
+      name: "list_release_certifications",
+      description:
+        "List Phase-5 release certification versions and validity states in the token project. Read-only.",
+      requiredScope: "read",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      handler: async (_args, ctx) => ctx.legacy.listReleaseCertifications(ctx.userId, ctx.projectId)
+    },
+    {
+      name: "get_release_dashboard",
+      description:
+        "Return the consolidated Phase-5 release dashboard for one registered build: commit/build, deterministic risk, regression scope/coverage, execution counts, flaky count, Phase-4 QA gate and certification state. Required: buildId.",
+      requiredScope: "read",
+      inputSchema: {
+        type: "object",
+        properties: { buildId: { type: "string" } },
+        required: ["buildId"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) =>
+        ctx.legacy.getPhase5ReleaseDashboard(ctx.userId, ctx.projectId, requireString(args, "buildId"))
+    },
+    {
       name: "decide_ticket_retest",
       description:
         "Evaluate a completed governed retest using its stored execution results. Required: ticketRef, runRef. Optional: note. The server computes Passed/Failed/Blocked; callers cannot override it. Passed closes the ticket, Failed/Blocked reopens it. Refuses incomplete runs.",

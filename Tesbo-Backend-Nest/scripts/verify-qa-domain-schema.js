@@ -21,8 +21,8 @@ async function main() {
     const migration = await scalar(
       "select count(*)::int as count, max(version)::int as max_version from schema_migrations",
     );
-    if (migration.count < 132 || migration.max_version < 132) {
-      throw new Error(`Expected migration 132; got count=${migration.count}, max=${migration.max_version}`);
+    if (migration.count < 133 || migration.max_version < 133) {
+      throw new Error(`Expected migration 133; got count=${migration.count}, max=${migration.max_version}`);
     }
 
     await client.query("BEGIN");
@@ -177,6 +177,121 @@ async function main() {
       [projectId, JSON.stringify({ releaseName: "release-ci", buildVersion: "build-132", passed: 1 }), "c".repeat(64)],
     );
 
+    const phase5BuildOne = await scalar(
+      `insert into qa_build_registry
+         (project_id,repository,source_provider,git_sha,base_sha,branch_name,release_name,build_version,
+          environment,config_fingerprint,deployment_timestamp,changed_files,dependency_changes,change_stats,metadata)
+       values ($1,'askk-pro/qa-ci','ci',$2,$3,'main','release-ci','build-133','staging',$4,
+               now() - interval '1 hour',$5::jsonb,'[]'::jsonb,'{}'::jsonb,'{}'::jsonb)
+       returning id`,
+      [
+        projectId,
+        "1".repeat(40),
+        "0".repeat(40),
+        "a".repeat(64),
+        JSON.stringify([{ path: "src/auth/session.ts", status: "modified", additions: 10, deletions: 2 }]),
+      ],
+    );
+    const phase5Rule = await scalar(
+      `insert into change_impact_rules
+         (project_id,name,path_pattern,testcase_id,risk_weight,mandatory)
+       values ($1,'CI auth impact','src/auth/**',$2,15,true)
+       returning id`,
+      [projectId, tcOne.id],
+    );
+    const phase5Plan = await scalar(
+      `insert into qa_regression_plans
+         (project_id,build_id,version,name,status,risk_score,risk_band,risk_factors,impact_snapshot,
+          selection_summary,matrix,selected_test_count,coverage_pct)
+       values ($1,$2,1,'CI smart regression','READY',45,'MEDIUM',
+               '[{"code":"CHANGE_SIZE","points":5,"explanation":"CI"}]'::jsonb,
+               '{"components":["Auth"]}'::jsonb,
+               '{"selected":1,"impacted":1}'::jsonb,
+               '[{"environment":"staging","browser":"","targetType":"manual","required":true}]'::jsonb,
+               1,100)
+       returning id`,
+      [projectId, phase5BuildOne.id],
+    );
+    await client.query(
+      `insert into qa_regression_plan_items
+         (plan_id,testcase_id,selection_sources,reasons,risk_weight,mandatory,selected)
+       values ($1,$2,'["impacted","smoke"]'::jsonb,'["CI impact rule"]'::jsonb,20,true,true)`,
+      [phase5Plan.id, tcOne.id],
+    );
+    await client.query(
+      `insert into qa_regression_plan_runs
+         (plan_id,cycle_id,environment,browser,target_type,source_kind)
+       values ($1,$2,'staging','','manual','initial')`,
+      [phase5Plan.id, runOne.id],
+    );
+    const phase5Cert = await scalar(
+      `insert into release_certifications
+         (project_id,build_id,version,plan_id,state,validity_status,evidence_snapshot,evidence_digest,
+          certificate_digest,certified_at)
+       values ($1,$2,1,$3,'CERTIFIED','current',$4::jsonb,$5,$6,now())
+       returning id`,
+      [
+        projectId,
+        phase5BuildOne.id,
+        phase5Plan.id,
+        JSON.stringify({ buildId: phase5BuildOne.id, planId: phase5Plan.id, selected: 1 }),
+        "d".repeat(64),
+        "e".repeat(64),
+      ],
+    );
+    await client.query(
+      `insert into release_certification_events(certification_id,event_type,details)
+       values ($1,'certified','{"source":"ci"}'::jsonb)`,
+      [phase5Cert.id],
+    );
+
+    let immutableRejected = false;
+    await client.query("SAVEPOINT phase5_cert_immutable");
+    try {
+      await client.query(
+        `update release_certifications
+            set evidence_snapshot='{"tampered":true}'::jsonb
+          where id=$1`,
+        [phase5Cert.id],
+      );
+    } catch (error) {
+      immutableRejected = String(error && error.message || "").includes("Certified release evidence is immutable");
+      await client.query("ROLLBACK TO SAVEPOINT phase5_cert_immutable");
+    }
+    await client.query("RELEASE SAVEPOINT phase5_cert_immutable");
+    if (!immutableRejected) {
+      throw new Error("Phase-5 certified evidence immutability trigger did not reject a rewrite");
+    }
+
+    const phase5BuildTwo = await scalar(
+      `insert into qa_build_registry
+         (project_id,repository,source_provider,git_sha,base_sha,branch_name,release_name,build_version,
+          environment,config_fingerprint,deployment_timestamp,changed_files,dependency_changes,change_stats,metadata)
+       values ($1,'askk-pro/qa-ci','ci',$2,$3,'main','release-ci','build-134','staging',$4,
+               now(),$5::jsonb,'[]'::jsonb,'{}'::jsonb,'{}'::jsonb)
+       returning id`,
+      [
+        projectId,
+        "2".repeat(40),
+        "1".repeat(40),
+        "b".repeat(64),
+        JSON.stringify([{ path: "src/auth/session.ts", status: "modified", additions: 2, deletions: 1 }]),
+      ],
+    );
+
+    const phase5 = await scalar(
+      `select
+         (select count(*)::int from qa_build_registry where project_id=$1) as builds,
+         (select count(*)::int from change_impact_rules where project_id=$1 and id=$2 and mandatory=true) as impact_rules,
+         (select count(*)::int from qa_regression_plans where project_id=$1 and id=$3 and selected_test_count=1) as regression_plans,
+         (select count(*)::int from qa_regression_plan_items where plan_id=$3 and testcase_id=$4 and selected=true) as plan_items,
+         (select count(*)::int from qa_regression_plan_runs where plan_id=$3 and cycle_id=$5 and target_type='manual') as plan_runs,
+         (select count(*)::int from release_certifications where id=$6 and state='CERTIFIED' and validity_status='superseded') as superseded_certifications,
+         (select count(*)::int from release_certification_events where certification_id=$6 and event_type='superseded'
+           and details->>'supersedingBuildId'=$7::text) as supersession_events`,
+      [projectId, phase5Rule.id, phase5Plan.id, tcOne.id, runOne.id, phase5Cert.id, phase5BuildTwo.id],
+    );
+
     const comment = await scalar(
       "select count(*)::int as count from ticket_comments where project_id=$1 and source='mcp'",
       [projectId],
@@ -235,10 +350,17 @@ async function main() {
       phase3.step_results !== 1 ||
       phase3.step_evidence !== 1 ||
       phase4.triage_snapshots !== 1 ||
-      phase4.release_gates !== 1
+      phase4.release_gates !== 1 ||
+      phase5.builds !== 2 ||
+      phase5.impact_rules !== 1 ||
+      phase5.regression_plans !== 1 ||
+      phase5.plan_items !== 1 ||
+      phase5.plan_runs !== 1 ||
+      phase5.superseded_certifications !== 1 ||
+      phase5.supersession_events !== 1
     ) {
       throw new Error(
-        `QA relation acceptance failed: comments=${comment.count}, requirement_testcases=${link.count}, ticket_requirements=${ticketRequirement.count}, ticket_evidence=${ticketEvidence.count}, retests=${phase3.retests}, step_results=${phase3.step_results}, step_evidence=${phase3.step_evidence}, triage_snapshots=${phase4.triage_snapshots}, release_gates=${phase4.release_gates}`,
+        `QA relation acceptance failed: comments=${comment.count}, requirement_testcases=${link.count}, ticket_requirements=${ticketRequirement.count}, ticket_evidence=${ticketEvidence.count}, retests=${phase3.retests}, step_results=${phase3.step_results}, step_evidence=${phase3.step_evidence}, triage_snapshots=${phase4.triage_snapshots}, release_gates=${phase4.release_gates}, phase5=${JSON.stringify(phase5)}`,
       );
     }
 
@@ -266,7 +388,7 @@ async function main() {
     }
 
     await client.query("ROLLBACK");
-    console.log("QA domain schema acceptance passed: migration 132, QA/TC/REQ/RUN IDs, retest lineage, step results, step evidence, failure triage snapshots, release QA gates, ticket/requirement/test links, sequence.");
+    console.log("QA domain schema acceptance passed: migration 133, QA/TC/REQ/RUN IDs, retest lineage, step evidence, failure triage, release QA gates, change-aware regression plans, immutable certifications, deployment supersession, traceability links and sequence.");
   } catch (error) {
     try {
       await client.query("ROLLBACK");

@@ -114,6 +114,46 @@ function makeLegacy(overrides: Partial<Record<string, jest.Mock>> = {}) {
     listReleaseQaGateHistory: jest.fn().mockResolvedValue([
       { id: "gate-1", releaseName: "v1.2", buildVersion: "101", readiness: "ready_for_approval" }
     ]),
+    listQaBuilds: jest.fn().mockResolvedValue([
+      { id: "build-1", repository: "askk-pro/app", gitSha: "abcdef1234567", buildVersion: "101", environment: "staging" }
+    ]),
+    registerQaBuild: jest.fn().mockResolvedValue({
+      id: "build-1", repository: "askk-pro/app", gitSha: "abcdef1234567", changedFiles: []
+    }),
+    markQaBuildDeployed: jest.fn().mockResolvedValue({ id: "build-1", deploymentTimestamp: "2026-10-02T10:00:00Z" }),
+    getQaBuildImpact: jest.fn().mockResolvedValue({
+      build: { id: "build-1", gitSha: "abcdef1234567" },
+      risk: { score: 42, band: "MEDIUM", factors: [] },
+      recommendation: { recommendedCount: 3, tests: [] }
+    }),
+    listChangeImpactRules: jest.fn().mockResolvedValue([]),
+    createChangeImpactRule: jest.fn().mockResolvedValue({ id: "rule-1", pathPattern: "src/auth/**" }),
+    updateChangeImpactRule: jest.fn().mockResolvedValue({ id: "rule-1", pathPattern: "src/auth/**" }),
+    deleteChangeImpactRule: jest.fn().mockResolvedValue({ ok: true, id: "rule-1" }),
+    generateRegressionPlan: jest.fn().mockResolvedValue({ id: "reg-plan-1", status: "DRAFT", selectedTestCount: 3 }),
+    listRegressionPlans: jest.fn().mockResolvedValue([{ id: "reg-plan-1", status: "DRAFT" }]),
+    getRegressionPlan: jest.fn().mockResolvedValue({ id: "reg-plan-1", status: "DRAFT", items: [], runs: [] }),
+    overrideRegressionPlanTest: jest.fn().mockResolvedValue({ id: "reg-plan-1", status: "DRAFT", items: [] }),
+    startRegressionPlan: jest.fn().mockResolvedValue({ plan: { id: "reg-plan-1", status: "TESTING" }, created: [] }),
+    createSelectiveRegressionRerun: jest.fn().mockResolvedValue({ created: [], plan: { id: "reg-plan-1" } }),
+    prepareReleaseCertification: jest.fn().mockResolvedValue({
+      certification: { id: "cert-1", state: "READY", validityStatus: "current" },
+      status: "ready"
+    }),
+    getReleaseCertification: jest.fn().mockResolvedValue({
+      certification: { id: "cert-1", state: "READY", validityStatus: "current" },
+      events: [],
+      status: "ready"
+    }),
+    listReleaseCertifications: jest.fn().mockResolvedValue([]),
+    getPhase5ReleaseDashboard: jest.fn().mockResolvedValue({
+      build: { id: "build-1" },
+      risk: { score: 42, band: "MEDIUM" },
+      plan: { id: "reg-plan-1", selected: 3, coveragePct: 100 },
+      execution: null,
+      qaGate: null,
+      certification: { certification: { id: "cert-1", state: "READY" } }
+    }),
     listExecutionStepResults: jest.fn().mockResolvedValue([
       { stepNumber: 1, action: "Open login", status: "Failed", reportedBy: "human" }
     ]),
@@ -350,6 +390,24 @@ describe("McpService", () => {
           "evaluate_release_qa_gate",
           "get_release_qa_gate",
           "list_release_qa_gate_history",
+          "list_qa_builds",
+          "register_qa_build",
+          "mark_qa_build_deployed",
+          "get_qa_build_impact",
+          "list_change_impact_rules",
+          "create_change_impact_rule",
+          "update_change_impact_rule",
+          "delete_change_impact_rule",
+          "generate_regression_plan",
+          "list_regression_plans",
+          "get_regression_plan",
+          "override_regression_plan_test",
+          "start_regression_plan",
+          "create_selective_regression_rerun",
+          "prepare_release_certification",
+          "get_release_certification",
+          "list_release_certifications",
+          "get_release_dashboard",
           "decide_ticket_retest",
           "link_ticket_to_requirement",
           "unlink_ticket_from_requirement",
@@ -2962,6 +3020,123 @@ describe("McpService", () => {
         "proj-1"
       );
       expect(attempted.error.code).toBe(RpcCode.MethodNotFound);
+    });
+  });
+
+  describe("Phase 5 change-aware regression and certification MCP tools", () => {
+    it("registers a build as the token user and attributes mutation to the MCP actor", async () => {
+      const { db } = makeDb({ mcpActorId: "mcp-actor-1" });
+      const legacy = makeLegacy();
+      const svc = new McpService(legacy, db);
+      const args = {
+        repository: "askk-pro/app",
+        gitSha: "abcdef1234567",
+        baseSha: "1234567abcdef",
+        branchName: "main",
+        buildVersion: "101",
+        releaseName: "v1.2",
+        environment: "staging",
+        changedFiles: [{ path: "src/auth/session.ts", additions: 5, deletions: 1 }]
+      };
+      const res: any = await svc.handleRequest(
+        rpc("tools/call", { name: "register_qa_build", arguments: args }),
+        principal({ userId: "user-7" }),
+        "proj-1"
+      );
+      expect(res.result.isError).toBe(false);
+      expect((legacy as any).registerQaBuild).toHaveBeenCalledWith(
+        "user-7",
+        "proj-1",
+        expect.objectContaining({ ...args, sourceProvider: "mcp" }),
+        "mcp-actor-1"
+      );
+    });
+
+    it("allows read-only clients to inspect deterministic build impact and the release dashboard", async () => {
+      const { db } = makeDb();
+      const legacy = makeLegacy();
+      const svc = new McpService(legacy, db);
+      const ro = principal({ userId: "user-7", scopes: ["read"] });
+      const impact: any = await svc.handleRequest(
+        rpc("tools/call", { name: "get_qa_build_impact", arguments: { buildId: "build-1" } }),
+        ro,
+        "proj-1"
+      );
+      const dashboard: any = await svc.handleRequest(
+        rpc("tools/call", { name: "get_release_dashboard", arguments: { buildId: "build-1" } }),
+        ro,
+        "proj-1"
+      );
+      expect(impact.result.isError).toBe(false);
+      expect(dashboard.result.isError).toBe(false);
+      expect((legacy as any).getQaBuildImpact).toHaveBeenCalledWith("user-7", "proj-1", "build-1");
+      expect((legacy as any).getPhase5ReleaseDashboard).toHaveBeenCalledWith("user-7", "proj-1", "build-1");
+    });
+
+    it("requires write scope to generate/start regression work", async () => {
+      const { db } = makeDb();
+      const legacy = makeLegacy();
+      const svc = new McpService(legacy, db);
+      const ro = principal({ userId: "user-7", scopes: ["read"] });
+      const generated: any = await svc.handleRequest(
+        rpc("tools/call", { name: "generate_regression_plan", arguments: { buildId: "build-1" } }),
+        ro,
+        "proj-1"
+      );
+      const started: any = await svc.handleRequest(
+        rpc("tools/call", { name: "start_regression_plan", arguments: { planId: "reg-plan-1" } }),
+        ro,
+        "proj-1"
+      );
+      expect(generated.error.code).toBe(RpcCode.ScopeDenied);
+      expect(started.error.code).toBe(RpcCode.ScopeDenied);
+      expect((legacy as any).generateRegressionPlan).not.toHaveBeenCalled();
+      expect((legacy as any).startRegressionPlan).not.toHaveBeenCalled();
+    });
+
+    it("attributes regression-plan generation and certification preparation to the MCP actor", async () => {
+      const { db } = makeDb({ mcpActorId: "mcp-actor-1" });
+      const legacy = makeLegacy();
+      const svc = new McpService(legacy, db);
+      const principalWithWrite = principal({ userId: "user-7" });
+      const plan: any = await svc.handleRequest(
+        rpc("tools/call", { name: "generate_regression_plan", arguments: { buildId: "build-1" } }),
+        principalWithWrite,
+        "proj-1"
+      );
+      const cert: any = await svc.handleRequest(
+        rpc("tools/call", { name: "prepare_release_certification", arguments: { buildId: "build-1", planId: "reg-plan-1" } }),
+        principalWithWrite,
+        "proj-1"
+      );
+      expect(plan.result.isError).toBe(false);
+      expect(cert.result.isError).toBe(false);
+      expect((legacy as any).generateRegressionPlan).toHaveBeenCalledWith(
+        "user-7", "proj-1", "build-1",
+        { name: undefined, matrix: undefined },
+        "mcp-actor-1"
+      );
+      expect((legacy as any).prepareReleaseCertification).toHaveBeenCalledWith(
+        "user-7", "proj-1", "build-1",
+        { planId: "reg-plan-1" },
+        "mcp-actor-1"
+      );
+    });
+
+    it("does not expose final release certification or certification revocation through MCP", async () => {
+      const { db } = makeDb();
+      const svc = new McpService(makeLegacy(), db);
+      const listed: any = await svc.handleRequest(rpc("tools/list"), principal(), "proj-1");
+      const names = listed.result.tools.map((tool: any) => tool.name);
+      expect(names).not.toContain("certify_release");
+      expect(names).not.toContain("revoke_release_certification");
+
+      const certify: any = await svc.handleRequest(
+        rpc("tools/call", { name: "certify_release", arguments: { buildId: "build-1" } }),
+        principal(),
+        "proj-1"
+      );
+      expect(certify.error.code).toBe(RpcCode.MethodNotFound);
     });
   });
 

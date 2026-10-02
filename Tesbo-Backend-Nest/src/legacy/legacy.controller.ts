@@ -1085,6 +1085,199 @@ export class LegacyController {
     return this.legacy.decideReleaseQaGate(req.userId, projectId, gateId, body || {});
   }
 
+  // Phase 5 — Change-aware regression, smart test selection and release certification
+
+  @Get("/api/projects/:projectId/qa-builds")
+  listQaBuilds(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Query("limit") limit?: string,
+  ) {
+    return this.legacy.listQaBuilds(req.userId, projectId, Number(limit || 100));
+  }
+
+  @Post("/api/projects/:projectId/qa-builds")
+  registerQaBuild(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Body() body: Record<string, any>,
+  ) {
+    return this.legacy.registerQaBuild(req.userId, projectId, body || {}, req.userId || null);
+  }
+
+  @Get("/api/projects/:projectId/qa-builds/:buildId")
+  getQaBuild(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("buildId") buildId: string,
+  ) {
+    return this.legacy.getQaBuild(req.userId, projectId, buildId);
+  }
+
+  @Post("/api/projects/:projectId/qa-builds/:buildId/deployed")
+  markQaBuildDeployed(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("buildId") buildId: string,
+    @Body() body: Record<string, any>,
+  ) {
+    return this.legacy.markQaBuildDeployed(req.userId, projectId, buildId, body || {}, req.userId || null);
+  }
+
+  @Get("/api/projects/:projectId/qa-builds/:buildId/impact")
+  getQaBuildImpact(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("buildId") buildId: string,
+  ) {
+    return this.legacy.getQaBuildImpact(req.userId, projectId, buildId);
+  }
+
+  @Get("/api/projects/:projectId/change-impact-rules")
+  listChangeImpactRules(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.listChangeImpactRules(req.userId, projectId);
+  }
+
+  @Post("/api/projects/:projectId/change-impact-rules")
+  createChangeImpactRule(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Body() body: Record<string, any>,
+  ) {
+    return this.legacy.createChangeImpactRule(req.userId, projectId, body || {}, req.userId || null);
+  }
+
+  @Patch("/api/projects/:projectId/change-impact-rules/:ruleId")
+  updateChangeImpactRule(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("ruleId") ruleId: string,
+    @Body() body: Record<string, any>,
+  ) {
+    return this.legacy.updateChangeImpactRule(req.userId, projectId, ruleId, body || {}, req.userId || null);
+  }
+
+  @Delete("/api/projects/:projectId/change-impact-rules/:ruleId")
+  deleteChangeImpactRule(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("ruleId") ruleId: string,
+  ) {
+    return this.legacy.deleteChangeImpactRule(req.userId, projectId, ruleId, req.userId || null);
+  }
+
+  @Get("/api/projects/:projectId/regression-plans")
+  listRegressionPlans(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Query("buildId") buildId?: string,
+  ) {
+    return this.legacy.listRegressionPlans(req.userId, projectId, buildId);
+  }
+
+  @Post("/api/projects/:projectId/qa-builds/:buildId/regression-plans")
+  generateRegressionPlan(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("buildId") buildId: string,
+    @Body() body: Record<string, any>,
+  ) {
+    return this.legacy.generateRegressionPlan(req.userId, projectId, buildId, body || {}, req.userId || null);
+  }
+
+  @Get("/api/projects/:projectId/regression-plans/:planId")
+  getRegressionPlan(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("planId") planId: string,
+  ) {
+    return this.legacy.getRegressionPlan(req.userId, projectId, planId);
+  }
+
+  @Patch("/api/projects/:projectId/regression-plans/:planId/tests/:testcaseRef")
+  overrideRegressionPlanTest(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("planId") planId: string,
+    @Param("testcaseRef") testcaseRef: string,
+    @Body() body: Record<string, any>,
+  ) {
+    return this.legacy.overrideRegressionPlanTest(req.userId, projectId, planId, testcaseRef, body || {}, req.userId || null);
+  }
+
+  @Post("/api/projects/:projectId/regression-plans/:planId/start")
+  startRegressionPlan(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("planId") planId: string,
+    @Body() body: Record<string, any>,
+  ) {
+    return this.legacy.startRegressionPlan(req.userId, projectId, planId, body || {}, req.userId || null);
+  }
+
+  @Post("/api/projects/:projectId/regression-plans/:planId/selective-rerun")
+  createSelectiveRegressionRerun(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("planId") planId: string,
+    @Body() body: Record<string, any>,
+  ) {
+    return this.legacy.createSelectiveRegressionRerun(req.userId, projectId, planId, body || {}, req.userId || null);
+  }
+
+  @Get("/api/projects/:projectId/qa-builds/:buildId/release-dashboard")
+  getPhase5ReleaseDashboard(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("buildId") buildId: string,
+  ) {
+    return this.legacy.getPhase5ReleaseDashboard(req.userId, projectId, buildId);
+  }
+
+  @Post("/api/projects/:projectId/qa-builds/:buildId/certification/prepare")
+  prepareReleaseCertification(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("buildId") buildId: string,
+    @Body() body: Record<string, any>,
+  ) {
+    return this.legacy.prepareReleaseCertification(req.userId, projectId, buildId, body || {}, req.userId || null);
+  }
+
+  @Get("/api/projects/:projectId/qa-builds/:buildId/certification")
+  getReleaseCertification(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("buildId") buildId: string,
+  ) {
+    return this.legacy.getReleaseCertification(req.userId, projectId, buildId);
+  }
+
+  @Post("/api/projects/:projectId/qa-builds/:buildId/certification/certify")
+  certifyRelease(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("buildId") buildId: string,
+    @Body() body: Record<string, any>,
+  ) {
+    return this.legacy.certifyRelease(req.userId, projectId, buildId, body || {});
+  }
+
+  @Get("/api/projects/:projectId/release-certifications")
+  listReleaseCertifications(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.listReleaseCertifications(req.userId, projectId);
+  }
+
+  @Post("/api/projects/:projectId/release-certifications/:certificationId/revoke")
+  revokeReleaseCertification(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("certificationId") certificationId: string,
+    @Body() body: Record<string, any>,
+  ) {
+    return this.legacy.revokeReleaseCertification(req.userId, projectId, certificationId, body || {});
+  }
+
   @Post("/api/projects/:projectId/qa-tickets/:ticketRef/retests/:runRef/decision")
   decideQaTicketRetest(
     @Req() req: AuthenticatedRequest,

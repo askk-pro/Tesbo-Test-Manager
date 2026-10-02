@@ -169,6 +169,31 @@ Release readiness is computed by application rules, not by the model. AI may sug
 
 There is intentionally no MCP tool that approves or rejects a release. Final release approval/rejection is restricted to an authenticated human project owner or manager in the application. Before a human decision is accepted, the backend recomputes the evidence digest; changed evidence forces re-evaluation.
 
+## Phase 5 change-aware regression and release certification
+
+Phase 5 adds project-scoped build/change evidence, deterministic regression selection and certification preparation.
+
+### Read
+
+- list_qa_builds — registered commit/build evidence and current plan/certification state.
+- get_qa_build_impact — deterministic change impact, risk factors, requirement coverage and recommended tests.
+- list_change_impact_rules — reusable path-to-QA mappings.
+- list_regression_plans / get_regression_plan — versioned scope, reasons, overrides, generated RUN-n cycles and result counts.
+- get_release_certification / list_release_certifications — current or historical certificate versions and validity.
+- get_release_dashboard — build, risk, regression, execution, Phase-4 gate and certification in one response.
+
+### Write
+
+- register_qa_build / mark_qa_build_deployed
+- create_change_impact_rule / update_change_impact_rule / delete_change_impact_rule (Owner/Manager authorization still enforced by the application)
+- generate_regression_plan
+- override_regression_plan_test — DRAFT only, reason required, mandatory tests protected.
+- start_regression_plan — materializes normal RUN-n cycles.
+- create_selective_regression_rerun — Failed/Blocked only or one Phase-4 signature cluster.
+- prepare_release_certification — prepares/refreshes evidence state; never signs the release.
+
+AI does not control smart-test selection or risk. Final release certification and manual certification revocation are intentionally not exposed through MCP. They remain authenticated human Owner/Manager actions in the application.
+
 ## Still reserved for later phases
 
 The following remain future operations:
