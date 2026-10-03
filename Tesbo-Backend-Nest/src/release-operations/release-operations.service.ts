@@ -631,7 +631,7 @@ export class ReleaseOperationsService {
     await this.db.query(
       `UPDATE release_promotions
           SET certification_id=$3,policy_snapshot=$4::jsonb,policy_digest=$5,status=$6::varchar,
-              approved_by=CASE WHEN $6::varchar='approved' THEN $7 ELSE NULL END,
+              approved_by=CASE WHEN $6::varchar='approved' THEN $7::uuid ELSE NULL END,
               approved_at=CASE WHEN $6::varchar='approved' THEN now() ELSE NULL END,
               updated_at=now()
         WHERE id=$1 AND project_id=$2`,
