@@ -495,7 +495,10 @@ export default function ReleasesPage() {
                           {canManage && promotion.status === "successful" && !promotion.rollbackOfPromotionId ? (
                             <Button disabled={Boolean(busy)} onClick={() => void markKnownGood(promotion.id)}>Mark Known Good</Button>
                           ) : null}
-                          {canManage && ["verification_failed", "observation_failed"].includes(promotion.status) && promotion.rollbackEligible ? (
+                          {canManage &&
+                          ["verification_failed", "observation_failed"].includes(promotion.status) &&
+                          promotion.rollbackEligible &&
+                          environments.some((env) => env.id === promotion.targetEnvironmentId && env.provider === "kps") ? (
                             <Button disabled={Boolean(busy)} onClick={() => void rollbackPromotion(promotion.id)}>Rollback to Known Good</Button>
                           ) : null}
                           {canManage && ["awaiting_qa", "ready_for_approval"].includes(promotion.status) ? (
