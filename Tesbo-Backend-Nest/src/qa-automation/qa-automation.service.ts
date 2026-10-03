@@ -712,7 +712,7 @@ export class QaAutomationService {
 
     await this.db.query(
       `UPDATE qa_automation_runs SET status='waiting_workers',heartbeat_at=now(),
-        summary=jsonb_build_object('createdShards',$2,'skippedTargets',$3),updated_at=now()
+        summary=jsonb_build_object('createdShards',$2::int,'skippedTargets',$3::int),updated_at=now()
         WHERE id=$1`,
       [runId, createdCount, skippedTargets],
     );
