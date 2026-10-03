@@ -541,9 +541,9 @@ export class ReleaseOperationsService {
 
     await this.db.query(
       `UPDATE release_promotions
-          SET certification_id=$3,policy_snapshot=$4::jsonb,policy_digest=$5,status=$6,
-              approved_by=CASE WHEN $6='approved' THEN approved_by ELSE NULL END,
-              approved_at=CASE WHEN $6='approved' THEN approved_at ELSE NULL END,
+          SET certification_id=$3,policy_snapshot=$4::jsonb,policy_digest=$5,status=$6::varchar,
+              approved_by=CASE WHEN $6::varchar='approved' THEN approved_by ELSE NULL END,
+              approved_at=CASE WHEN $6::varchar='approved' THEN approved_at ELSE NULL END,
               updated_at=now()
         WHERE id=$1 AND project_id=$2`,
       [promotionId, projectId, certification?.id || null, JSON.stringify(snapshot), digest, nextStatus],
@@ -630,9 +630,9 @@ export class ReleaseOperationsService {
     const nextStatus = approvalCount >= requiredApprovals ? "approved" : "ready_for_approval";
     await this.db.query(
       `UPDATE release_promotions
-          SET certification_id=$3,policy_snapshot=$4::jsonb,policy_digest=$5,status=$6,
-              approved_by=CASE WHEN $6='approved' THEN $7 ELSE NULL END,
-              approved_at=CASE WHEN $6='approved' THEN now() ELSE NULL END,
+          SET certification_id=$3,policy_snapshot=$4::jsonb,policy_digest=$5,status=$6::varchar,
+              approved_by=CASE WHEN $6::varchar='approved' THEN $7 ELSE NULL END,
+              approved_at=CASE WHEN $6::varchar='approved' THEN now() ELSE NULL END,
               updated_at=now()
         WHERE id=$1 AND project_id=$2`,
       [promotionId, projectId, certification?.id || null, JSON.stringify(snapshot), digest, nextStatus, uid],
