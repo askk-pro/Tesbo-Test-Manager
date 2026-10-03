@@ -12,9 +12,11 @@ import { createHash } from "crypto";
 import { AppConfigService } from "../config/app-config.service";
 import { DatabaseService } from "../database/database.service";
 import { LegacyService, isUuid } from "../legacy/legacy.service";
+import { QaAutomationService } from "../qa-automation/qa-automation.service";
 import { KpsDeploymentProvider } from "./kps-deployment.provider";
 import {
   RELEASE_DEPLOYMENT_MONITOR_JOB,
+  RELEASE_VERIFICATION_MONITOR_JOB,
   RELEASE_DEPLOYMENT_QUEUE,
 } from "./release-deployment.constants";
 import { evaluateDeploymentProvenance } from "./release-provenance.policy";
@@ -111,6 +113,7 @@ export class ReleaseOperationsService {
     private readonly legacy: LegacyService,
     private readonly kps: KpsDeploymentProvider,
     private readonly config: AppConfigService,
+    private readonly qaAutomation: QaAutomationService,
     @InjectQueue(RELEASE_DEPLOYMENT_QUEUE) private readonly deploymentQueue: Queue,
   ) {}
 
@@ -1154,6 +1157,7 @@ export class ReleaseOperationsService {
       },
       null,
     );
+    await this.enqueueVerificationMonitor(promotionId);
     return { status: "verified" as const, promotionStatus: "verifying" };
   }
 
@@ -1182,6 +1186,377 @@ export class ReleaseOperationsService {
     const promotion = await this.promotionDetail(projectId, promotionId) as Body;
     if (promotion.status !== "deploying") return promotion;
     await this.monitorDeployment(promotionId);
+    return this.promotionDetail(projectId, promotionId);
+  }
+
+  private verificationJobId(promotionId: string): string {
+    return "release-verification-" + promotionId;
+  }
+
+  private async enqueueVerificationMonitor(promotionId: string): Promise<boolean> {
+    const jobId = this.verificationJobId(promotionId);
+    const existing = await this.deploymentQueue.getJob(jobId);
+    if (existing) return false;
+    await this.deploymentQueue.add(
+      RELEASE_VERIFICATION_MONITOR_JOB,
+      { promotionId },
+      { jobId, ...this.deploymentJobOptions() },
+    );
+    return true;
+  }
+
+  async recoverVerificationMonitors(): Promise<number> {
+    const rows = await this.db.query<{ id: string }>(
+      `SELECT id FROM release_promotions
+        WHERE status='verifying' AND provenance_status='matched'
+        ORDER BY updated_at`,
+    );
+    let recovered = 0;
+    for (const row of rows.rows) {
+      if (await this.enqueueVerificationMonitor(row.id)) recovered++;
+    }
+    return recovered;
+  }
+
+  private async verificationMonitorRow(promotionId: string): Promise<Body | null> {
+    const res = await this.db.query(
+      `SELECT p.*,
+              te.name AS target_environment_name,
+              te.slug AS target_environment_slug,
+              te.environment_type AS target_environment_type,
+              te.url AS target_environment_url,
+              te.allowed_browsers AS target_allowed_browsers,
+              te.settings AS target_settings,
+              te.observation_minutes AS target_observation_minutes,
+              te.known_good_build_id AS target_known_good_build_id,
+              te.known_good_git_sha AS target_known_good_git_sha,
+              b.repository,b.git_sha,b.branch_name,b.release_name,b.build_version
+         FROM release_promotions p
+         JOIN release_environments te ON te.id=p.target_environment_id
+         JOIN qa_build_registry b ON b.id=p.build_id
+        WHERE p.id=$1`,
+      [promotionId],
+    );
+    return (res.rows[0] as Body | undefined) || null;
+  }
+
+  private verificationTarget(row: Body) {
+    const baseUrl = String(row.target_environment_url || "").trim();
+    if (!baseUrl) {
+      throw new ConflictException({
+        error: "Post-deployment verification requires a target environment URL.",
+      });
+    }
+    const settings =
+      row.target_settings && typeof row.target_settings === "object" && !Array.isArray(row.target_settings)
+        ? row.target_settings as Body
+        : {};
+    const healthPath = String(settings.verificationHealthPath || settings.healthPath || "").trim();
+    let healthUrl = baseUrl;
+    if (healthPath) {
+      try {
+        healthUrl = new URL(healthPath, baseUrl.endsWith("/") ? baseUrl : baseUrl + "/").toString();
+      } catch {
+        throw new ConflictException({ error: "Release environment verification health path is invalid." });
+      }
+    }
+    const browsers = (Array.isArray(row.target_allowed_browsers) ? row.target_allowed_browsers : [])
+      .map((item: unknown) => String(item || "").trim().toLowerCase())
+      .filter(Boolean)
+      .slice(0, 10);
+    const environment = String(row.target_environment_slug || row.target_environment_name || "release").slice(0, 128);
+    const matrix: Body[] = [
+      { environment, browser: "", targetType: "production-safe", required: true },
+      { environment, browser: "", targetType: "api", required: true },
+      ...browsers.map((browser: string) => ({ environment, browser, targetType: "browser", required: true })),
+    ];
+    return { baseUrl, healthUrl, browsers, environment, matrix };
+  }
+
+  private async ensureVerificationRun(promotionId: string, actorId?: string | null) {
+    let row = await this.verificationMonitorRow(promotionId);
+    if (!row) throw new NotFoundException({ error: "Promotion not found" });
+    if (row.status !== "verifying" || row.provenance_status !== "matched") {
+      throw new ConflictException({
+        error: "Post-deployment verification can start only after deployment provenance has matched.",
+      });
+    }
+    if (row.verification_automation_run_id) {
+      return { runId: String(row.verification_automation_run_id), created: false };
+    }
+
+    const target = this.verificationTarget(row);
+    const actor = String(actorId || row.approved_by || row.requested_by || "").trim();
+    if (!isUuid(actor)) {
+      throw new ConflictException({ error: "Promotion has no valid project user available to start verification." });
+    }
+    const run = await this.qaAutomation.triggerManual(actor, String(row.project_id), {
+      buildId: String(row.build_id),
+      triggerKey:
+        "release-verification:" +
+        promotionId +
+        ":" +
+        String(row.provider_deployment_id || row.requested_git_sha || "deployment"),
+      matrix: target.matrix,
+      desiredShards: 2,
+      maxParallelism: 4,
+      retryLimit: 1,
+      retryBackoffSeconds: 15,
+      stuckAfterMinutes: 20,
+      autoPrepareCertification: false,
+      notifyOn: ["failed", "blocked", "stuck"],
+      payload: {
+        releaseVerification: {
+          promotionId,
+          targetEnvironmentId: row.target_environment_id,
+          environmentName: row.target_environment_name,
+          environmentType: row.target_environment_type,
+          baseUrl: target.baseUrl,
+          healthUrl: target.healthUrl,
+          expectedGitSha: row.requested_git_sha,
+          deployedGitSha: row.deployed_git_sha,
+          providerDeploymentId: row.provider_deployment_id,
+          providerArtifactRef: row.provider_artifact_ref,
+          providerConfigurationHash: row.provider_configuration_hash,
+          requiredPreflight: {
+            kind: "http",
+            url: target.healthUrl,
+            expectedStatusMin: 200,
+            expectedStatusMax: 399,
+          },
+        },
+      },
+    }) as Body;
+
+    const updated = await this.db.query(
+      `UPDATE release_promotions
+          SET verification_automation_run_id=$2,
+              verification_status=$3,
+              verification_started_at=COALESCE(verification_started_at,now()),
+              verification_checked_at=now(),
+              failure_reason=NULL,
+              updated_at=now()
+        WHERE id=$1 AND status='verifying' AND verification_automation_run_id IS NULL
+        RETURNING id`,
+      [promotionId, run.id, String(run.status || "queued")],
+    );
+    if (updated.rows[0]) {
+      await this.insertEvent(
+        promotionId,
+        "verification_requested",
+        "verifying",
+        "verifying",
+        {
+          automationRunId: run.id,
+          targetEnvironmentId: row.target_environment_id,
+          baseUrl: target.baseUrl,
+          healthUrl: target.healthUrl,
+          matrix: target.matrix,
+          expectedGitSha: row.requested_git_sha,
+          providerDeploymentId: row.provider_deployment_id,
+        },
+        actor,
+      );
+      return { runId: String(run.id), created: true };
+    }
+
+    row = await this.verificationMonitorRow(promotionId);
+    if (row?.verification_automation_run_id) {
+      return { runId: String(row.verification_automation_run_id), created: false };
+    }
+    throw new ConflictException({ error: "Promotion verification state changed while the QA run was being attached." });
+  }
+
+  async startVerification(
+    userId: string | null | undefined,
+    projectId: string,
+    promotionId: string,
+  ) {
+    await this.requireManager(userId, projectId);
+    const promotion = await this.promotionDetail(projectId, promotionId) as Body;
+    if (promotion.status !== "verifying" || promotion.provenanceStatus !== "matched") {
+      throw new ConflictException({
+        error: "Verification can start only after exact deployment provenance has matched.",
+      });
+    }
+    await this.ensureVerificationRun(promotionId, this.userId(userId));
+    await this.enqueueVerificationMonitor(promotionId);
+    return this.promotionDetail(projectId, promotionId);
+  }
+
+  async monitorVerification(promotionId: string) {
+    let row = await this.verificationMonitorRow(promotionId);
+    if (!row || row.status !== "verifying") {
+      return { status: "terminal" as const, promotionStatus: row?.status || "missing" };
+    }
+    if (row.provenance_status !== "matched") {
+      return this.failVerificationTimeout(
+        promotionId,
+        "Post-deployment verification was blocked because deployment provenance is not matched.",
+      );
+    }
+
+    const attached = await this.ensureVerificationRun(promotionId);
+    const runRes = await this.db.query(
+      `SELECT id,status,plan_id,summary,error,trigger_payload,started_at,completed_at,updated_at
+         FROM qa_automation_runs
+        WHERE id=$1 AND project_id=$2`,
+      [attached.runId, row.project_id],
+    );
+    const run = runRes.rows[0] as Body | undefined;
+    if (!run) {
+      return this.failVerificationTimeout(
+        promotionId,
+        "The linked Continuous-QA verification run no longer exists.",
+      );
+    }
+
+    const runStatus = String(run.status || "");
+    const summary = {
+      automationRunId: run.id,
+      planId: run.plan_id || null,
+      status: runStatus,
+      runSummary: run.summary || {},
+      error: run.error || null,
+      startedAt: run.started_at || null,
+      completedAt: run.completed_at || null,
+      providerDeploymentId: row.provider_deployment_id || null,
+      expectedGitSha: row.requested_git_sha || null,
+      deployedGitSha: row.deployed_git_sha || null,
+    };
+    await this.db.query(
+      `UPDATE release_promotions
+          SET verification_status=$2,verification_summary=$3::jsonb,
+              verification_checked_at=now(),updated_at=now()
+        WHERE id=$1 AND status='verifying'`,
+      [promotionId, runStatus, JSON.stringify(summary)],
+    );
+
+    if (!["passed","failed","blocked","partial","stuck","cancelled"].includes(runStatus)) {
+      return { status: "pending" as const, verificationStatus: runStatus, automationRunId: run.id };
+    }
+
+    if (runStatus === "passed") {
+      const observationMinutes = Math.max(0, Math.min(10080, Number(row.target_observation_minutes || 0)));
+      const changed = await this.db.query(
+        `UPDATE release_promotions
+            SET status='observation',verification_status='passed',
+                verification_summary=$2::jsonb,verification_checked_at=now(),verified_at=now(),
+                observation_started_at=now(),
+                observation_ends_at=now()+($3::text || ' minutes')::interval,
+                failure_reason=NULL,rollback_eligible=false,updated_at=now()
+          WHERE id=$1 AND status='verifying'
+          RETURNING id`,
+        [promotionId, JSON.stringify(summary), observationMinutes],
+      );
+      if (changed.rows[0]) {
+        await this.insertEvent(
+          promotionId,
+          "verification_passed",
+          "verifying",
+          "observation",
+          {
+            automationRunId: run.id,
+            planId: run.plan_id || null,
+            summary: run.summary || {},
+            observationMinutes,
+            providerDeploymentId: row.provider_deployment_id || null,
+            deployedGitSha: row.deployed_git_sha || null,
+          },
+          null,
+        );
+      }
+      return { status: "passed" as const, promotionStatus: "observation", automationRunId: run.id };
+    }
+
+    const rollbackEligible = Boolean(
+      row.previous_known_good_build_id ||
+      row.previous_known_good_git_sha ||
+      row.target_known_good_build_id ||
+      row.target_known_good_git_sha
+    );
+    const reason =
+      "Post-deployment verification ended with Continuous-QA status " + runStatus +
+      (run.error ? ": " + String(run.error) : ".");
+    const changed = await this.db.query(
+      `UPDATE release_promotions
+          SET status='verification_failed',verification_status=$2,
+              verification_summary=$3::jsonb,verification_checked_at=now(),
+              failure_reason=$4,rollback_eligible=$5,completed_at=now(),updated_at=now()
+        WHERE id=$1 AND status='verifying'
+        RETURNING id`,
+      [promotionId, runStatus, JSON.stringify(summary), reason, rollbackEligible],
+    );
+    if (changed.rows[0]) {
+      await this.insertEvent(
+        promotionId,
+        "verification_failed",
+        "verifying",
+        "verification_failed",
+        {
+          automationRunId: run.id,
+          planId: run.plan_id || null,
+          verificationStatus: runStatus,
+          summary: run.summary || {},
+          error: run.error || null,
+          rollbackEligible,
+          providerDeploymentId: row.provider_deployment_id || null,
+          deployedGitSha: row.deployed_git_sha || null,
+        },
+        null,
+      );
+    }
+    return {
+      status: "failed" as const,
+      promotionStatus: "verification_failed",
+      verificationStatus: runStatus,
+      rollbackEligible,
+      automationRunId: run.id,
+    };
+  }
+
+  async failVerificationTimeout(promotionId: string, reason: string) {
+    const row = await this.verificationMonitorRow(promotionId);
+    if (!row || row.status !== "verifying") return { status: "terminal" as const };
+
+    const rollbackEligible = Boolean(
+      row.previous_known_good_build_id ||
+      row.previous_known_good_git_sha ||
+      row.target_known_good_build_id ||
+      row.target_known_good_git_sha
+    );
+    const changed = await this.db.query(
+      `UPDATE release_promotions
+          SET status='verification_failed',
+              verification_status=COALESCE(verification_status,'stuck'),
+              verification_checked_at=now(),failure_reason=$2,
+              rollback_eligible=$3,completed_at=now(),updated_at=now()
+        WHERE id=$1 AND status='verifying'
+        RETURNING id`,
+      [promotionId, reason, rollbackEligible],
+    );
+    if (changed.rows[0]) {
+      await this.insertEvent(
+        promotionId,
+        "verification_failed",
+        "verifying",
+        "verification_failed",
+        { reason, rollbackEligible, stage: "verification_monitor" },
+        null,
+      );
+    }
+    return { status: "failed" as const, promotionStatus: "verification_failed", rollbackEligible };
+  }
+
+  async refreshVerification(
+    userId: string | null | undefined,
+    projectId: string,
+    promotionId: string,
+  ) {
+    await this.requireManager(userId, projectId);
+    const promotion = await this.promotionDetail(projectId, promotionId) as Body;
+    if (promotion.status !== "verifying") return promotion;
+    await this.monitorVerification(promotionId);
     return this.promotionDetail(projectId, promotionId);
   }
 

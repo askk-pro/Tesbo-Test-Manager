@@ -93,6 +93,24 @@ export class ReleaseOperationsController {
     return this.releases.refreshDeployment(req.userId, projectId, promotionId);
   }
 
+  @Post("/api/projects/:projectId/release-promotions/:promotionId/verification/start")
+  startVerification(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("promotionId") promotionId: string,
+  ) {
+    return this.releases.startVerification(req.userId, projectId, promotionId);
+  }
+
+  @Post("/api/projects/:projectId/release-promotions/:promotionId/verification/refresh")
+  refreshVerification(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("promotionId") promotionId: string,
+  ) {
+    return this.releases.refreshVerification(req.userId, projectId, promotionId);
+  }
+
   @Post("/api/projects/:projectId/release-promotions/:promotionId/decision")
   decidePromotion(
     @Req() req: AuthenticatedRequest,

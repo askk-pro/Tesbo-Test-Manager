@@ -3899,6 +3899,15 @@ export interface ReleasePromotion {
   providerConfigurationHash?: string | null;
   provenanceStatus?: "pending" | "matched" | "mismatch" | "unavailable";
   provenanceCheckedAt?: string | null;
+  verificationAutomationRunId?: string | null;
+  verificationStatus?: string | null;
+  verificationSummary?: Record<string, unknown>;
+  verificationCheckedAt?: string | null;
+  verificationStartedAt?: string | null;
+  verifiedAt?: string | null;
+  observationStartedAt?: string | null;
+  observationEndsAt?: string | null;
+  rollbackEligible?: boolean;
   failureReason?: string | null;
   policySnapshot: {
     environment?: Record<string, unknown>;
@@ -3988,6 +3997,26 @@ export async function refreshReleaseDeployment(
   promotionId: string,
 ): Promise<ReleasePromotion> {
   return api(`/api/projects/${projectId}/release-promotions/${promotionId}/deployment/refresh`, {
+    method: "POST",
+    body: {},
+  });
+}
+
+export async function startReleaseVerification(
+  projectId: string,
+  promotionId: string,
+): Promise<ReleasePromotion> {
+  return api(`/api/projects/${projectId}/release-promotions/${promotionId}/verification/start`, {
+    method: "POST",
+    body: {},
+  });
+}
+
+export async function refreshReleaseVerification(
+  projectId: string,
+  promotionId: string,
+): Promise<ReleasePromotion> {
+  return api(`/api/projects/${projectId}/release-promotions/${promotionId}/verification/refresh`, {
     method: "POST",
     body: {},
   });

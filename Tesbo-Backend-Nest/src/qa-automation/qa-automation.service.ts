@@ -210,7 +210,7 @@ export class QaAutomationService {
   }
 
   async createSchedule(userId: string | null | undefined, projectId: string, body: Body) {
-    const project = await this.requireManager(userId, projectId);
+    await this.requireManager(userId, projectId);
     const uid = String(userId);
     const name = boundedText(body.name, "name", 255, true);
     const p = this.schedulePayload(body);
@@ -794,6 +794,14 @@ export class QaAutomationService {
     });
 
     if (!shard) return { shard: null };
+    const runContextRes = await this.db.query(
+      `SELECT trigger_source,trigger_key,trigger_payload,build_id
+         FROM qa_automation_runs
+        WHERE id=$1`,
+      [shard.automation_run_id],
+    );
+    const runContext = runContextRes.rows[0] || {};
+    const triggerPayload = jsonObject(runContext.trigger_payload);
     const cases = await this.db.query(
       `SELECT t.id,t.human_id,t.external_id,t.title,t.type,t.automation_status,t.automation_path,
               t.automation_framework,t.automation_tags
@@ -807,6 +815,13 @@ export class QaAutomationService {
         ...camelRow(shard),
         claimToken: token,
         testcases: cases.rows.map(camelRow),
+        automationContext: {
+          triggerSource: runContext.trigger_source || null,
+          triggerKey: runContext.trigger_key || null,
+          buildId: runContext.build_id || null,
+          payload: triggerPayload,
+        },
+        verificationContext: jsonObject(triggerPayload.releaseVerification),
         resultIngest: {
           runId: shard.cycle_id,
           resultsPath: `/api/projects/${projectId}/automation/runs/${shard.cycle_id}/results`,

@@ -12,7 +12,9 @@ import {
   listReleasePromotions,
   refreshReleaseDeployment,
   refreshReleasePromotion,
+  refreshReleaseVerification,
   startReleaseDeployment,
+  startReleaseVerification,
   type QaBuildRecord,
   type ReleaseEnvironment,
   type ReleasePromotion,
@@ -127,7 +129,7 @@ export default function ReleasesPage() {
   }, [projectId, refresh]);
 
   useEffect(() => {
-    if (!promotions.some((promotion) => promotion.status === "deploying")) return;
+    if (!promotions.some((promotion) => ["deploying", "verifying"].includes(promotion.status))) return;
     const timer = window.setInterval(() => {
       void refresh().catch((e) => setError(e instanceof Error ? e.message : String(e)));
     }, 5000);
@@ -248,6 +250,38 @@ export default function ReleasesPage() {
     }
   }
 
+  async function startVerification(promotionId: string) {
+    setBusy("verify-" + promotionId);
+    setError("");
+    setNotice("");
+    try {
+      const result = await startReleaseVerification(projectId, promotionId);
+      setNotice(
+        result.verificationAutomationRunId
+          ? "Post-deployment verification is running through the Phase-6 worker queue."
+          : "Post-deployment verification was queued.",
+      );
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function checkVerification(promotionId: string) {
+    setBusy("verification-" + promotionId);
+    setError("");
+    try {
+      await refreshReleaseVerification(projectId, promotionId);
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy("");
+    }
+  }
+
   async function decide(promotionId: string, decision: "approve" | "reject") {
     const comment =
       decision === "reject"
@@ -301,7 +335,7 @@ export default function ReleasesPage() {
         <Metric title="Environments" value={environments.length} note="Durable release targets" />
         <Metric title="Protected" value={protectedCount} note="Policy-gated targets" />
         <Metric title="Active promotions" value={activePromotionCount} note="Awaiting QA/approval/deployment" />
-        <Metric title="Known Good" value={knownGoodCount} note="Established after post-deploy verification in later Slice 3+" />
+        <Metric title="Known Good" value={knownGoodCount} note="Established after verification + observation" />
       </div>
 
       <div className="mt-5 flex gap-2 border-b border-[var(--border)]">
@@ -401,6 +435,12 @@ export default function ReleasesPage() {
                           {canManage && promotion.status === "deploying" ? (
                             <Button variant="secondary" disabled={Boolean(busy)} onClick={() => void checkDeployment(promotion.id)}>Check deployment</Button>
                           ) : null}
+                          {canManage && promotion.status === "verifying" && !promotion.verificationAutomationRunId ? (
+                            <Button disabled={Boolean(busy)} onClick={() => void startVerification(promotion.id)}>Start verification</Button>
+                          ) : null}
+                          {canManage && promotion.status === "verifying" && promotion.verificationAutomationRunId ? (
+                            <Button variant="secondary" disabled={Boolean(busy)} onClick={() => void checkVerification(promotion.id)}>Check verification</Button>
+                          ) : null}
                           {canManage && ["awaiting_qa", "ready_for_approval"].includes(promotion.status) ? (
                             <Button variant="secondary" disabled={Boolean(busy)} onClick={() => void decide(promotion.id, "reject")}>Reject</Button>
                           ) : null}
@@ -416,6 +456,18 @@ export default function ReleasesPage() {
                           <div><span className="text-[var(--muted-soft)]">Artifact</span><div className="font-mono break-all">{promotion.providerArtifactRef || "not reported yet"}</div></div>
                           {promotion.providerConfigurationHash ? <div className="md:col-span-2"><span className="text-[var(--muted-soft)]">Provider configuration hash</span><div className="font-mono break-all">{promotion.providerConfigurationHash}</div></div> : null}
                           {promotion.failureReason ? <div className="md:col-span-2 text-[var(--status-fail-text)]">{promotion.failureReason}</div> : null}
+                        </div>
+                      ) : null}
+                      {promotion.verificationAutomationRunId || promotion.verificationStatus ? (
+                        <div className="mt-3 rounded-lg border border-[var(--border)] bg-[var(--surface-raised)] p-3 text-[11px] text-[var(--muted)]">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="font-semibold text-[var(--foreground)]">Post-deployment verification</span>
+                            <Badge value={promotion.verificationStatus || "queued"} />
+                            {promotion.rollbackEligible ? <Badge value="rollback eligible" /> : null}
+                          </div>
+                          <div className="mt-1 font-mono">
+                            Run: {promotion.verificationAutomationRunId || "pending"} · checked {promotion.verificationCheckedAt ? new Date(promotion.verificationCheckedAt).toLocaleString() : "not yet"}
+                          </div>
                         </div>
                       ) : null}
                       {blockers.length ? (
