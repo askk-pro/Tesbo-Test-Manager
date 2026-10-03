@@ -11,8 +11,11 @@ import {
   listReleaseEnvironments,
   listReleasePromotions,
   refreshReleaseDeployment,
+  refreshReleaseObservation,
   refreshReleasePromotion,
   refreshReleaseVerification,
+  promoteReleaseKnownGood,
+  requestReleaseRollback,
   startReleaseDeployment,
   startReleaseVerification,
   type QaBuildRecord,
@@ -35,7 +38,7 @@ function tone(value?: string | null) {
   if (["approved", "successful", "known_good", "certified", "ready_for_approval"].includes(v)) {
     return "border-[var(--success)]/30 bg-[var(--success-soft)] text-[var(--success)]";
   }
-  if (["blocked", "rejected", "deployment_failed", "verification_failed", "rolled_back"].includes(v)) {
+  if (["blocked", "rejected", "deployment_failed", "verification_failed", "observation_failed", "rolled_back"].includes(v)) {
     return "border-[var(--error)]/30 bg-[var(--error-soft)] text-[var(--status-fail-text)]";
   }
   if (["awaiting_qa", "deploying", "verifying", "observation"].includes(v)) {
@@ -129,7 +132,7 @@ export default function ReleasesPage() {
   }, [projectId, refresh]);
 
   useEffect(() => {
-    if (!promotions.some((promotion) => ["deploying", "verifying"].includes(promotion.status))) return;
+    if (!promotions.some((promotion) => ["deploying", "verifying", "observation"].includes(promotion.status))) return;
     const timer = window.setInterval(() => {
       void refresh().catch((e) => setError(e instanceof Error ? e.message : String(e)));
     }, 5000);
@@ -282,6 +285,51 @@ export default function ReleasesPage() {
     }
   }
 
+  async function checkObservation(promotionId: string) {
+    setBusy("observation-" + promotionId);
+    setError("");
+    try {
+      await refreshReleaseObservation(projectId, promotionId);
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function markKnownGood(promotionId: string) {
+    if (!window.confirm("Promote this successfully observed deployment to Known Good for the environment?")) return;
+    setBusy("known-good-" + promotionId);
+    setError("");
+    setNotice("");
+    try {
+      await promoteReleaseKnownGood(projectId, promotionId);
+      setNotice("Known Good updated to the exact verified deployment.");
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function rollbackPromotion(promotionId: string) {
+    if (!window.confirm("Deploy the previous Known-Good SHA and run post-rollback verification?")) return;
+    setBusy("rollback-" + promotionId);
+    setError("");
+    setNotice("");
+    try {
+      const rollback = await requestReleaseRollback(projectId, promotionId);
+      setNotice("Safe rollback queued at exact Known-Good SHA: " + String(rollback.requestedGitSha || "").slice(0, 12));
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy("");
+    }
+  }
+
   async function decide(promotionId: string, decision: "approve" | "reject") {
     const comment =
       decision === "reject"
@@ -403,7 +451,7 @@ export default function ReleasesPage() {
           <Card className="overflow-hidden">
             <div className="border-b border-[var(--border)] px-5 py-4">
               <h2 className="font-semibold">Promotion queue</h2>
-              <p className="mt-1 text-[11px] text-[var(--muted)]">Approved releases deploy through KPS at the exact requested Git SHA; provider provenance is monitored server-side.</p>
+              <p className="mt-1 text-[11px] text-[var(--muted)]">Approved releases deploy at the exact SHA, verify through Phase 6, survive observation, and can then be promoted to Known Good.</p>
             </div>
             {promotions.length === 0 ? (
               <div className="p-8 text-center text-sm text-[var(--muted)]">No release promotions yet.</div>
@@ -441,6 +489,15 @@ export default function ReleasesPage() {
                           {canManage && promotion.status === "verifying" && promotion.verificationAutomationRunId ? (
                             <Button variant="secondary" disabled={Boolean(busy)} onClick={() => void checkVerification(promotion.id)}>Check verification</Button>
                           ) : null}
+                          {canManage && promotion.status === "observation" ? (
+                            <Button variant="secondary" disabled={Boolean(busy)} onClick={() => void checkObservation(promotion.id)}>Check observation</Button>
+                          ) : null}
+                          {canManage && promotion.status === "successful" && !promotion.rollbackOfPromotionId ? (
+                            <Button disabled={Boolean(busy)} onClick={() => void markKnownGood(promotion.id)}>Mark Known Good</Button>
+                          ) : null}
+                          {canManage && ["verification_failed", "observation_failed"].includes(promotion.status) && promotion.rollbackEligible ? (
+                            <Button disabled={Boolean(busy)} onClick={() => void rollbackPromotion(promotion.id)}>Rollback to Known Good</Button>
+                          ) : null}
                           {canManage && ["awaiting_qa", "ready_for_approval"].includes(promotion.status) ? (
                             <Button variant="secondary" disabled={Boolean(busy)} onClick={() => void decide(promotion.id, "reject")}>Reject</Button>
                           ) : null}
@@ -468,6 +525,28 @@ export default function ReleasesPage() {
                           <div className="mt-1 font-mono">
                             Run: {promotion.verificationAutomationRunId || "pending"} · checked {promotion.verificationCheckedAt ? new Date(promotion.verificationCheckedAt).toLocaleString() : "not yet"}
                           </div>
+                        </div>
+                      ) : null}
+                      {promotion.status === "observation" || promotion.observationStatus ? (
+                        <div className="mt-3 rounded-lg border border-[var(--border)] bg-[var(--surface-raised)] p-3 text-[11px] text-[var(--muted)]">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="font-semibold text-[var(--foreground)]">Observation window</span>
+                            <Badge value={promotion.observationStatus || "pending"} />
+                          </div>
+                          <div className="mt-1">
+                            Checks: {promotion.observationCheckCount || 0} · consecutive failures: {promotion.observationConsecutiveFailures || 0}
+                            {promotion.observationEndsAt ? " · ends " + new Date(promotion.observationEndsAt).toLocaleString() : ""}
+                          </div>
+                        </div>
+                      ) : null}
+                      {promotion.rollbackOfPromotionId || promotion.rollbackPromotionId || promotion.rollbackRecoveryStatus ? (
+                        <div className="mt-3 rounded-lg border border-[var(--border)] bg-[var(--surface-raised)] p-3 text-[11px] text-[var(--muted)]">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="font-semibold text-[var(--foreground)]">Safe rollback</span>
+                            {promotion.rollbackRecoveryStatus ? <Badge value={promotion.rollbackRecoveryStatus} /> : null}
+                          </div>
+                          {promotion.rollbackOfPromotionId ? <div className="mt-1 font-mono">Recovery for: {promotion.rollbackOfPromotionId}</div> : null}
+                          {promotion.rollbackPromotionId ? <div className="mt-1 font-mono">Recovery promotion: {promotion.rollbackPromotionId}</div> : null}
                         </div>
                       ) : null}
                       {blockers.length ? (

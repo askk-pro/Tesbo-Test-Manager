@@ -48,6 +48,8 @@ export class AppConfigService {
   readonly kpsApiToken = this.optionalString("KPS_API_TOKEN");
   readonly releaseDeploymentMonitorIntervalMs = this.integer("RELEASE_DEPLOYMENT_MONITOR_INTERVAL_MS", 5_000);
   readonly releaseDeploymentMonitorMaxAttempts = this.integer("RELEASE_DEPLOYMENT_MONITOR_MAX_ATTEMPTS", 360);
+  readonly releaseObservationMonitorIntervalMs = this.integer("RELEASE_OBSERVATION_MONITOR_INTERVAL_MS", 15_000);
+  readonly releaseObservationMonitorMaxAttempts = this.integer("RELEASE_OBSERVATION_MONITOR_MAX_ATTEMPTS", 50_000);
   readonly postmarkApiToken = this.string("POSTMARK_API_TOKEN", "");
   readonly postmarkFromEmail = this.string("POSTMARK_FROM_EMAIL", "noreply@example.com");
   // "live" delivers mail for real and is what PRODUCTION must set. Anything else — including an

@@ -4,6 +4,7 @@ import type { Job } from "bullmq";
 import {
   RELEASE_DEPLOYMENT_MONITOR_JOB,
   RELEASE_VERIFICATION_MONITOR_JOB,
+  RELEASE_OBSERVATION_MONITOR_JOB,
   RELEASE_DEPLOYMENT_PROCESSOR_CONCURRENCY,
   RELEASE_DEPLOYMENT_QUEUE,
 } from "./release-deployment.constants";
@@ -22,6 +23,31 @@ export class ReleaseDeploymentProcessor extends WorkerHost {
     if (!promotionId) return null;
 
     const maxAttempts = Math.max(1, Number(job.opts.attempts || 1));
+
+    if (job.name === RELEASE_OBSERVATION_MONITOR_JOB) {
+      try {
+        const result = await this.releases.monitorObservation(promotionId);
+        if (result.status === "pending") {
+          if (job.attemptsMade + 1 >= maxAttempts) {
+            return this.releases.failObservationTimeout(
+              promotionId,
+              "Release observation did not reach a terminal state before its monitoring allowance expired.",
+            );
+          }
+          throw new Error("release_observation_pending");
+        }
+        return result;
+      } catch (error) {
+        if (job.attemptsMade + 1 >= maxAttempts) {
+          return this.releases.failObservationTimeout(
+            promotionId,
+            "Release observation monitoring failed repeatedly: " +
+              (error instanceof Error ? error.message : String(error)),
+          );
+        }
+        throw error;
+      }
+    }
 
     if (job.name === RELEASE_VERIFICATION_MONITOR_JOB) {
       try {

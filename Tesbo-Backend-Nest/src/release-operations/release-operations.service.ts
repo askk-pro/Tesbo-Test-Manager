@@ -17,6 +17,7 @@ import { KpsDeploymentProvider } from "./kps-deployment.provider";
 import {
   RELEASE_DEPLOYMENT_MONITOR_JOB,
   RELEASE_VERIFICATION_MONITOR_JOB,
+  RELEASE_OBSERVATION_MONITOR_JOB,
   RELEASE_DEPLOYMENT_QUEUE,
 } from "./release-deployment.constants";
 import { evaluateDeploymentProvenance } from "./release-provenance.policy";
@@ -683,6 +684,18 @@ export class ReleaseOperationsService {
     };
   }
 
+  private observationJobOptions() {
+    return {
+      attempts: Math.max(1, Math.min(200_000, this.config.releaseObservationMonitorMaxAttempts)),
+      backoff: {
+        type: "fixed" as const,
+        delay: Math.max(1_000, Math.min(300_000, this.config.releaseObservationMonitorIntervalMs)),
+      },
+      removeOnComplete: true,
+      removeOnFail: 100,
+    };
+  }
+
   private deploymentJobId(promotionId: string): string {
     return "release-promotion-" + promotionId;
   }
@@ -993,6 +1006,14 @@ export class ReleaseOperationsService {
         { reason, ...details },
         null,
       );
+      if (row.rollback_of_promotion_id) {
+        await this.markRollbackRecoveryFailure(
+          String(row.rollback_of_promotion_id),
+          String(row.id),
+          "deployment",
+          reason,
+        );
+      }
     }
     return { status: "failed" as const, reason };
   }
@@ -1157,6 +1178,30 @@ export class ReleaseOperationsService {
       },
       null,
     );
+    if (row.rollback_of_promotion_id) {
+      const parent = await this.db.query(
+        `UPDATE release_promotions
+            SET rollback_recovery_status='verifying',updated_at=now()
+          WHERE id=$1 AND rollback_promotion_id=$2
+            AND status IN ('verification_failed','observation_failed')
+          RETURNING status`,
+        [row.rollback_of_promotion_id, promotionId],
+      );
+      if (parent.rows[0]) {
+        await this.insertEvent(
+          String(row.rollback_of_promotion_id),
+          "rollback_provenance_verified",
+          String(parent.rows[0].status),
+          String(parent.rows[0].status),
+          {
+            rollbackPromotionId: promotionId,
+            requestedGitSha: row.requested_git_sha,
+            deployedGitSha: observed.deployedGitSha,
+          },
+          null,
+        );
+      }
+    }
     await this.enqueueVerificationMonitor(promotionId);
     return { status: "verified" as const, promotionStatus: "verifying" };
   }
@@ -1437,6 +1482,9 @@ export class ReleaseOperationsService {
     }
 
     if (runStatus === "passed") {
+      if (row.rollback_of_promotion_id) {
+        return this.completeRollbackRecovery(row, run, summary);
+      }
       const observationMinutes = Math.max(0, Math.min(10080, Number(row.target_observation_minutes || 0)));
       const changed = await this.db.query(
         `UPDATE release_promotions
@@ -1444,6 +1492,9 @@ export class ReleaseOperationsService {
                 verification_summary=$2::jsonb,verification_checked_at=now(),verified_at=now(),
                 observation_started_at=now(),
                 observation_ends_at=now()+($3::text || ' minutes')::interval,
+                observation_status='pending',observation_checked_at=NULL,
+                observation_check_count=0,observation_consecutive_failures=0,
+                observation_summary='{}'::jsonb,
                 failure_reason=NULL,rollback_eligible=false,updated_at=now()
           WHERE id=$1 AND status='verifying'
           RETURNING id`,
@@ -1465,16 +1516,12 @@ export class ReleaseOperationsService {
           },
           null,
         );
+        await this.enqueueObservationMonitor(promotionId);
       }
       return { status: "passed" as const, promotionStatus: "observation", automationRunId: run.id };
     }
 
-    const rollbackEligible = Boolean(
-      row.previous_known_good_build_id ||
-      row.previous_known_good_git_sha ||
-      row.target_known_good_build_id ||
-      row.target_known_good_git_sha
-    );
+    const rollbackEligible = this.hasRollbackReference(row);
     const reason =
       "Post-deployment verification ended with Continuous-QA status " + runStatus +
       (run.error ? ": " + String(run.error) : ".");
@@ -1505,6 +1552,14 @@ export class ReleaseOperationsService {
         },
         null,
       );
+      if (row.rollback_of_promotion_id) {
+        await this.markRollbackRecoveryFailure(
+          String(row.rollback_of_promotion_id),
+          promotionId,
+          "verification",
+          reason,
+        );
+      }
     }
     return {
       status: "failed" as const,
@@ -1519,12 +1574,7 @@ export class ReleaseOperationsService {
     const row = await this.verificationMonitorRow(promotionId);
     if (!row || row.status !== "verifying") return { status: "terminal" as const };
 
-    const rollbackEligible = Boolean(
-      row.previous_known_good_build_id ||
-      row.previous_known_good_git_sha ||
-      row.target_known_good_build_id ||
-      row.target_known_good_git_sha
-    );
+    const rollbackEligible = this.hasRollbackReference(row);
     const changed = await this.db.query(
       `UPDATE release_promotions
           SET status='verification_failed',
@@ -1544,6 +1594,14 @@ export class ReleaseOperationsService {
         { reason, rollbackEligible, stage: "verification_monitor" },
         null,
       );
+      if (row.rollback_of_promotion_id) {
+        await this.markRollbackRecoveryFailure(
+          String(row.rollback_of_promotion_id),
+          promotionId,
+          "verification_monitor",
+          reason,
+        );
+      }
     }
     return { status: "failed" as const, promotionStatus: "verification_failed", rollbackEligible };
   }
@@ -1558,6 +1616,766 @@ export class ReleaseOperationsService {
     if (promotion.status !== "verifying") return promotion;
     await this.monitorVerification(promotionId);
     return this.promotionDetail(projectId, promotionId);
+  }
+
+  private hasRollbackReference(row: Body): boolean {
+    return Boolean(
+      (row.previous_known_good_build_id && row.previous_known_good_git_sha) ||
+      (row.target_known_good_build_id && row.target_known_good_git_sha)
+    );
+  }
+
+  private observationJobId(promotionId: string): string {
+    return "release-observation-" + promotionId;
+  }
+
+  private async enqueueObservationMonitor(promotionId: string): Promise<boolean> {
+    const jobId = this.observationJobId(promotionId);
+    const existing = await this.deploymentQueue.getJob(jobId);
+    if (existing) return false;
+    await this.deploymentQueue.add(
+      RELEASE_OBSERVATION_MONITOR_JOB,
+      { promotionId },
+      { jobId, ...this.observationJobOptions() },
+    );
+    return true;
+  }
+
+  async recoverObservationMonitors(): Promise<number> {
+    const rows = await this.db.query<{ id: string }>(
+      `SELECT rp.id
+         FROM release_promotions rp
+         JOIN projects p ON p.id=rp.project_id
+        WHERE rp.status='observation' AND p.archived_at IS NULL
+        ORDER BY rp.updated_at`,
+    );
+    let recovered = 0;
+    for (const row of rows.rows) {
+      if (await this.enqueueObservationMonitor(row.id)) recovered++;
+    }
+    return recovered;
+  }
+
+  private async observationMonitorRow(promotionId: string): Promise<Body | null> {
+    const res = await this.db.query(
+      `SELECT p.*,
+              e.provider,e.provider_project_ref,e.provider_workload_ref,
+              e.url AS target_environment_url,e.settings AS target_settings,
+              e.known_good_build_id AS target_known_good_build_id,
+              e.known_good_git_sha AS target_known_good_git_sha,
+              e.current_build_id AS target_current_build_id,
+              e.current_git_sha AS target_current_git_sha
+         FROM release_promotions p
+         JOIN release_environments e ON e.id=p.target_environment_id
+        WHERE p.id=$1`,
+      [promotionId],
+    );
+    return (res.rows[0] as Body | undefined) || null;
+  }
+
+  private observationHealthUrl(row: Body): { url: string | null; timeoutMs: number; failureThreshold: number } {
+    const settings =
+      row.target_settings && typeof row.target_settings === "object" && !Array.isArray(row.target_settings)
+        ? row.target_settings as Body
+        : {};
+    const baseUrl = String(row.target_environment_url || "").trim();
+    let url = baseUrl || null;
+    const explicitUrl = String(settings.observationHealthUrl || "").trim();
+    const healthPath = String(
+      settings.observationHealthPath ||
+      settings.verificationHealthPath ||
+      settings.healthPath ||
+      "",
+    ).trim();
+    if (explicitUrl) {
+      try {
+        const parsed = new URL(explicitUrl);
+        if (!["http:","https:"].includes(parsed.protocol)) throw new Error("protocol");
+        url = parsed.toString();
+      } catch {
+        url = null;
+      }
+    } else if (baseUrl && healthPath) {
+      try {
+        url = new URL(healthPath, baseUrl.endsWith("/") ? baseUrl : baseUrl + "/").toString();
+      } catch {
+        url = null;
+      }
+    }
+    const timeoutMs = Math.max(1_000, Math.min(30_000, Number(settings.observationTimeoutMs || 10_000)));
+    const failureThreshold = Math.max(1, Math.min(10, Math.round(Number(settings.observationFailureThreshold || 2))));
+    return { url, timeoutMs, failureThreshold };
+  }
+
+  private async observePromotionHealth(row: Body) {
+    const target = this.observationHealthUrl(row);
+    const expectedGitSha = String(row.deployed_git_sha || row.requested_git_sha || "").trim().toLowerCase();
+    let httpStatus: number | null = null;
+    let httpHealthy = false;
+    let observedGitSha: string | null = null;
+    let responseExcerpt: string | null = null;
+    let httpError: string | null = null;
+
+    if (target.url) {
+      try {
+        const response = await fetch(target.url, {
+          headers: { Accept: "application/json,text/plain,*/*" },
+          signal: AbortSignal.timeout(target.timeoutMs),
+        });
+        httpStatus = response.status;
+        const text = (await response.text()).slice(0, 4096);
+        responseExcerpt = text || null;
+        httpHealthy = response.status >= 200 && response.status <= 399;
+        if (text) {
+          try {
+            const body = JSON.parse(text) as Body;
+            const candidate = String(
+              body.gitSha || body.git_sha || body.commitSha || body.commit_sha || body.commit || "",
+            ).trim().toLowerCase();
+            if (/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(candidate)) observedGitSha = candidate;
+          } catch {
+            // A healthy HTML/text endpoint is acceptable; SHA is verified when the endpoint exposes it.
+          }
+        }
+        if (observedGitSha && expectedGitSha && observedGitSha !== expectedGitSha) httpHealthy = false;
+      } catch (error) {
+        httpError = error instanceof Error ? error.message : String(error);
+      }
+    } else {
+      httpError = "Release environment has no valid observation health URL.";
+    }
+
+    let providerState: string | null = null;
+    let providerStatus: string | null = null;
+    let providerGitSha: string | null = null;
+    let providerHealthy = true;
+    let providerError: string | null = null;
+    if (String(row.provider || "").toLowerCase() === "kps") {
+      providerHealthy = false;
+      if (!row.provider_deployment_id) {
+        providerError = "Promotion has no provider deployment id.";
+      } else {
+        try {
+          const observed = await this.kps.observe({
+            ...this.kpsReference(row),
+            deploymentId: String(row.provider_deployment_id),
+          });
+          providerState = observed.state;
+          providerStatus = observed.providerStatus;
+          providerGitSha = observed.deployedGitSha ? String(observed.deployedGitSha).toLowerCase() : null;
+          providerHealthy =
+            observed.state === "succeeded" &&
+            Boolean(providerGitSha) &&
+            (!expectedGitSha || providerGitSha === expectedGitSha);
+          if (!providerHealthy) {
+            providerError = "KPS provider no longer reports the exact verified deployment as successful.";
+          }
+        } catch (error) {
+          providerError = error instanceof Error ? error.message : String(error);
+        }
+      }
+    }
+
+    const currentBuildMatches =
+      String(row.target_current_build_id || "") === String(row.build_id || "");
+    const currentShaMatches =
+      String(row.target_current_git_sha || "").trim().toLowerCase() === expectedGitSha;
+    const currentDeploymentMatches = currentBuildMatches && currentShaMatches;
+    if (!currentDeploymentMatches) {
+      providerHealthy = false;
+      providerError =
+        "This promotion is no longer the environment's current deployment.";
+    }
+
+    const healthy = httpHealthy && providerHealthy && currentDeploymentMatches;
+    return {
+      healthy,
+      healthUrl: target.url,
+      failureThreshold: target.failureThreshold,
+      httpStatus,
+      httpHealthy,
+      httpError,
+      observedGitSha,
+      expectedGitSha: expectedGitSha || null,
+      providerState,
+      providerStatus,
+      providerGitSha,
+      providerHealthy,
+      providerError,
+      currentDeploymentMatches,
+      responseExcerpt,
+    };
+  }
+
+  async monitorObservation(promotionId: string) {
+    const row = await this.observationMonitorRow(promotionId);
+    if (!row || row.status !== "observation") {
+      return { status: "terminal" as const, promotionStatus: row?.status || "missing" };
+    }
+
+    const observed = await this.observePromotionHealth(row);
+    const nextFailures = observed.healthy ? 0 : Number(row.observation_consecutive_failures || 0) + 1;
+    const nextCount = Number(row.observation_check_count || 0) + 1;
+    const summary = {
+      healthy: observed.healthy,
+      healthUrl: observed.healthUrl,
+      httpStatus: observed.httpStatus,
+      httpHealthy: observed.httpHealthy,
+      httpError: observed.httpError,
+      observedGitSha: observed.observedGitSha,
+      expectedGitSha: observed.expectedGitSha,
+      providerState: observed.providerState,
+      providerStatus: observed.providerStatus,
+      providerGitSha: observed.providerGitSha,
+      providerHealthy: observed.providerHealthy,
+      providerError: observed.providerError,
+      currentDeploymentMatches: observed.currentDeploymentMatches,
+      consecutiveFailures: nextFailures,
+      failureThreshold: observed.failureThreshold,
+      checkCount: nextCount,
+      checkedAt: new Date().toISOString(),
+    };
+
+    await this.db.query(
+      `INSERT INTO release_observation_checks
+         (promotion_id,health_status,health_url,http_status,provider_state,provider_status,
+          expected_git_sha,observed_git_sha,details)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)`,
+      [
+        promotionId,
+        observed.healthy ? "healthy" : "unhealthy",
+        observed.healthUrl,
+        observed.httpStatus,
+        observed.providerState,
+        observed.providerStatus,
+        observed.expectedGitSha,
+        observed.observedGitSha || observed.providerGitSha,
+        JSON.stringify(summary),
+      ],
+    );
+
+    await this.db.query(
+      `UPDATE release_promotions
+          SET observation_status=$2,observation_checked_at=now(),
+              observation_check_count=$3,observation_consecutive_failures=$4,
+              observation_summary=$5::jsonb,updated_at=now()
+        WHERE id=$1 AND status='observation'`,
+      [promotionId, observed.healthy ? "healthy" : "unhealthy", nextCount, nextFailures, JSON.stringify(summary)],
+    );
+
+    if (!observed.healthy && nextFailures >= observed.failureThreshold) {
+      const rollbackEligible = this.hasRollbackReference(row);
+      const reason =
+        "Release observation failed " + nextFailures + " consecutive health check(s). " +
+        String(observed.httpError || observed.providerError || "Health/provenance check failed.");
+      const changed = await this.db.query(
+        `UPDATE release_promotions
+            SET status='observation_failed',observation_status='failed',
+                failure_reason=$2,rollback_eligible=$3,completed_at=now(),updated_at=now()
+          WHERE id=$1 AND status='observation'
+          RETURNING id`,
+        [promotionId, reason, rollbackEligible],
+      );
+      if (changed.rows[0]) {
+        await this.insertEvent(
+          promotionId,
+          "observation_failed",
+          "observation",
+          "observation_failed",
+          { reason, rollbackEligible, observation: summary },
+          null,
+        );
+      }
+      return {
+        status: "failed" as const,
+        promotionStatus: "observation_failed",
+        rollbackEligible,
+        observation: summary,
+      };
+    }
+
+    const deadline = row.observation_ends_at ? new Date(row.observation_ends_at).getTime() : 0;
+    if (observed.healthy && deadline > 0 && Date.now() >= deadline) {
+      const changed = await this.db.query(
+        `UPDATE release_promotions
+            SET status='successful',observation_status='passed',
+                observation_checked_at=now(),observation_summary=$2::jsonb,
+                failure_reason=NULL,rollback_eligible=false,completed_at=now(),updated_at=now()
+          WHERE id=$1 AND status='observation'
+          RETURNING target_environment_id,build_id,deployed_git_sha`,
+        [promotionId, JSON.stringify(summary)],
+      );
+      if (changed.rows[0]) {
+        await this.db.query(
+          `UPDATE release_environments
+              SET current_build_id=$2,current_git_sha=$3,last_verified_at=now(),updated_at=now()
+            WHERE id=$1`,
+          [
+            changed.rows[0].target_environment_id,
+            changed.rows[0].build_id,
+            changed.rows[0].deployed_git_sha,
+          ],
+        );
+        await this.insertEvent(
+          promotionId,
+          "observation_passed",
+          "observation",
+          "successful",
+          { observation: summary, observationEndsAt: row.observation_ends_at || null },
+          null,
+        );
+      }
+      return { status: "passed" as const, promotionStatus: "successful", observation: summary };
+    }
+
+    return {
+      status: "pending" as const,
+      promotionStatus: "observation",
+      observation: summary,
+      observationEndsAt: row.observation_ends_at || null,
+    };
+  }
+
+  async failObservationTimeout(promotionId: string, reason: string) {
+    const row = await this.observationMonitorRow(promotionId);
+    if (!row || row.status !== "observation") return { status: "terminal" as const };
+    const rollbackEligible = this.hasRollbackReference(row);
+    const changed = await this.db.query(
+      `UPDATE release_promotions
+          SET status='observation_failed',observation_status='failed',
+              observation_checked_at=now(),failure_reason=$2,
+              rollback_eligible=$3,completed_at=now(),updated_at=now()
+        WHERE id=$1 AND status='observation'
+        RETURNING id`,
+      [promotionId, reason, rollbackEligible],
+    );
+    if (changed.rows[0]) {
+      await this.insertEvent(
+        promotionId,
+        "observation_failed",
+        "observation",
+        "observation_failed",
+        { reason, rollbackEligible, stage: "observation_monitor" },
+        null,
+      );
+    }
+    return { status: "failed" as const, promotionStatus: "observation_failed", rollbackEligible };
+  }
+
+  async refreshObservation(
+    userId: string | null | undefined,
+    projectId: string,
+    promotionId: string,
+  ) {
+    await this.requireManager(userId, projectId);
+    const promotion = await this.promotionDetail(projectId, promotionId) as Body;
+    if (promotion.status !== "observation") return promotion;
+    await this.monitorObservation(promotionId);
+    return this.promotionDetail(projectId, promotionId);
+  }
+
+  async promoteKnownGood(
+    userId: string | null | undefined,
+    projectId: string,
+    promotionId: string,
+  ) {
+    await this.requireManager(userId, projectId);
+    const uid = this.userId(userId);
+    const result = await this.db.transaction(async (client) => {
+      const locked = await client.query(
+        `SELECT p.*,e.current_build_id,e.current_git_sha,e.known_good_build_id,e.known_good_git_sha
+           FROM release_promotions p
+           JOIN release_environments e ON e.id=p.target_environment_id
+          WHERE p.id=$1 AND p.project_id=$2
+          FOR UPDATE OF p,e`,
+        [promotionId, projectId],
+      );
+      const row = locked.rows[0] as Body | undefined;
+      if (!row) throw new NotFoundException({ error: "Promotion not found" });
+      if (row.rollback_of_promotion_id) {
+        throw new ConflictException({
+          error: "A rollback recovery restores the existing Known Good and cannot redefine it.",
+        });
+      }
+      if (row.status !== "successful" || row.observation_status !== "passed") {
+        throw new ConflictException({
+          error: "Only a successfully observed release can be promoted to Known Good.",
+        });
+      }
+      const deployedSha = String(row.deployed_git_sha || "").toLowerCase();
+      if (
+        String(row.current_build_id || "") !== String(row.build_id) ||
+        String(row.current_git_sha || "").toLowerCase() !== deployedSha
+      ) {
+        throw new ConflictException({
+          error: "This release is no longer the environment's current deployment; Known Good promotion is blocked.",
+        });
+      }
+      const previousBuildId = row.known_good_build_id || null;
+      const previousGitSha = row.known_good_git_sha || null;
+      await client.query(
+        `UPDATE release_environments
+            SET known_good_build_id=$2,known_good_git_sha=$3,last_verified_at=now(),updated_at=now()
+          WHERE id=$1`,
+        [row.target_environment_id, row.build_id, row.deployed_git_sha],
+      );
+      await client.query(
+        `UPDATE release_promotions
+            SET status='known_good',completed_at=COALESCE(completed_at,now()),updated_at=now()
+          WHERE id=$1`,
+        [promotionId],
+      );
+      return { previousBuildId, previousGitSha, buildId: row.build_id, gitSha: row.deployed_git_sha };
+    });
+
+    await this.insertEvent(
+      promotionId,
+      "known_good_promoted",
+      "successful",
+      "known_good",
+      {
+        previousKnownGoodBuildId: result.previousBuildId,
+        previousKnownGoodGitSha: result.previousGitSha,
+        knownGoodBuildId: result.buildId,
+        knownGoodGitSha: result.gitSha,
+      },
+      uid,
+    );
+    await this.legacy.logProjectActivity(
+      projectId,
+      uid,
+      "release_known_good_promoted",
+      "release_promotion",
+      promotionId,
+      null,
+      result,
+    );
+    return this.promotionDetail(projectId, promotionId);
+  }
+
+  private async markRollbackRecoveryFailure(
+    parentPromotionId: string,
+    rollbackPromotionId: string,
+    stage: string,
+    reason: string,
+  ) {
+    const changed = await this.db.query(
+      `UPDATE release_promotions
+          SET rollback_recovery_status='failed',rollback_completed_at=now(),
+              rollback_eligible=true,updated_at=now()
+        WHERE id=$1 AND rollback_promotion_id=$2
+          AND status IN ('verification_failed','observation_failed')
+        RETURNING status`,
+      [parentPromotionId, rollbackPromotionId],
+    );
+    if (changed.rows[0]) {
+      await this.insertEvent(
+        parentPromotionId,
+        "rollback_recovery_failed",
+        String(changed.rows[0].status),
+        String(changed.rows[0].status),
+        { rollbackPromotionId, stage, reason },
+        null,
+      );
+    }
+  }
+
+  private async completeRollbackRecovery(row: Body, run: Body, summary: Body) {
+    const parentPromotionId = String(row.rollback_of_promotion_id || "");
+    const requestedGitSha = String(row.requested_git_sha || "").toLowerCase();
+    const deployedGitSha = String(row.deployed_git_sha || "").toLowerCase();
+    const environment = await this.requireEnvironment(String(row.project_id), String(row.target_environment_id));
+    const currentKnownGoodBuildId = String(environment.known_good_build_id || "");
+    const currentKnownGoodGitSha = String(environment.known_good_git_sha || "").toLowerCase();
+
+    if (
+      !parentPromotionId ||
+      requestedGitSha !== deployedGitSha ||
+      currentKnownGoodBuildId !== String(row.build_id) ||
+      currentKnownGoodGitSha !== requestedGitSha
+    ) {
+      const reason = "Rollback recovery verification passed, but the environment Known-Good reference changed or exact SHA provenance no longer matches.";
+      await this.db.query(
+        `UPDATE release_promotions
+            SET status='verification_failed',verification_status='passed',
+                verification_summary=$2::jsonb,verification_checked_at=now(),
+                failure_reason=$3,completed_at=now(),updated_at=now()
+          WHERE id=$1 AND status='verifying'`,
+        [row.id, JSON.stringify(summary), reason],
+      );
+      if (parentPromotionId) {
+        await this.markRollbackRecoveryFailure(parentPromotionId, String(row.id), "recovery_safety_gate", reason);
+      }
+      await this.insertEvent(
+        String(row.id),
+        "rollback_recovery_blocked",
+        "verifying",
+        "verification_failed",
+        { reason, requestedGitSha, deployedGitSha, currentKnownGoodGitSha },
+        null,
+      );
+      return { status: "failed" as const, promotionStatus: "verification_failed", reason };
+    }
+
+    const result = await this.db.transaction(async (client) => {
+      const parentRes = await client.query(
+        `SELECT status
+           FROM release_promotions
+          WHERE id=$1 AND project_id=$2
+          FOR UPDATE`,
+        [parentPromotionId, row.project_id],
+      );
+      const parentStatus = String(parentRes.rows[0]?.status || "");
+      if (!["verification_failed","observation_failed"].includes(parentStatus)) {
+        throw new ConflictException({ error: "Rollback parent is no longer in a recoverable failed state." });
+      }
+      const environmentRes = await client.query(
+        `UPDATE release_environments
+            SET current_build_id=$2,current_git_sha=$3,last_verified_at=now(),updated_at=now()
+          WHERE id=$1 AND known_good_build_id=$2 AND lower(known_good_git_sha)=lower($3)
+          RETURNING id`,
+        [row.target_environment_id, row.build_id, row.requested_git_sha],
+      );
+      if (!environmentRes.rows[0]) {
+        throw new ConflictException({ error: "Environment Known Good changed during rollback recovery." });
+      }
+      await client.query(
+        `UPDATE release_promotions
+            SET status='successful',verification_status='passed',
+                verification_summary=$2::jsonb,verification_checked_at=now(),verified_at=now(),
+                observation_status='passed',observation_started_at=now(),observation_ends_at=now(),
+                observation_checked_at=now(),rollback_eligible=false,
+                failure_reason=NULL,completed_at=now(),updated_at=now()
+          WHERE id=$1 AND status='verifying'`,
+        [row.id, JSON.stringify(summary)],
+      );
+      await client.query(
+        `UPDATE release_promotions
+            SET status='rolled_back',rollback_recovery_status='passed',
+                rollback_completed_at=now(),rollback_eligible=false,
+                completed_at=now(),updated_at=now()
+          WHERE id=$1 AND rollback_promotion_id=$2`,
+        [parentPromotionId, row.id],
+      );
+      return { parentStatus };
+    });
+
+    await this.insertEvent(
+      String(row.id),
+      "rollback_verification_passed",
+      "verifying",
+      "successful",
+      {
+        parentPromotionId,
+        automationRunId: run.id,
+        planId: run.plan_id || null,
+        restoredGitSha: row.requested_git_sha,
+      },
+      null,
+    );
+    await this.insertEvent(
+      parentPromotionId,
+      "rollback_recovery_passed",
+      result.parentStatus,
+      "rolled_back",
+      {
+        rollbackPromotionId: row.id,
+        automationRunId: run.id,
+        restoredBuildId: row.build_id,
+        restoredGitSha: row.requested_git_sha,
+      },
+      null,
+    );
+    return {
+      status: "passed" as const,
+      promotionStatus: "successful",
+      parentPromotionStatus: "rolled_back",
+      automationRunId: run.id,
+    };
+  }
+
+  async requestRollback(
+    userId: string | null | undefined,
+    projectId: string,
+    promotionId: string,
+  ) {
+    await this.requireManager(userId, projectId);
+    const uid = this.userId(userId);
+    const original = await this.promotionDetail(projectId, promotionId) as Body;
+    if (!["verification_failed","observation_failed"].includes(String(original.status))) {
+      throw new ConflictException({
+        error: "Safe rollback is available only after post-deployment verification or observation failure.",
+      });
+    }
+    if (!original.rollbackEligible) {
+      throw new ConflictException({ error: "This failed release has no complete previous Known-Good reference to restore." });
+    }
+
+    const target = await this.requireEnvironment(projectId, String(original.targetEnvironmentId));
+    const rollbackBuildId = String(original.previousKnownGoodBuildId || target.known_good_build_id || "");
+    const rollbackGitSha = String(original.previousKnownGoodGitSha || target.known_good_git_sha || "").trim().toLowerCase();
+    if (!isUuid(rollbackBuildId) || !/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(rollbackGitSha)) {
+      throw new ConflictException({ error: "Previous Known Good is incomplete; rollback is blocked." });
+    }
+    const rollbackBuild = await this.requireBuild(projectId, rollbackBuildId);
+    if (String(rollbackBuild.git_sha || "").trim().toLowerCase() !== rollbackGitSha) {
+      throw new ConflictException({ error: "Previous Known-Good build and Git SHA do not match; rollback is blocked." });
+    }
+    if (
+      String(target.known_good_build_id || "") !== rollbackBuildId ||
+      String(target.known_good_git_sha || "").trim().toLowerCase() !== rollbackGitSha
+    ) {
+      throw new ConflictException({
+        error: "The environment Known Good changed after this release failed; refresh before choosing a recovery action.",
+      });
+    }
+    const failedDeploymentSha = String(original.deployedGitSha || original.requestedGitSha || "").trim().toLowerCase();
+    if (
+      String(target.current_build_id || "") !== String(original.buildId || "") ||
+      String(target.current_git_sha || "").trim().toLowerCase() !== failedDeploymentSha
+    ) {
+      throw new ConflictException({
+        error: "This failed release is no longer the environment's current deployment; rollback is blocked to avoid overwriting a newer release.",
+      });
+    }
+    const ref = this.kpsReference(target);
+
+    const active = await this.db.query(
+      `SELECT id FROM release_promotions
+        WHERE rollback_of_promotion_id=$1
+          AND status IN ('deploying','verifying','observation')
+        ORDER BY created_at DESC LIMIT 1`,
+      [promotionId],
+    );
+    if (active.rows[0]) return this.promotionDetail(projectId, String(active.rows[0].id));
+
+    const rollbackSnapshot = {
+      rollback: {
+        sourcePromotionId: promotionId,
+        sourceFailureStatus: original.status,
+        restoresKnownGoodBuildId: rollbackBuildId,
+        restoresKnownGoodGitSha: rollbackGitSha,
+      },
+    };
+    const inserted = await this.db.query(
+      `INSERT INTO release_promotions
+         (project_id,target_environment_id,build_id,status,requested_by,approved_by,requested_at,approved_at,
+          deployment_started_at,previous_known_good_build_id,previous_known_good_git_sha,
+          policy_snapshot,requested_git_sha,rollback_of_promotion_id,
+          provider_deployment_status,provenance_status,rollback_eligible)
+       VALUES ($1,$2,$3,'deploying',$4,$4,now(),now(),now(),$3,$5,$6::jsonb,$5,$7,'requesting','pending',false)
+       RETURNING id`,
+      [
+        projectId,
+        original.targetEnvironmentId,
+        rollbackBuildId,
+        uid,
+        rollbackGitSha,
+        JSON.stringify(rollbackSnapshot),
+        promotionId,
+      ],
+    );
+    const rollbackPromotionId = String(inserted.rows[0].id);
+    await this.db.query(
+      `UPDATE release_promotions
+          SET rollback_promotion_id=$2,rollback_started_at=now(),
+              rollback_completed_at=NULL,rollback_recovery_status='deploying',updated_at=now()
+        WHERE id=$1 AND project_id=$3`,
+      [promotionId, rollbackPromotionId, projectId],
+    );
+    await this.insertEvent(
+      promotionId,
+      "rollback_requested",
+      String(original.status),
+      String(original.status),
+      { rollbackPromotionId, rollbackBuildId, rollbackGitSha },
+      uid,
+    );
+    await this.insertEvent(
+      rollbackPromotionId,
+      "rollback_requested",
+      null,
+      "deploying",
+      { parentPromotionId: promotionId, rollbackBuildId, rollbackGitSha },
+      uid,
+    );
+
+    let started;
+    try {
+      started = await this.kps.start({ ...ref, requestedGitSha: rollbackGitSha });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      await this.db.query(
+        `UPDATE release_promotions
+            SET status='deployment_failed',provider_deployment_status='request_failed',
+                provenance_status='unavailable',provenance_checked_at=now(),
+                failure_reason=$2,completed_at=now(),updated_at=now()
+          WHERE id=$1 AND status='deploying'`,
+        [rollbackPromotionId, reason],
+      );
+      await this.insertEvent(
+        rollbackPromotionId,
+        "deployment_failed",
+        "deploying",
+        "deployment_failed",
+        { stage: "rollback_provider_request", reason },
+        uid,
+      );
+      await this.markRollbackRecoveryFailure(
+        promotionId,
+        rollbackPromotionId,
+        "provider_request",
+        reason,
+      );
+      throw new BadGatewayException({ error: "KPS rollback deployment request failed: " + reason });
+    }
+
+    await this.db.query(
+      `UPDATE release_promotions
+          SET provider_deployment_id=$2,provider_deployment_status=$3,
+              evidence=COALESCE(evidence,'{}'::jsonb) || $4::jsonb,updated_at=now()
+        WHERE id=$1 AND status='deploying'`,
+      [
+        rollbackPromotionId,
+        started.deploymentId,
+        started.providerStatus,
+        JSON.stringify({
+          providerRequest: {
+            provider: "kps",
+            rollback: true,
+            deploymentId: started.deploymentId,
+            deploymentStrategy: started.deploymentStrategy,
+            persistentVolumeCount: started.persistentVolumeCount,
+            metadata: started.metadata,
+            requestedGitSha: rollbackGitSha,
+          },
+        }),
+      ],
+    );
+    await this.insertEvent(
+      rollbackPromotionId,
+      "deployment_requested",
+      "deploying",
+      "deploying",
+      {
+        provider: "kps",
+        rollback: true,
+        providerDeploymentId: started.deploymentId,
+        requestedGitSha: rollbackGitSha,
+      },
+      uid,
+    );
+    await this.enqueueDeploymentMonitor(rollbackPromotionId);
+    await this.legacy.logProjectActivity(
+      projectId,
+      uid,
+      "release_safe_rollback_requested",
+      "release_promotion",
+      promotionId,
+      null,
+      { rollbackPromotionId, rollbackBuildId, rollbackGitSha, providerDeploymentId: started.deploymentId },
+    );
+    return this.promotionDetail(projectId, rollbackPromotionId);
   }
 
 }

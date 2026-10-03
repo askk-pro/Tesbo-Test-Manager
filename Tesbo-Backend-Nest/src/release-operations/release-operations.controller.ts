@@ -111,6 +111,33 @@ export class ReleaseOperationsController {
     return this.releases.refreshVerification(req.userId, projectId, promotionId);
   }
 
+  @Post("/api/projects/:projectId/release-promotions/:promotionId/observation/refresh")
+  refreshObservation(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("promotionId") promotionId: string,
+  ) {
+    return this.releases.refreshObservation(req.userId, projectId, promotionId);
+  }
+
+  @Post("/api/projects/:projectId/release-promotions/:promotionId/known-good")
+  promoteKnownGood(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("promotionId") promotionId: string,
+  ) {
+    return this.releases.promoteKnownGood(req.userId, projectId, promotionId);
+  }
+
+  @Post("/api/projects/:projectId/release-promotions/:promotionId/rollback")
+  requestRollback(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("promotionId") promotionId: string,
+  ) {
+    return this.releases.requestRollback(req.userId, projectId, promotionId);
+  }
+
   @Post("/api/projects/:projectId/release-promotions/:promotionId/decision")
   decidePromotion(
     @Req() req: AuthenticatedRequest,

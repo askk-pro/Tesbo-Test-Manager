@@ -3907,7 +3907,17 @@ export interface ReleasePromotion {
   verifiedAt?: string | null;
   observationStartedAt?: string | null;
   observationEndsAt?: string | null;
+  observationStatus?: "pending" | "healthy" | "unhealthy" | "passed" | "failed" | null;
+  observationCheckedAt?: string | null;
+  observationCheckCount?: number;
+  observationConsecutiveFailures?: number;
+  observationSummary?: Record<string, unknown>;
   rollbackEligible?: boolean;
+  rollbackPromotionId?: string | null;
+  rollbackOfPromotionId?: string | null;
+  rollbackStartedAt?: string | null;
+  rollbackCompletedAt?: string | null;
+  rollbackRecoveryStatus?: "deploying" | "verifying" | "passed" | "failed" | null;
   failureReason?: string | null;
   policySnapshot: {
     environment?: Record<string, unknown>;
@@ -4017,6 +4027,36 @@ export async function refreshReleaseVerification(
   promotionId: string,
 ): Promise<ReleasePromotion> {
   return api(`/api/projects/${projectId}/release-promotions/${promotionId}/verification/refresh`, {
+    method: "POST",
+    body: {},
+  });
+}
+
+export async function refreshReleaseObservation(
+  projectId: string,
+  promotionId: string,
+): Promise<ReleasePromotion> {
+  return api(`/api/projects/${projectId}/release-promotions/${promotionId}/observation/refresh`, {
+    method: "POST",
+    body: {},
+  });
+}
+
+export async function promoteReleaseKnownGood(
+  projectId: string,
+  promotionId: string,
+): Promise<ReleasePromotion> {
+  return api(`/api/projects/${projectId}/release-promotions/${promotionId}/known-good`, {
+    method: "POST",
+    body: {},
+  });
+}
+
+export async function requestReleaseRollback(
+  projectId: string,
+  promotionId: string,
+): Promise<ReleasePromotion> {
+  return api(`/api/projects/${projectId}/release-promotions/${promotionId}/rollback`, {
     method: "POST",
     body: {},
   });

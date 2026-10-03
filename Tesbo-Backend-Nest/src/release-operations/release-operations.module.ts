@@ -48,5 +48,15 @@ export class ReleaseOperationsModule implements OnModuleInit {
             (error instanceof Error ? error.message : String(error)),
         );
       });
+    await this.releases.recoverObservationMonitors()
+      .then((count) => {
+        if (count > 0) this.logger.log("Recovered " + count + " release observation monitor(s).");
+      })
+      .catch((error) => {
+        this.logger.warn(
+          "Failed to recover release observation monitors: " +
+            (error instanceof Error ? error.message : String(error)),
+        );
+      });
   }
 }
