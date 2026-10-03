@@ -91,7 +91,7 @@ export function evaluateReleasePolicy(
     }
   }
 
-  if (coverage === null || coverage < policy.minRegressionCoverage) {
+  if (policy.minRegressionCoverage > 0 && (coverage === null || coverage < policy.minRegressionCoverage)) {
     blockers.push({
       code: "REGRESSION_COVERAGE",
       message: `Regression coverage must be at least ${policy.minRegressionCoverage}%.`,

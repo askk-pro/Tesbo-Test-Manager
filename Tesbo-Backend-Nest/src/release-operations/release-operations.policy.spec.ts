@@ -53,6 +53,23 @@ describe("Phase 7 release promotion policy", () => {
     );
   });
 
+  it("allows a zero-threshold non-protected target without certification evidence", () => {
+    const result = evaluateReleasePolicy(
+      {
+        ...protectedPolicy,
+        protected: false,
+        requiredCertificationState: "NONE",
+        requiredApprovals: 1,
+        requireNoP0P1: false,
+        minRegressionCoverage: 0,
+        requireSmoke: false,
+        observationMinutes: 0,
+      },
+      null,
+    );
+    expect(result).toEqual(expect.objectContaining({ passed: true, blockers: [] }));
+  });
+
   it("fails closed when a protected policy lacks P0/P1 evidence", () => {
     const result = evaluateReleasePolicy(
       protectedPolicy,
