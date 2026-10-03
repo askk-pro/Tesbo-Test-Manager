@@ -3837,6 +3837,130 @@ export async function revokeReleaseCertification(projectId: string, certificatio
   });
 }
 
+export interface ReleaseEnvironment {
+  id: string;
+  projectId: string;
+  name: string;
+  slug: string;
+  environmentType: "development" | "qa" | "staging" | "uat" | "production" | "custom";
+  url?: string | null;
+  provider: string;
+  providerProjectRef?: string | null;
+  branchName?: string | null;
+  protected: boolean;
+  requiredCertificationState: "NONE" | "READY" | "APPROVED" | "CERTIFIED";
+  requiredApprovals: number;
+  requireNoP0P1: boolean;
+  minRegressionCoverage: number | string;
+  requireSmoke: boolean;
+  allowedBrowsers: string[];
+  observationMinutes: number;
+  currentBuildId?: string | null;
+  currentGitSha?: string | null;
+  knownGoodBuildId?: string | null;
+  knownGoodGitSha?: string | null;
+  lastVerifiedAt?: string | null;
+  sortOrder: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ReleasePromotion {
+  id: string;
+  projectId: string;
+  sourceEnvironmentId?: string | null;
+  sourceEnvironmentName?: string | null;
+  targetEnvironmentId: string;
+  targetEnvironmentName: string;
+  targetEnvironmentType: string;
+  targetProtected?: boolean;
+  buildId: string;
+  repository?: string;
+  gitSha?: string;
+  branchName?: string;
+  releaseName?: string;
+  buildVersion?: string;
+  certificationId?: string | null;
+  certificationState?: string | null;
+  certificationValidity?: string | null;
+  status: string;
+  requestedBy?: string | null;
+  approvedBy?: string | null;
+  requestedAt: string;
+  approvedAt?: string | null;
+  policySnapshot: {
+    environment?: Record<string, unknown>;
+    rules?: Record<string, unknown>;
+    certification?: Record<string, unknown> | null;
+    evaluation?: {
+      passed?: boolean;
+      blockers?: Array<{ code: string; message: string; expected?: unknown; actual?: unknown }>;
+      certificationState?: string | null;
+      certificationValidity?: string | null;
+      regressionCoverage?: number | null;
+      smokeSelected?: number | null;
+      openP0P1Tickets?: number | null;
+    };
+  };
+  policyDigest?: string | null;
+  approvalCount?: number;
+  rejectionCount?: number;
+  approvals?: Array<Record<string, unknown>>;
+  events?: Array<Record<string, unknown>>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export async function listReleaseEnvironments(projectId: string): Promise<ReleaseEnvironment[]> {
+  return api(`/api/projects/${projectId}/release-environments`);
+}
+
+export async function createReleaseEnvironment(
+  projectId: string,
+  data: Partial<ReleaseEnvironment> & { name: string },
+): Promise<ReleaseEnvironment> {
+  return api(`/api/projects/${projectId}/release-environments`, { method: "POST", body: data });
+}
+
+export async function updateReleaseEnvironment(
+  projectId: string,
+  environmentId: string,
+  data: Partial<ReleaseEnvironment>,
+): Promise<ReleaseEnvironment> {
+  return api(`/api/projects/${projectId}/release-environments/${environmentId}`, { method: "PATCH", body: data });
+}
+
+export async function archiveReleaseEnvironment(projectId: string, environmentId: string): Promise<{ ok: boolean; id: string }> {
+  return api(`/api/projects/${projectId}/release-environments/${environmentId}`, { method: "DELETE" });
+}
+
+export async function listReleasePromotions(projectId: string, limit = 100): Promise<ReleasePromotion[]> {
+  return api(`/api/projects/${projectId}/release-promotions?limit=${limit}`);
+}
+
+export async function getReleasePromotion(projectId: string, promotionId: string): Promise<ReleasePromotion> {
+  return api(`/api/projects/${projectId}/release-promotions/${promotionId}`);
+}
+
+export async function createReleasePromotion(
+  projectId: string,
+  data: { buildId: string; targetEnvironmentId: string; sourceEnvironmentId?: string | null },
+): Promise<ReleasePromotion> {
+  return api(`/api/projects/${projectId}/release-promotions`, { method: "POST", body: data });
+}
+
+export async function refreshReleasePromotion(projectId: string, promotionId: string): Promise<ReleasePromotion> {
+  return api(`/api/projects/${projectId}/release-promotions/${promotionId}/refresh`, { method: "POST", body: {} });
+}
+
+export async function decideReleasePromotion(
+  projectId: string,
+  promotionId: string,
+  data: { decision: "approve" | "reject"; comment?: string },
+): Promise<ReleasePromotion> {
+  return api(`/api/projects/${projectId}/release-promotions/${promotionId}/decision`, { method: "POST", body: data });
+}
+
 export async function decideQaTicketRetest(
   projectId: string,
   ticketRef: string,
