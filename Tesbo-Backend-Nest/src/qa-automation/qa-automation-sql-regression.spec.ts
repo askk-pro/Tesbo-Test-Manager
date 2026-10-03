@@ -12,4 +12,12 @@ describe("Phase 6 PostgreSQL SQL regression guards", () => {
       "summary=jsonb_build_object('createdShards',$2,'skippedTargets',$3)"
     );
   });
+
+  it("types the reused automation step-status bind parameter consistently", () => {
+    const source = readFileSync(join(__dirname, "../legacy/legacy.service.ts"), "utf8");
+
+    expect(source).toContain(
+      "VALUES ($1,$2,$3,$4,$5,$6::text,$7,$8,'automation',$9,CASE WHEN $6::text='Untested' THEN NULL ELSE now() END)"
+    );
+  });
 });

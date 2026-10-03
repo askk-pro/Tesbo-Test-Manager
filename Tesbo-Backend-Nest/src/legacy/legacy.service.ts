@@ -6615,7 +6615,7 @@ export class LegacyService implements OnModuleInit {
         `INSERT INTO execution_step_results
            (project_id, execution_id, step_number, action, expected_result, status,
             actual_result, error_message, reported_by, executed_by, executed_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'automation',$9,CASE WHEN $6='Untested' THEN NULL ELSE now() END)
+         VALUES ($1,$2,$3,$4,$5,$6::text,$7,$8,'automation',$9,CASE WHEN $6::text='Untested' THEN NULL ELSE now() END)
          ON CONFLICT (execution_id, step_number)
          DO UPDATE SET
            action = EXCLUDED.action,
