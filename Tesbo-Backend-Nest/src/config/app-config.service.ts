@@ -43,6 +43,11 @@ export class AppConfigService {
   readonly httpKeepAliveTimeoutMs = this.integer("HTTP_KEEP_ALIVE_TIMEOUT_MS", 65_000);
   readonly httpHeadersTimeoutMs = this.integer("HTTP_HEADERS_TIMEOUT_MS", 70_000);
   readonly redisUrl = this.string("REDIS_URL", "redis://localhost:6379");
+  // Phase 7 release deployment provider. Server-only: the token is never exposed to the frontend.
+  readonly kpsBaseUrl = this.optionalString("KPS_BASE_URL");
+  readonly kpsApiToken = this.optionalString("KPS_API_TOKEN");
+  readonly releaseDeploymentMonitorIntervalMs = this.integer("RELEASE_DEPLOYMENT_MONITOR_INTERVAL_MS", 5_000);
+  readonly releaseDeploymentMonitorMaxAttempts = this.integer("RELEASE_DEPLOYMENT_MONITOR_MAX_ATTEMPTS", 360);
   readonly postmarkApiToken = this.string("POSTMARK_API_TOKEN", "");
   readonly postmarkFromEmail = this.string("POSTMARK_FROM_EMAIL", "noreply@example.com");
   // "live" delivers mail for real and is what PRODUCTION must set. Anything else — including an

@@ -1,13 +1,23 @@
+import { InjectQueue } from "@nestjs/bullmq";
 import {
+  BadGatewayException,
   BadRequestException,
   ConflictException,
   ForbiddenException,
   Injectable,
   NotFoundException,
 } from "@nestjs/common";
+import type { Queue } from "bullmq";
 import { createHash } from "crypto";
+import { AppConfigService } from "../config/app-config.service";
 import { DatabaseService } from "../database/database.service";
 import { LegacyService, isUuid } from "../legacy/legacy.service";
+import { KpsDeploymentProvider } from "./kps-deployment.provider";
+import {
+  RELEASE_DEPLOYMENT_MONITOR_JOB,
+  RELEASE_DEPLOYMENT_QUEUE,
+} from "./release-deployment.constants";
+import { evaluateDeploymentProvenance } from "./release-provenance.policy";
 import {
   evaluateReleasePolicy,
   type ReleaseCertificationEvidence,
@@ -99,6 +109,9 @@ export class ReleaseOperationsService {
   constructor(
     private readonly db: DatabaseService,
     private readonly legacy: LegacyService,
+    private readonly kps: KpsDeploymentProvider,
+    private readonly config: AppConfigService,
+    @InjectQueue(RELEASE_DEPLOYMENT_QUEUE) private readonly deploymentQueue: Queue,
   ) {}
 
   private userId(userId: string | null | undefined): string {
@@ -302,6 +315,7 @@ export class ReleaseOperationsService {
       url: validUrl(body.url),
       provider: bounded(body.provider || "manual", "provider", 64, true).toLowerCase(),
       providerProjectRef: bounded(body.providerProjectRef, "providerProjectRef", 255) || null,
+      providerWorkloadRef: bounded(body.providerWorkloadRef, "providerWorkloadRef", 255) || null,
       branchName: bounded(body.branchName, "branchName", 255) || null,
       protected: protectedEnvironment,
       requiredCertificationState,
@@ -318,17 +332,17 @@ export class ReleaseOperationsService {
     try {
       const res = await this.db.query(
         `INSERT INTO release_environments
-           (project_id,name,slug,environment_type,url,provider,provider_project_ref,branch_name,protected,
+           (project_id,name,slug,environment_type,url,provider,provider_project_ref,provider_workload_ref,branch_name,protected,
             required_certification_state,required_approvals,require_no_p0_p1,min_regression_coverage,
             require_smoke,allowed_browsers,observation_minutes,settings,sort_order,created_by)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb,$16,$17::jsonb,$18,$19)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17,$18::jsonb,$19,$20)
          RETURNING *`,
         [
           projectId, values.name, values.slug, values.environmentType, values.url, values.provider,
-          values.providerProjectRef, values.branchName, values.protected, values.requiredCertificationState,
-          values.requiredApprovals, values.requireNoP0P1, values.minRegressionCoverage, values.requireSmoke,
-          JSON.stringify(values.allowedBrowsers), values.observationMinutes, JSON.stringify(values.settings),
-          values.sortOrder, uid,
+          values.providerProjectRef, values.providerWorkloadRef, values.branchName, values.protected,
+          values.requiredCertificationState, values.requiredApprovals, values.requireNoP0P1,
+          values.minRegressionCoverage, values.requireSmoke, JSON.stringify(values.allowedBrowsers),
+          values.observationMinutes, JSON.stringify(values.settings), values.sortOrder, uid,
         ],
       );
       const created = camelRow(res.rows[0] as Body);
@@ -353,6 +367,7 @@ export class ReleaseOperationsService {
       url: body.url !== undefined ? body.url : current.url,
       provider: body.provider !== undefined ? body.provider : current.provider,
       providerProjectRef: body.providerProjectRef !== undefined ? body.providerProjectRef : current.provider_project_ref,
+      providerWorkloadRef: body.providerWorkloadRef !== undefined ? body.providerWorkloadRef : current.provider_workload_ref,
       branchName: body.branchName !== undefined ? body.branchName : current.branch_name,
       protected: body.protected !== undefined ? body.protected : current.protected,
       requiredCertificationState: body.requiredCertificationState !== undefined ? body.requiredCertificationState : current.required_certification_state,
@@ -374,16 +389,17 @@ export class ReleaseOperationsService {
     try {
       const res = await this.db.query(
         `UPDATE release_environments SET
-           name=$3,slug=$4,environment_type=$5,url=$6,provider=$7,provider_project_ref=$8,branch_name=$9,
-           protected=$10,required_certification_state=$11,required_approvals=$12,require_no_p0_p1=$13,
-           min_regression_coverage=$14,require_smoke=$15,allowed_browsers=$16::jsonb,
-           observation_minutes=$17,settings=$18::jsonb,sort_order=$19,updated_at=now()
+           name=$3,slug=$4,environment_type=$5,url=$6,provider=$7,provider_project_ref=$8,provider_workload_ref=$9,branch_name=$10,
+           protected=$11,required_certification_state=$12,required_approvals=$13,require_no_p0_p1=$14,
+           min_regression_coverage=$15,require_smoke=$16,allowed_browsers=$17::jsonb,
+           observation_minutes=$18,settings=$19::jsonb,sort_order=$20,updated_at=now()
          WHERE id=$1 AND project_id=$2 AND archived_at IS NULL
          RETURNING *`,
         [
           environmentId, projectId, name, bounded(merged.slug || slugify(name), "slug", 96, true).toLowerCase(),
           environmentType, validUrl(merged.url), bounded(merged.provider || "manual", "provider", 64, true).toLowerCase(),
           bounded(merged.providerProjectRef, "providerProjectRef", 255) || null,
+          bounded(merged.providerWorkloadRef, "providerWorkloadRef", 255) || null,
           bounded(merged.branchName, "branchName", 255) || null, Boolean(merged.protected), requiredCertificationState,
           Math.round(numberValue(merged.requiredApprovals, "requiredApprovals", 1, 1, 20)),
           Boolean(merged.requireNoP0P1), numberValue(merged.minRegressionCoverage, "minRegressionCoverage", 0, 0, 100),
@@ -499,12 +515,13 @@ export class ReleaseOperationsService {
     const inserted = await this.db.query(
       `INSERT INTO release_promotions
          (project_id,source_environment_id,target_environment_id,build_id,certification_id,status,
-          requested_by,previous_known_good_build_id,previous_known_good_git_sha,policy_snapshot,policy_digest)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11)
+          requested_by,previous_known_good_build_id,previous_known_good_git_sha,policy_snapshot,policy_digest,requested_git_sha)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12)
        RETURNING *`,
       [
         projectId, sourceEnvironmentId, targetEnvironmentId, buildId, certification?.id || null, status, uid,
         target.known_good_build_id || null, target.known_good_git_sha || null, JSON.stringify(snapshot), digest,
+        String(build.git_sha),
       ],
     );
     const promotionId = String(inserted.rows[0].id);
@@ -651,4 +668,521 @@ export class ReleaseOperationsService {
     });
     return this.promotionDetail(projectId, promotionId);
   }
+  private deploymentJobOptions() {
+    return {
+      attempts: Math.max(1, Math.min(2_000, this.config.releaseDeploymentMonitorMaxAttempts)),
+      backoff: {
+        type: "fixed" as const,
+        delay: Math.max(1_000, Math.min(60_000, this.config.releaseDeploymentMonitorIntervalMs)),
+      },
+      removeOnComplete: true,
+      removeOnFail: 100,
+    };
+  }
+
+  private deploymentJobId(promotionId: string): string {
+    return "release-promotion-" + promotionId;
+  }
+
+  private async enqueueDeploymentMonitor(promotionId: string): Promise<boolean> {
+    const jobId = this.deploymentJobId(promotionId);
+    const existing = await this.deploymentQueue.getJob(jobId);
+    if (existing) return false;
+    await this.deploymentQueue.add(
+      RELEASE_DEPLOYMENT_MONITOR_JOB,
+      { promotionId },
+      { jobId, ...this.deploymentJobOptions() },
+    );
+    return true;
+  }
+
+  async recoverDeploymentMonitors(): Promise<number> {
+    const rows = await this.db.query<{ id: string }>(
+      `SELECT id FROM release_promotions
+        WHERE status='deploying' AND provider_deployment_id IS NOT NULL
+        ORDER BY updated_at`,
+    );
+    let recovered = 0;
+    for (const row of rows.rows) {
+      if (await this.enqueueDeploymentMonitor(row.id)) recovered++;
+    }
+    return recovered;
+  }
+
+  private kpsReference(environment: Body) {
+    const provider = String(environment.provider || "").trim().toLowerCase();
+    if (provider !== "kps") {
+      throw new ConflictException({
+        error: provider
+          ? `Deployment provider "${provider}" is not supported by Phase 7 Slice 2. Configure this release environment with provider "kps".`
+          : 'Configure this release environment with provider "kps".',
+      });
+    }
+    const projectRef = String(environment.provider_project_ref || "").trim();
+    const workloadRef = String(environment.provider_workload_ref || "").trim();
+    if (!projectRef || !workloadRef) {
+      throw new ConflictException({
+        error: "KPS deployment requires both providerProjectRef and providerWorkloadRef on the target release environment.",
+      });
+    }
+    return { projectRef, workloadRef };
+  }
+
+  private async invalidateDeploymentApproval(
+    projectId: string,
+    promotion: Body,
+    certification: Body | null,
+    snapshot: Body,
+    digest: string,
+    nextStatus: "awaiting_qa" | "ready_for_approval",
+    reason: string,
+    actorId: string,
+  ) {
+    await this.db.query(
+      `UPDATE release_promotions
+          SET certification_id=$3,policy_snapshot=$4::jsonb,policy_digest=$5,status=$6,
+              approved_by=NULL,approved_at=NULL,updated_at=now()
+        WHERE id=$1 AND project_id=$2 AND status='approved'`,
+      [promotion.id, projectId, certification?.id || null, JSON.stringify(snapshot), digest, nextStatus],
+    );
+    await this.insertEvent(
+      String(promotion.id),
+      "approval_invalidated",
+      "approved",
+      nextStatus,
+      { reason, policyDigest: digest, blockers: snapshot.evaluation?.blockers || [] },
+      actorId,
+    );
+  }
+
+  async startDeployment(
+    userId: string | null | undefined,
+    projectId: string,
+    promotionId: string,
+  ) {
+    await this.requireManager(userId, projectId);
+    const uid = this.userId(userId);
+    const promotion = await this.promotionDetail(projectId, promotionId) as Body;
+    if (promotion.status !== "approved") {
+      throw new ConflictException({ error: "Only an approved promotion can start deployment." });
+    }
+
+    const target = await this.requireEnvironment(projectId, String(promotion.targetEnvironmentId));
+    const build = await this.requireBuild(projectId, String(promotion.buildId));
+    const requestedGitSha = String(promotion.requestedGitSha || "").trim().toLowerCase();
+    const buildGitSha = String(build.git_sha || "").trim().toLowerCase();
+    if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(requestedGitSha)) {
+      throw new ConflictException({
+        error: "Exact deployment requires a full 40- or 64-character Git SHA. Register this build with its full commit SHA.",
+      });
+    }
+    if (requestedGitSha !== buildGitSha) {
+      throw new ConflictException({
+        error: "The promotion's immutable requested SHA no longer matches its registered QA build. Deployment is blocked.",
+      });
+    }
+
+    const certification = await this.latestCertification(String(promotion.buildId));
+    const snapshot = this.policySnapshot(target, certification) as Body;
+    const digest = this.policyDigest(snapshot);
+    const evaluation = snapshot.evaluation as Body;
+    if (!evaluation?.passed || digest !== String(promotion.policyDigest || "")) {
+      const nextStatus = evaluation?.passed ? "ready_for_approval" : "awaiting_qa";
+      await this.invalidateDeploymentApproval(
+        projectId,
+        promotion,
+        certification,
+        snapshot,
+        digest,
+        nextStatus,
+        digest === String(promotion.policyDigest || "")
+          ? "Release policy is no longer satisfied."
+          : "Release evidence/policy changed after human approval.",
+        uid,
+      );
+      throw new ConflictException({
+        error: "Release evidence changed or no longer satisfies the target policy. Refresh and approve the promotion again.",
+        blockers: evaluation?.blockers || [],
+      });
+    }
+
+    const approvalCount = await this.db.query<{ count: number }>(
+      `SELECT COUNT(*)::int AS count
+         FROM release_promotion_approvals
+        WHERE promotion_id=$1 AND decision='approved' AND policy_digest=$2`,
+      [promotionId, digest],
+    );
+    const requiredApprovals = Number(target.required_approvals || 1);
+    if (Number(approvalCount.rows[0]?.count || 0) < requiredApprovals) {
+      await this.invalidateDeploymentApproval(
+        projectId,
+        promotion,
+        certification,
+        snapshot,
+        digest,
+        "ready_for_approval",
+        "The required human approval count is no longer satisfied.",
+        uid,
+      );
+      throw new ConflictException({ error: "Required human approvals are not satisfied." });
+    }
+
+    const ref = this.kpsReference(target);
+    const claimed = await this.db.query(
+      `UPDATE release_promotions
+          SET status='deploying',deployment_started_at=now(),provider_deployment_status='requesting',
+              provenance_status='pending',failure_reason=NULL,updated_at=now()
+        WHERE id=$1 AND project_id=$2 AND status='approved'
+        RETURNING id`,
+      [promotionId, projectId],
+    );
+    if (!claimed.rows[0]) {
+      throw new ConflictException({ error: "Promotion state changed; refresh before deploying." });
+    }
+    await this.insertEvent(
+      promotionId,
+      "deployment_requested",
+      "approved",
+      "deploying",
+      {
+        provider: "kps",
+        providerProjectRef: ref.projectRef,
+        providerWorkloadRef: ref.workloadRef,
+        requestedGitSha,
+      },
+      uid,
+    );
+
+    let started;
+    try {
+      started = await this.kps.start({ ...ref, requestedGitSha });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      await this.db.query(
+        `UPDATE release_promotions
+            SET status='deployment_failed',provider_deployment_status='request_failed',
+                provenance_status='unavailable',provenance_checked_at=now(),
+                failure_reason=$3,completed_at=now(),updated_at=now()
+          WHERE id=$1 AND project_id=$2 AND status='deploying'`,
+        [promotionId, projectId, reason],
+      );
+      await this.insertEvent(
+        promotionId,
+        "deployment_failed",
+        "deploying",
+        "deployment_failed",
+        { stage: "provider_request", reason },
+        uid,
+      );
+      throw new BadGatewayException({ error: "KPS deployment request failed: " + reason });
+    }
+
+    await this.db.query(
+      `UPDATE release_promotions
+          SET provider_deployment_id=$3,provider_deployment_status=$4,
+              evidence=COALESCE(evidence,'{}'::jsonb) || $5::jsonb,updated_at=now()
+        WHERE id=$1 AND project_id=$2 AND status='deploying'`,
+      [
+        promotionId,
+        projectId,
+        started.deploymentId,
+        started.providerStatus,
+        JSON.stringify({
+          deploymentProvider: "kps",
+          providerStart: {
+            deploymentStrategy: started.deploymentStrategy,
+            persistentVolumeCount: started.persistentVolumeCount,
+            ...started.metadata,
+          },
+        }),
+      ],
+    );
+    await this.insertEvent(
+      promotionId,
+      "deployment_queued",
+      "deploying",
+      "deploying",
+      {
+        provider: "kps",
+        providerDeploymentId: started.deploymentId,
+        providerStatus: started.providerStatus,
+        deploymentStrategy: started.deploymentStrategy,
+        persistentVolumeCount: started.persistentVolumeCount,
+      },
+      uid,
+    );
+
+    try {
+      await this.enqueueDeploymentMonitor(promotionId);
+    } catch (queueError) {
+      const queueReason = queueError instanceof Error ? queueError.message : String(queueError);
+      await this.db.query(
+        `UPDATE release_promotions
+            SET evidence=COALESCE(evidence,'{}'::jsonb) || $3::jsonb,updated_at=now()
+          WHERE id=$1 AND project_id=$2 AND status='deploying'`,
+        [promotionId, projectId, JSON.stringify({ monitorQueueWarning: queueReason })],
+      );
+      await this.insertEvent(
+        promotionId,
+        "monitor_queue_warning",
+        "deploying",
+        "deploying",
+        { reason: queueReason },
+        uid,
+      );
+    }
+
+    await this.legacy.logProjectActivity(
+      projectId,
+      uid,
+      "release_deployment_started",
+      "release_promotion",
+      promotionId,
+      null,
+      {
+        provider: "kps",
+        providerDeploymentId: started.deploymentId,
+        requestedGitSha,
+      },
+    );
+    return this.promotionDetail(projectId, promotionId);
+  }
+
+  private async deploymentMonitorRow(promotionId: string): Promise<Body | null> {
+    const result = await this.db.query(
+      `SELECT p.*,e.provider,e.provider_project_ref,e.provider_workload_ref,
+              b.metadata AS build_metadata,b.config_fingerprint AS build_config_fingerprint
+         FROM release_promotions p
+         JOIN release_environments e ON e.id=p.target_environment_id
+         JOIN qa_build_registry b ON b.id=p.build_id
+        WHERE p.id=$1`,
+      [promotionId],
+    );
+    return (result.rows[0] as Body | undefined) || null;
+  }
+
+  private async markDeploymentFailed(
+    row: Body,
+    reason: string,
+    details: Record<string, unknown>,
+    provenanceStatus: "pending" | "mismatch" | "unavailable" = "unavailable",
+  ) {
+    const updated = await this.db.query(
+      `UPDATE release_promotions
+          SET status='deployment_failed',provider_deployment_status=COALESCE($2,provider_deployment_status),
+              provenance_status=$3,provenance_checked_at=now(),failure_reason=$4,
+              completed_at=now(),updated_at=now()
+        WHERE id=$1 AND status='deploying'
+        RETURNING id`,
+      [
+        row.id,
+        details.providerStatus ? String(details.providerStatus) : null,
+        provenanceStatus,
+        reason,
+      ],
+    );
+    if (updated.rows[0]) {
+      await this.insertEvent(
+        String(row.id),
+        provenanceStatus === "mismatch" ? "provenance_mismatch" : "deployment_failed",
+        "deploying",
+        "deployment_failed",
+        { reason, ...details },
+        null,
+      );
+    }
+    return { status: "failed" as const, reason };
+  }
+
+  async monitorDeployment(promotionId: string) {
+    const row = await this.deploymentMonitorRow(promotionId);
+    if (!row) return { status: "terminal" as const, reason: "promotion_not_found" };
+    if (row.status !== "deploying") {
+      return { status: "terminal" as const, promotionStatus: String(row.status) };
+    }
+    if (!row.provider_deployment_id) {
+      return { status: "pending" as const, providerStatus: "awaiting_provider_deployment_id" };
+    }
+
+    const ref = this.kpsReference(row);
+    const observed = await this.kps.observe({
+      ...ref,
+      deploymentId: String(row.provider_deployment_id),
+    });
+
+    if (observed.state === "pending" || observed.state === "unknown") {
+      await this.db.query(
+        `UPDATE release_promotions
+            SET provider_deployment_status=$2,
+                evidence=COALESCE(evidence,'{}'::jsonb) || $3::jsonb,updated_at=now()
+          WHERE id=$1 AND status='deploying'`,
+        [
+          promotionId,
+          observed.providerStatus,
+          JSON.stringify({ providerObservation: observed.metadata }),
+        ],
+      );
+      return { status: "pending" as const, providerStatus: observed.providerStatus };
+    }
+
+    if (observed.state === "failed" || observed.state === "cancelled") {
+      return this.markDeploymentFailed(
+        row,
+        "KPS/Coolify deployment ended with provider state " + observed.state + ".",
+        {
+          providerStatus: observed.providerStatus,
+          providerState: observed.state,
+          providerDeploymentId: row.provider_deployment_id,
+        },
+      );
+    }
+
+    const metadata =
+      row.build_metadata && typeof row.build_metadata === "object" && !Array.isArray(row.build_metadata)
+        ? row.build_metadata as Body
+        : {};
+    const expectedArtifactRef =
+      String(metadata.providerArtifactRef || metadata.artifactRef || "").trim() || null;
+    const expectedConfigurationHash =
+      String(row.build_config_fingerprint || metadata.providerConfigurationHash || "").trim() || null;
+    const provenance = evaluateDeploymentProvenance({
+      requestedGitSha: String(row.requested_git_sha || ""),
+      deployedGitSha: observed.deployedGitSha,
+      expectedArtifactRef,
+      providerArtifactRef: observed.artifactRef,
+      expectedConfigurationHash,
+      providerConfigurationHash: observed.configurationHash,
+    });
+    const artifactDigest =
+      observed.artifactRef && /^sha256:[0-9a-f]{64}$/i.test(observed.artifactRef)
+        ? observed.artifactRef
+        : null;
+
+    if (!provenance.matched) {
+      await this.db.query(
+        `UPDATE release_promotions
+            SET deployed_git_sha=$2,provider_deployment_status=$3,
+                provider_artifact_ref=$4,provider_configuration_hash=$5,artifact_digest=$6,
+                provenance_status=$7,provenance_checked_at=now(),
+                evidence=COALESCE(evidence,'{}'::jsonb) || $8::jsonb,updated_at=now()
+          WHERE id=$1 AND status='deploying'`,
+        [
+          promotionId,
+          observed.deployedGitSha,
+          observed.providerStatus,
+          observed.artifactRef,
+          observed.configurationHash,
+          artifactDigest,
+          provenance.status,
+          JSON.stringify({
+            providerObservation: observed.metadata,
+            provenance: { reasons: provenance.reasons },
+          }),
+        ],
+      );
+      return this.markDeploymentFailed(
+        { ...row, id: promotionId },
+        "Deployment provenance verification failed.",
+        {
+          providerStatus: observed.providerStatus,
+          providerDeploymentId: row.provider_deployment_id,
+          requestedGitSha: row.requested_git_sha,
+          deployedGitSha: observed.deployedGitSha,
+          providerArtifactRef: observed.artifactRef,
+          providerConfigurationHash: observed.configurationHash,
+          reasons: provenance.reasons,
+        },
+        provenance.status === "unavailable" ? "unavailable" : "mismatch",
+      );
+    }
+
+    const changed = await this.db.query(
+      `UPDATE release_promotions
+          SET status='verifying',provider_deployment_status=$2,deployed_git_sha=$3,
+              provider_artifact_ref=$4,provider_configuration_hash=$5,artifact_digest=$6,
+              provenance_status='matched',provenance_checked_at=now(),deployed_at=now(),
+              verification_started_at=now(),
+              evidence=COALESCE(evidence,'{}'::jsonb) || $7::jsonb,updated_at=now()
+        WHERE id=$1 AND status='deploying'
+        RETURNING project_id,target_environment_id,build_id`,
+      [
+        promotionId,
+        observed.providerStatus,
+        observed.deployedGitSha,
+        observed.artifactRef,
+        observed.configurationHash,
+        artifactDigest,
+        JSON.stringify({
+          providerObservation: observed.metadata,
+          provenance: {
+            matched: true,
+            requestedGitSha: row.requested_git_sha,
+            deployedGitSha: observed.deployedGitSha,
+            providerArtifactRef: observed.artifactRef,
+            providerConfigurationHash: observed.configurationHash,
+          },
+        }),
+      ],
+    );
+    if (!changed.rows[0]) {
+      return { status: "terminal" as const, promotionStatus: "state_changed" };
+    }
+
+    await this.db.query(
+      `UPDATE release_environments
+          SET current_build_id=$2,current_git_sha=$3,updated_at=now()
+        WHERE id=$1`,
+      [changed.rows[0].target_environment_id, changed.rows[0].build_id, observed.deployedGitSha],
+    );
+    await this.db.query(
+      `UPDATE qa_build_registry
+          SET deployment_timestamp=COALESCE(deployment_timestamp,now()),updated_at=now()
+        WHERE id=$1`,
+      [changed.rows[0].build_id],
+    );
+    await this.insertEvent(
+      promotionId,
+      "provenance_verified",
+      "deploying",
+      "verifying",
+      {
+        providerDeploymentId: row.provider_deployment_id,
+        requestedGitSha: row.requested_git_sha,
+        deployedGitSha: observed.deployedGitSha,
+        providerArtifactRef: observed.artifactRef,
+        providerConfigurationHash: observed.configurationHash,
+      },
+      null,
+    );
+    return { status: "verified" as const, promotionStatus: "verifying" };
+  }
+
+  async failDeploymentTimeout(promotionId: string, reason: string) {
+    const row = await this.deploymentMonitorRow(promotionId);
+    if (!row || row.status !== "deploying") {
+      return { status: "terminal" as const };
+    }
+    return this.markDeploymentFailed(
+      row,
+      reason,
+      {
+        providerStatus: row.provider_deployment_status || "monitor_timeout",
+        providerDeploymentId: row.provider_deployment_id || null,
+      },
+      "unavailable",
+    );
+  }
+
+  async refreshDeployment(
+    userId: string | null | undefined,
+    projectId: string,
+    promotionId: string,
+  ) {
+    await this.requireManager(userId, projectId);
+    const promotion = await this.promotionDetail(projectId, promotionId) as Body;
+    if (promotion.status !== "deploying") return promotion;
+    await this.monitorDeployment(promotionId);
+    return this.promotionDetail(projectId, promotionId);
+  }
+
 }

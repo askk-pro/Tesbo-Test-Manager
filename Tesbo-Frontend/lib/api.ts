@@ -3846,6 +3846,7 @@ export interface ReleaseEnvironment {
   url?: string | null;
   provider: string;
   providerProjectRef?: string | null;
+  providerWorkloadRef?: string | null;
   branchName?: string | null;
   protected: boolean;
   requiredCertificationState: "NONE" | "READY" | "APPROVED" | "CERTIFIED";
@@ -3888,6 +3889,17 @@ export interface ReleasePromotion {
   approvedBy?: string | null;
   requestedAt: string;
   approvedAt?: string | null;
+  deploymentStartedAt?: string | null;
+  deployedAt?: string | null;
+  requestedGitSha?: string | null;
+  deployedGitSha?: string | null;
+  providerDeploymentId?: string | null;
+  providerDeploymentStatus?: string | null;
+  providerArtifactRef?: string | null;
+  providerConfigurationHash?: string | null;
+  provenanceStatus?: "pending" | "matched" | "mismatch" | "unavailable";
+  provenanceCheckedAt?: string | null;
+  failureReason?: string | null;
   policySnapshot: {
     environment?: Record<string, unknown>;
     rules?: Record<string, unknown>;
@@ -3959,6 +3971,26 @@ export async function decideReleasePromotion(
   data: { decision: "approve" | "reject"; comment?: string },
 ): Promise<ReleasePromotion> {
   return api(`/api/projects/${projectId}/release-promotions/${promotionId}/decision`, { method: "POST", body: data });
+}
+
+export async function startReleaseDeployment(
+  projectId: string,
+  promotionId: string,
+): Promise<ReleasePromotion> {
+  return api(`/api/projects/${projectId}/release-promotions/${promotionId}/deploy`, {
+    method: "POST",
+    body: {},
+  });
+}
+
+export async function refreshReleaseDeployment(
+  projectId: string,
+  promotionId: string,
+): Promise<ReleasePromotion> {
+  return api(`/api/projects/${projectId}/release-promotions/${promotionId}/deployment/refresh`, {
+    method: "POST",
+    body: {},
+  });
 }
 
 export async function decideQaTicketRetest(

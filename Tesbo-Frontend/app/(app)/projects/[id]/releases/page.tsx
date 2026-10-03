@@ -10,7 +10,9 @@ import {
   listQaBuilds,
   listReleaseEnvironments,
   listReleasePromotions,
+  refreshReleaseDeployment,
   refreshReleasePromotion,
+  startReleaseDeployment,
   type QaBuildRecord,
   type ReleaseEnvironment,
   type ReleasePromotion,
@@ -79,7 +81,9 @@ export default function ReleasesPage() {
     name: "Production",
     environmentType: "production",
     url: "",
-    provider: "manual",
+    provider: "kps",
+    providerProjectRef: "",
+    providerWorkloadRef: "",
     protected: true,
     requiredCertificationState: "READY",
     requiredApprovals: "1",
@@ -122,6 +126,14 @@ export default function ReleasesPage() {
     };
   }, [projectId, refresh]);
 
+  useEffect(() => {
+    if (!promotions.some((promotion) => promotion.status === "deploying")) return;
+    const timer = window.setInterval(() => {
+      void refresh().catch((e) => setError(e instanceof Error ? e.message : String(e)));
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [promotions, refresh]);
+
   const protectedCount = environments.filter((env) => env.protected).length;
   const activePromotionCount = promotions.filter((promotion) =>
     ["draft", "awaiting_qa", "ready_for_approval", "approved", "deploying", "verifying", "observation"].includes(
@@ -145,7 +157,9 @@ export default function ReleasesPage() {
         name: environmentForm.name.trim(),
         environmentType: environmentForm.environmentType as ReleaseEnvironment["environmentType"],
         url: environmentForm.url.trim() || null,
-        provider: environmentForm.provider.trim() || "manual",
+        provider: environmentForm.provider.trim() || "kps",
+        providerProjectRef: environmentForm.providerProjectRef.trim() || null,
+        providerWorkloadRef: environmentForm.providerWorkloadRef.trim() || null,
         protected: environmentForm.protected,
         requiredCertificationState:
           environmentForm.requiredCertificationState as ReleaseEnvironment["requiredCertificationState"],
@@ -194,6 +208,38 @@ export default function ReleasesPage() {
     setError("");
     try {
       await refreshReleasePromotion(projectId, promotionId);
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function deployPromotion(promotionId: string) {
+    setBusy("deploy-" + promotionId);
+    setError("");
+    setNotice("");
+    try {
+      const deployed = await startReleaseDeployment(projectId, promotionId);
+      setNotice(
+        deployed.providerDeploymentId
+          ? "Deployment queued in KPS. Provenance monitoring is running automatically."
+          : "Deployment started. Provenance monitoring is running automatically.",
+      );
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function checkDeployment(promotionId: string) {
+    setBusy("deployment-" + promotionId);
+    setError("");
+    try {
+      await refreshReleaseDeployment(projectId, promotionId);
       await refresh();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -255,7 +301,7 @@ export default function ReleasesPage() {
         <Metric title="Environments" value={environments.length} note="Durable release targets" />
         <Metric title="Protected" value={protectedCount} note="Policy-gated targets" />
         <Metric title="Active promotions" value={activePromotionCount} note="Awaiting QA/approval/deployment" />
-        <Metric title="Known Good" value={knownGoodCount} note="Will be populated by later Phase-7 deployment work" />
+        <Metric title="Known Good" value={knownGoodCount} note="Established after post-deploy verification in later Slice 3+" />
       </div>
 
       <div className="mt-5 flex gap-2 border-b border-[var(--border)]">
@@ -323,7 +369,7 @@ export default function ReleasesPage() {
           <Card className="overflow-hidden">
             <div className="border-b border-[var(--border)] px-5 py-4">
               <h2 className="font-semibold">Promotion queue</h2>
-              <p className="mt-1 text-[11px] text-[var(--muted)]">Deployment/provider actions arrive in the next Phase-7 slice; this queue currently governs readiness and human approval.</p>
+              <p className="mt-1 text-[11px] text-[var(--muted)]">Approved releases deploy through KPS at the exact requested Git SHA; provider provenance is monitored server-side.</p>
             </div>
             {promotions.length === 0 ? (
               <div className="p-8 text-center text-sm text-[var(--muted)]">No release promotions yet.</div>
@@ -349,11 +395,29 @@ export default function ReleasesPage() {
                           {canManage && ["ready_for_approval"].includes(promotion.status) ? (
                             <Button disabled={Boolean(busy)} onClick={() => void decide(promotion.id, "approve")}>Approve</Button>
                           ) : null}
+                          {canManage && promotion.status === "approved" ? (
+                            <Button disabled={Boolean(busy)} onClick={() => void deployPromotion(promotion.id)}>Deploy exact SHA</Button>
+                          ) : null}
+                          {canManage && promotion.status === "deploying" ? (
+                            <Button variant="secondary" disabled={Boolean(busy)} onClick={() => void checkDeployment(promotion.id)}>Check deployment</Button>
+                          ) : null}
                           {canManage && ["awaiting_qa", "ready_for_approval"].includes(promotion.status) ? (
                             <Button variant="secondary" disabled={Boolean(busy)} onClick={() => void decide(promotion.id, "reject")}>Reject</Button>
                           ) : null}
                         </div>
                       </div>
+                      {(promotion.providerDeploymentId || promotion.requestedGitSha || promotion.deployedGitSha) ? (
+                        <div className="mt-3 grid gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface-raised)] p-3 text-[11px] md:grid-cols-2">
+                          <div><span className="text-[var(--muted-soft)]">KPS deployment</span><div className="font-mono">{promotion.providerDeploymentId || "requesting"}</div></div>
+                          <div><span className="text-[var(--muted-soft)]">Provider status</span><div>{promotion.providerDeploymentStatus || "pending"}</div></div>
+                          <div><span className="text-[var(--muted-soft)]">Requested SHA</span><div className="font-mono break-all">{promotion.requestedGitSha || "—"}</div></div>
+                          <div><span className="text-[var(--muted-soft)]">Deployed SHA</span><div className="font-mono break-all">{promotion.deployedGitSha || "not observed yet"}</div></div>
+                          <div><span className="text-[var(--muted-soft)]">Provenance</span><div><Badge value={promotion.provenanceStatus || "pending"} /></div></div>
+                          <div><span className="text-[var(--muted-soft)]">Artifact</span><div className="font-mono break-all">{promotion.providerArtifactRef || "not reported yet"}</div></div>
+                          {promotion.providerConfigurationHash ? <div className="md:col-span-2"><span className="text-[var(--muted-soft)]">Provider configuration hash</span><div className="font-mono break-all">{promotion.providerConfigurationHash}</div></div> : null}
+                          {promotion.failureReason ? <div className="md:col-span-2 text-[var(--status-fail-text)]">{promotion.failureReason}</div> : null}
+                        </div>
+                      ) : null}
                       {blockers.length ? (
                         <div className="mt-3 rounded-lg border border-[var(--warning)]/30 bg-[var(--warning-soft)] p-3">
                           <div className="text-[11px] font-semibold text-[var(--warning-foreground)]">Policy blockers</div>
@@ -385,7 +449,15 @@ export default function ReleasesPage() {
                   </select>
                 </label>
                 <label className={labelClass}>URL<input className={inputClass} placeholder="https://app.example.com" value={environmentForm.url} onChange={(e) => setEnvironmentForm({ ...environmentForm, url: e.target.value })} /></label>
-                <label className={labelClass}>Provider<input className={inputClass} placeholder="manual / kps / coolify" value={environmentForm.provider} onChange={(e) => setEnvironmentForm({ ...environmentForm, provider: e.target.value })} /></label>
+                <label className={labelClass}>
+                  Provider
+                  <select className={inputClass} value={environmentForm.provider} onChange={(e) => setEnvironmentForm({ ...environmentForm, provider: e.target.value })}>
+                    <option value="kps">KPS / Coolify</option>
+                    <option value="manual">Manual</option>
+                  </select>
+                </label>
+                <label className={labelClass}>KPS project ID<input className={inputClass} placeholder="cmu..." value={environmentForm.providerProjectRef} onChange={(e) => setEnvironmentForm({ ...environmentForm, providerProjectRef: e.target.value })} /></label>
+                <label className={labelClass}>KPS workload ID<input className={inputClass} placeholder="cmu..." value={environmentForm.providerWorkloadRef} onChange={(e) => setEnvironmentForm({ ...environmentForm, providerWorkloadRef: e.target.value })} /></label>
                 <label className={labelClass}>
                   Certification
                   <select className={inputClass} value={environmentForm.requiredCertificationState} onChange={(e) => setEnvironmentForm({ ...environmentForm, requiredCertificationState: e.target.value })}>
@@ -414,6 +486,12 @@ export default function ReleasesPage() {
                   <Badge value={env.protected ? "protected" : "standard"} />
                 </div>
                 {env.url ? <div className="mt-3 break-all text-[11px] text-[var(--muted)]">{env.url}</div> : null}
+                {env.provider === "kps" ? (
+                  <div className="mt-3 rounded-md border border-[var(--border)] bg-[var(--surface-raised)] p-2 text-[10px] text-[var(--muted)]">
+                    KPS project: <span className="font-mono">{env.providerProjectRef || "not configured"}</span><br />
+                    Workload: <span className="font-mono">{env.providerWorkloadRef || "not configured"}</span>
+                  </div>
+                ) : null}
                 <div className="mt-4 grid grid-cols-2 gap-3 text-[11px]">
                   <div><span className="text-[var(--muted-soft)]">Certification</span><div className="font-medium">{env.requiredCertificationState}</div></div>
                   <div><span className="text-[var(--muted-soft)]">Approvals</span><div className="font-medium">{env.requiredApprovals}</div></div>

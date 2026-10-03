@@ -75,6 +75,24 @@ export class ReleaseOperationsController {
     return this.releases.refreshPromotion(req.userId, projectId, promotionId);
   }
 
+  @Post("/api/projects/:projectId/release-promotions/:promotionId/deploy")
+  startDeployment(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("promotionId") promotionId: string,
+  ) {
+    return this.releases.startDeployment(req.userId, projectId, promotionId);
+  }
+
+  @Post("/api/projects/:projectId/release-promotions/:promotionId/deployment/refresh")
+  refreshDeployment(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("promotionId") promotionId: string,
+  ) {
+    return this.releases.refreshDeployment(req.userId, projectId, promotionId);
+  }
+
   @Post("/api/projects/:projectId/release-promotions/:promotionId/decision")
   decidePromotion(
     @Req() req: AuthenticatedRequest,

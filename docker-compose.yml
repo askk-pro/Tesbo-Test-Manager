@@ -57,6 +57,11 @@ services:
       DATABASE_USER: ${DATABASE_USER}
       DATABASE_PASSWORD: ${DATABASE_PASSWORD}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      # Phase 7 release deployment provider. KPS_API_TOKEN is server-only and must never be exposed to the frontend.
+      KPS_BASE_URL: ${KPS_BASE_URL:-}
+      KPS_API_TOKEN: ${KPS_API_TOKEN:-}
+      RELEASE_DEPLOYMENT_MONITOR_INTERVAL_MS: ${RELEASE_DEPLOYMENT_MONITOR_INTERVAL_MS:-5000}
+      RELEASE_DEPLOYMENT_MONITOR_MAX_ATTEMPTS: ${RELEASE_DEPLOYMENT_MONITOR_MAX_ATTEMPTS:-360}
       FRONTEND_URL: ${FRONTEND_URL:-http://localhost:1010}
       # Optional: public address for links written into Jira/Linear comments. Unset = FRONTEND_URL.
       # A localhost/private address produces plain test-case IDs instead of links.
