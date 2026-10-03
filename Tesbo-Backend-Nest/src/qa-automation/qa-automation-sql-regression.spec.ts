@@ -13,6 +13,13 @@ describe("Phase 6 PostgreSQL SQL regression guards", () => {
     );
   });
 
+  it("preserves a manual run matrix when no persisted schedule row exists", () => {
+    const source = readFileSync(join(__dirname, "qa-automation.service.ts"), "utf8");
+    expect(source).toContain("automationMatrix: jsonArray(schedule.matrix)");
+    expect(source).toContain("const manualMatrix = jsonArray(triggerPayload.automationMatrix)");
+    expect(source).toContain("const matrix = scheduleMatrix.length ? scheduleMatrix : manualMatrix");
+  });
+
   it("exposes release verification context to claimed Phase-6 workers", () => {
     const source = readFileSync(join(__dirname, "qa-automation.service.ts"), "utf8");
     expect(source).toContain("verificationContext: jsonObject(triggerPayload.releaseVerification)");

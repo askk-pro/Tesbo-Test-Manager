@@ -411,7 +411,10 @@ export class QaAutomationService {
       body.triggerSource === "mcp" ? "mcp" : "manual",
       key,
       body.buildId ? String(body.buildId) : null,
-      jsonObject(body.payload),
+      {
+        ...jsonObject(body.payload),
+        automationMatrix: jsonArray(schedule.matrix),
+      },
       String(userId),
       new Date(),
     );
@@ -600,7 +603,10 @@ export class QaAutomationService {
     let planId = run.plan_id ? String(run.plan_id) : "";
     let plan: Body;
     if (!planId) {
-      const matrix = jsonArray(run.schedule_matrix);
+      const triggerPayload = jsonObject(run.trigger_payload);
+      const scheduleMatrix = jsonArray(run.schedule_matrix);
+      const manualMatrix = jsonArray(triggerPayload.automationMatrix);
+      const matrix = scheduleMatrix.length ? scheduleMatrix : manualMatrix;
       const generated = await this.legacy.generateRegressionPlan(actor, projectId, buildId, { matrix }, actor) as Body;
       planId = String(generated.id);
       plan = generated;
