@@ -22,6 +22,7 @@ import { AutomationModule } from "./automation/automation.module";
 import { ZyraArchiveSweepModule } from "./zyra-archive-sweep/zyra-archive-sweep.module";
 import { QaAutomationModule } from "./qa-automation/qa-automation.module";
 import { ReleaseOperationsModule } from "./release-operations/release-operations.module";
+import { EngineeringIntegrationsModule } from "./engineering-integrations/engineering-integrations.module";
 
 @Module({
   imports: [
@@ -47,7 +48,8 @@ import { ReleaseOperationsModule } from "./release-operations/release-operations
     AutomationModule,
     ZyraArchiveSweepModule,
     QaAutomationModule,
-    ReleaseOperationsModule
+    ReleaseOperationsModule,
+    EngineeringIntegrationsModule
   ],
   // Global so every current and future mutating /api/projects/:id route is covered; the guard
   // itself no-ops on reads and on workspaces that are within their limits.

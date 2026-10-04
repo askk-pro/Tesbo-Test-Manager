@@ -12,6 +12,8 @@ import {
   getBillingInfo,
   getLinearStatus,
   getKpsDevOpsStatus,
+  getAzureDevOpsProjectStatus,
+  getGitHubProjectStatus,
   listWorkspaceMembers,
   addProjectMember,
   removeProjectMember,
@@ -21,6 +23,7 @@ import {
   type JiraConnection,
   type LinearConnection,
   type KpsDevOpsStatus,
+  type EngineeringProjectStatus,
   type ProjectIcon,
   type TestEnvironmentSetting,
 } from "@/lib/api";
@@ -128,6 +131,8 @@ export default function ProjectSettingsPage() {
   const [jiraStatus, setJiraStatus] = useState<JiraConnection | null>(null);
   const [linearStatus, setLinearStatus] = useState<LinearConnection | null>(null);
   const [kpsDevOpsStatus, setKpsDevOpsStatus] = useState<KpsDevOpsStatus | null>(null);
+  const [azureDevOpsStatus, setAzureDevOpsStatus] = useState<EngineeringProjectStatus | null>(null);
+  const [githubStatus, setGithubStatus] = useState<EngineeringProjectStatus | null>(null);
   /*
    * Basecamp 10191178824 — "Linear is restricted behind a Pro upgrade in Workspace Settings, but the
    * same integration is available in Project Settings → Integrations".
@@ -257,6 +262,8 @@ export default function ProjectSettingsPage() {
     getJiraStatus(projectId).then(setJiraStatus).catch(() => {});
     getLinearStatus(projectId).then(setLinearStatus).catch(() => {});
     getKpsDevOpsStatus(projectId).then(setKpsDevOpsStatus).catch(() => {});
+    getAzureDevOpsProjectStatus(projectId).then(setAzureDevOpsStatus).catch(() => {});
+    getGitHubProjectStatus(projectId).then(setGithubStatus).catch(() => {});
     getBillingInfo()
       .then((billing) => setLinearIsPro(billing.enabled === false || billing.plan === "pro"))
       .catch(() => setLinearIsPro(null));
@@ -934,8 +941,8 @@ export default function ProjectSettingsPage() {
           <div>
             <h2 className="text-base font-semibold text-[var(--foreground)]">App Integrations</h2>
             <p className="mt-1 text-sm text-[var(--muted)]">
-              Jira and Linear connect once for the whole workspace. Azure DevOps uses the trusted KPS DevOps connection already configured on this deployment.
-              Open an integration&apos;s settings to choose which remote project feeds <em>this</em>{" "}project and sync requirements.
+              Jira, Linear, Microsoft Azure DevOps, and GitHub connect at workspace level; KPS DevOps uses the trusted KPS runtime connection.
+              Open an integration&apos;s settings to choose which remote project or repository feeds <em>this</em>{" "}project and sync requirements.
             </p>
           </div>
 
@@ -1052,6 +1059,104 @@ export default function ProjectSettingsPage() {
             </div>
           </div>
 
+          {/* Microsoft Azure DevOps */}
+          <div className="rounded-lg border border-[var(--border)] p-4 flex items-start gap-4">
+            <div className="shrink-0 w-10 h-10 rounded-lg bg-[#0078D4] flex items-center justify-center text-xs font-bold text-white">
+              AZ
+            </div>
+            <div className="flex-1 min-w-0">
+              <h3 className="text-sm font-semibold text-[var(--foreground)]">Microsoft Azure DevOps</h3>
+              <p className="text-xs text-[var(--muted)] mt-0.5">
+                Map an Azure DevOps project and sync Azure Boards work items into Tesbo REQ-n requirements.
+              </p>
+              {azureDevOpsStatus?.connected ? (
+                <div className="mt-2 space-y-1">
+                  <div className="flex items-center gap-2">
+                    <span className="inline-block w-2 h-2 rounded-full bg-[var(--success)]" />
+                    <span className="text-xs text-[var(--success-foreground)] font-medium">Workspace connected</span>
+                  </div>
+                  {azureDevOpsStatus.mappedItem ? (
+                    <p className="text-xs text-[var(--muted)]">
+                      Linked Azure project: <span className="font-medium text-[var(--foreground)]">{azureDevOpsStatus.mappedItem.name}</span>
+                    </p>
+                  ) : (
+                    <p className="text-xs text-[var(--muted-soft)]">No Azure DevOps project linked to this project yet.</p>
+                  )}
+                </div>
+              ) : (
+                <p className="mt-2 text-xs text-[var(--muted-soft)]">Not connected for this workspace yet.</p>
+              )}
+            </div>
+            <div className="shrink-0">
+              {azureDevOpsStatus?.connected ? (
+                <Link
+                  href={"/projects/" + projectId + "/settings/integrations/azure-devops"}
+                  aria-label="Microsoft Azure DevOps integration settings"
+                  title="Microsoft Azure DevOps integration settings"
+                  className="inline-flex h-9 w-9 items-center justify-center rounded-[10px] border border-[var(--border)] text-[var(--muted)] transition-colors hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
+                >
+                  <IconSettings size={17} stroke={1.75} />
+                </Link>
+              ) : (
+                <Link
+                  href={"/settings/integrations/azure-devops?returnProjectId=" + projectId}
+                  className="inline-flex h-9 items-center justify-center rounded-[10px] border border-transparent bg-[var(--brand-primary)] px-3.5 text-[13px] font-semibold text-white shadow-sm transition-colors hover:bg-[var(--brand-hover)]"
+                >
+                  Connect in Workspace Settings
+                </Link>
+              )}
+            </div>
+          </div>
+
+          {/* GitHub Issues */}
+          <div className="rounded-lg border border-[var(--border)] p-4 flex items-start gap-4">
+            <div className="shrink-0 w-10 h-10 rounded-lg bg-[var(--brand-primary)] flex items-center justify-center text-xs font-bold text-white">
+              GH
+            </div>
+            <div className="flex-1 min-w-0">
+              <h3 className="text-sm font-semibold text-[var(--foreground)]">GitHub Issues</h3>
+              <p className="text-xs text-[var(--muted)] mt-0.5">
+                Map a GitHub organization repository and sync Issues into Tesbo REQ-n requirements.
+              </p>
+              {githubStatus?.connected ? (
+                <div className="mt-2 space-y-1">
+                  <div className="flex items-center gap-2">
+                    <span className="inline-block w-2 h-2 rounded-full bg-[var(--success)]" />
+                    <span className="text-xs text-[var(--success-foreground)] font-medium">Workspace connected</span>
+                  </div>
+                  {githubStatus.mappedItem ? (
+                    <p className="text-xs text-[var(--muted)]">
+                      Linked repository: <span className="font-medium text-[var(--foreground)]">{githubStatus.mappedItem.context || githubStatus.mappedItem.name}</span>
+                    </p>
+                  ) : (
+                    <p className="text-xs text-[var(--muted-soft)]">No GitHub repository linked to this project yet.</p>
+                  )}
+                </div>
+              ) : (
+                <p className="mt-2 text-xs text-[var(--muted-soft)]">Not connected for this workspace yet.</p>
+              )}
+            </div>
+            <div className="shrink-0">
+              {githubStatus?.connected ? (
+                <Link
+                  href={"/projects/" + projectId + "/settings/integrations/github"}
+                  aria-label="GitHub Issues integration settings"
+                  title="GitHub Issues integration settings"
+                  className="inline-flex h-9 w-9 items-center justify-center rounded-[10px] border border-[var(--border)] text-[var(--muted)] transition-colors hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
+                >
+                  <IconSettings size={17} stroke={1.75} />
+                </Link>
+              ) : (
+                <Link
+                  href={"/settings/integrations/github?returnProjectId=" + projectId}
+                  className="inline-flex h-9 items-center justify-center rounded-[10px] border border-transparent bg-[var(--brand-primary)] px-3.5 text-[13px] font-semibold text-white shadow-sm transition-colors hover:bg-[var(--brand-hover)]"
+                >
+                  Connect in Workspace Settings
+                </Link>
+              )}
+            </div>
+          </div>
+
           {/* Azure DevOps via KPS DevOps */}
           <div className="rounded-lg border border-[var(--border)] p-4 flex items-start gap-4">
             <div className="shrink-0 w-10 h-10 rounded-lg bg-[#0078D4] flex items-center justify-center text-xs font-bold text-white">
@@ -1111,7 +1216,7 @@ export default function ProjectSettingsPage() {
             </div>
             <div>
               <h3 className="text-sm font-medium text-[var(--muted)]">More integrations coming soon</h3>
-              <p className="text-xs text-[var(--muted-soft)] mt-0.5">Slack, GitHub and more.</p>
+              <p className="text-xs text-[var(--muted-soft)] mt-0.5">GitLab Issues / Merge Requests and more.</p>
             </div>
           </div>
         </Card>

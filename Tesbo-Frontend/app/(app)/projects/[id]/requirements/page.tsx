@@ -734,11 +734,15 @@ export default function RequirementsPage() {
                       <div className="font-medium text-[var(--foreground)]">{requirement.title}</div>
                       <div className="mt-1 flex flex-wrap items-center gap-2">
                         <span className="rounded bg-[var(--surface-secondary)] px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-[var(--muted)]">
-                          {requirement.sourceProvider === "other" && requirement.sourceKey?.startsWith("kps-devops:")
-                            ? "KPS DevOps"
-                            : requirement.sourceProvider === "internal"
-                              ? "Tesbo"
-                              : requirement.sourceProvider}
+                          {requirement.sourceProvider === "other" && requirement.sourceKey?.startsWith("azure-devops:")
+                            ? "Azure DevOps"
+                            : requirement.sourceProvider === "other" && requirement.sourceKey?.startsWith("github:")
+                              ? "GitHub"
+                              : requirement.sourceProvider === "other" && requirement.sourceKey?.startsWith("kps-devops:")
+                                ? "KPS DevOps"
+                                : requirement.sourceProvider === "internal"
+                                  ? "Tesbo"
+                                  : requirement.sourceProvider}
                         </span>
                         {requirement.sourceUrl ? (
                           <a

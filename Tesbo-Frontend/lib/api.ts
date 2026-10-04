@@ -4410,6 +4410,120 @@ export async function getIntegrationStatus(provider: IntegrationProvider): Promi
   return api<IntegrationConnectionStatus>(`/api/workspace/integrations/${provider}/status`);
 }
 
+// ── External engineering integrations: Microsoft Azure DevOps + GitHub ──
+
+export type EngineeringIntegrationProvider = "azure-devops" | "github";
+
+export interface EngineeringIntegrationStatus {
+  connected: boolean;
+  provider?: EngineeringIntegrationProvider;
+  externalId?: string | null;
+  siteUrl?: string | null;
+  authMethod?: string;
+  createdAt?: string;
+  connectedProjects?: { projectId: string; projectName: string; projectKey: string }[];
+}
+
+export interface EngineeringRemoteItem {
+  id: string;
+  key: string;
+  name: string;
+  context?: string;
+  connected: boolean;
+  private?: boolean;
+  archived?: boolean;
+}
+
+export interface EngineeringProjectStatus {
+  connected: boolean;
+  siteUrl: string | null;
+  externalId: string | null;
+  mappedItem: { id: string; key: string; name: string; context: string } | null;
+  lastSyncedAt: string | null;
+  lastSyncedCount: number;
+  lastTotalCount: number;
+}
+
+export interface EngineeringSyncResult {
+  ok: boolean;
+  total: number;
+  synced: number;
+  created: number;
+  updated: number;
+  syncedAt: string;
+}
+
+export async function getEngineeringIntegrationStatus(
+  provider: EngineeringIntegrationProvider
+): Promise<EngineeringIntegrationStatus> {
+  return api<EngineeringIntegrationStatus>("/api/workspace/engineering-integrations/" + provider + "/status");
+}
+
+export async function connectEngineeringIntegration(
+  provider: EngineeringIntegrationProvider,
+  organization: string,
+  token: string
+): Promise<EngineeringIntegrationStatus> {
+  return api<EngineeringIntegrationStatus>("/api/workspace/engineering-integrations/" + provider + "/connect", {
+    method: "POST",
+    body: { organization, token },
+    signal: AbortSignal.timeout(30_000),
+  });
+}
+
+export async function disconnectEngineeringIntegration(
+  provider: EngineeringIntegrationProvider
+): Promise<void> {
+  await api("/api/workspace/engineering-integrations/" + provider + "/disconnect", {
+    method: "DELETE",
+    signal: AbortSignal.timeout(20_000),
+  });
+}
+
+export async function getAzureDevOpsProjectStatus(projectId: string): Promise<EngineeringProjectStatus> {
+  return api<EngineeringProjectStatus>("/api/projects/" + projectId + "/azure-devops/status");
+}
+
+export async function listAzureDevOpsProjects(projectId: string): Promise<EngineeringRemoteItem[]> {
+  return api<EngineeringRemoteItem[]>("/api/projects/" + projectId + "/azure-devops/projects");
+}
+
+export async function mapAzureDevOpsProject(projectId: string, remoteId: string | null): Promise<void> {
+  await api("/api/projects/" + projectId + "/azure-devops/project", {
+    method: "POST",
+    body: { remoteId: remoteId || "" },
+  });
+}
+
+export async function syncAzureDevOpsRequirements(projectId: string): Promise<EngineeringSyncResult> {
+  return api<EngineeringSyncResult>("/api/projects/" + projectId + "/azure-devops/sync", {
+    method: "POST",
+    signal: AbortSignal.timeout(60_000),
+  });
+}
+
+export async function getGitHubProjectStatus(projectId: string): Promise<EngineeringProjectStatus> {
+  return api<EngineeringProjectStatus>("/api/projects/" + projectId + "/github/status");
+}
+
+export async function listGitHubRepositories(projectId: string): Promise<EngineeringRemoteItem[]> {
+  return api<EngineeringRemoteItem[]>("/api/projects/" + projectId + "/github/repositories");
+}
+
+export async function mapGitHubRepository(projectId: string, remoteId: string | null): Promise<void> {
+  await api("/api/projects/" + projectId + "/github/repository", {
+    method: "POST",
+    body: { remoteId: remoteId || "" },
+  });
+}
+
+export async function syncGitHubRequirements(projectId: string): Promise<EngineeringSyncResult> {
+  return api<EngineeringSyncResult>("/api/projects/" + projectId + "/github/sync", {
+    method: "POST",
+    signal: AbortSignal.timeout(60_000),
+  });
+}
+
 // ── Azure DevOps (KPS DevOps) project mapping / requirement sync ──
 
 export interface KpsDevOpsMappedProject {

@@ -3,10 +3,14 @@
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  getBillingInfo,
-  getIntegrationStatus,
+  disconnectEngineeringIntegration,
   disconnectIntegration,
+  getBillingInfo,
+  getEngineeringIntegrationStatus,
+  getIntegrationStatus,
   type BillingInfo,
+  type EngineeringIntegrationProvider,
+  type EngineeringIntegrationStatus,
   type IntegrationConnectionStatus,
   type IntegrationProvider,
 } from "@/lib/api";
@@ -24,7 +28,7 @@ const PROVIDERS: {
   {
     id: "jira",
     name: "Jira",
-    description: "Import tickets from Jira to use as knowledge base for test generation.",
+    description: "Import Jira tickets and use them for requirements, knowledge, test generation, and traceability.",
     proOnly: false,
     icon: (
       <svg viewBox="0 0 24 24" className="w-6 h-6 text-white" fill="currentColor">
@@ -35,7 +39,7 @@ const PROVIDERS: {
   {
     id: "linear",
     name: "Linear",
-    description: "Import issues from Linear to use as knowledge base for test generation.",
+    description: "Import Linear issues for requirements, knowledge, test generation, and traceability.",
     proOnly: true,
     icon: (
       <svg viewBox="0 0 24 24" className="w-6 h-6 text-white" fill="currentColor">
@@ -45,17 +49,35 @@ const PROVIDERS: {
   },
 ];
 
+const ENGINEERING_PROVIDERS: {
+  id: EngineeringIntegrationProvider;
+  name: string;
+  description: string;
+  mark: string;
+}[] = [
+  {
+    id: "azure-devops",
+    name: "Microsoft Azure DevOps",
+    description: "Sync Azure Boards work items into native Tesbo REQ-n requirements and traceability.",
+    mark: "AZ",
+  },
+  {
+    id: "github",
+    name: "GitHub Issues",
+    description: "Connect a GitHub organization, map repositories, and sync Issues into Tesbo requirements.",
+    mark: "GH",
+  },
+];
+
 export default function IntegrationsTab() {
   const { workspace } = useAppData();
   const [billingInfo, setBillingInfo] = useState<BillingInfo | null>(null);
   const [statuses, setStatuses] = useState<Record<string, IntegrationConnectionStatus>>({});
+  const [engineeringStatuses, setEngineeringStatuses] = useState<Record<string, EngineeringIntegrationStatus>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
-  const [disconnectingProvider, setDisconnectingProvider] = useState<IntegrationProvider | null>(null);
-  // A real synchronous guard: two clicks fired before React flushes setDisconnectingProvider both
-  // read the same stale (null) state, so that alone doesn't stop a fast double-click. A ref is
-  // mutated and read back immediately, in the same tick.
+  const [disconnectingProvider, setDisconnectingProvider] = useState<string | null>(null);
   const disconnectingRef = useRef(false);
   const [pricingOpen, setPricingOpen] = useState(false);
 
@@ -64,13 +86,16 @@ export default function IntegrationsTab() {
 
   const loadData = useCallback(async () => {
     try {
-      const [billing, jira, linear] = await Promise.all([
+      const [billing, jira, linear, azure, github] = await Promise.all([
         getBillingInfo().catch(() => null),
         getIntegrationStatus("jira").catch(() => ({ connected: false }) as IntegrationConnectionStatus),
         getIntegrationStatus("linear").catch(() => ({ connected: false }) as IntegrationConnectionStatus),
+        getEngineeringIntegrationStatus("azure-devops").catch(() => ({ connected: false }) as EngineeringIntegrationStatus),
+        getEngineeringIntegrationStatus("github").catch(() => ({ connected: false }) as EngineeringIntegrationStatus),
       ]);
       setBillingInfo(billing);
       setStatuses({ jira, linear });
+      setEngineeringStatuses({ "azure-devops": azure, github });
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load integrations.");
@@ -79,18 +104,19 @@ export default function IntegrationsTab() {
     }
   }, []);
 
-  useEffect(() => { void loadData(); }, [loadData]);
+  useEffect(() => {
+    void loadData();
+  }, [loadData]);
 
   async function handleDisconnect(provider: IntegrationProvider) {
-    if (!canManage) return;
-    if (disconnectingRef.current) return;
+    if (!canManage || disconnectingRef.current) return;
     disconnectingRef.current = true;
     setDisconnectingProvider(provider);
     setMessage(null);
     setError(null);
     try {
       await disconnectIntegration(provider);
-      setMessage(`${provider === "jira" ? "Jira" : "Linear"} disconnected.`);
+      setMessage((provider === "jira" ? "Jira" : "Linear") + " disconnected.");
       await loadData();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to disconnect.");
@@ -100,47 +126,67 @@ export default function IntegrationsTab() {
     }
   }
 
-  if (loading) {
-    return <PageLoader />;
+  async function handleEngineeringDisconnect(provider: EngineeringIntegrationProvider) {
+    if (!canManage || disconnectingRef.current) return;
+    disconnectingRef.current = true;
+    setDisconnectingProvider(provider);
+    setMessage(null);
+    setError(null);
+    try {
+      await disconnectEngineeringIntegration(provider);
+      setMessage((provider === "azure-devops" ? "Microsoft Azure DevOps" : "GitHub") + " disconnected.");
+      await loadData();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to disconnect.");
+    } finally {
+      disconnectingRef.current = false;
+      setDisconnectingProvider(null);
+    }
   }
+
+  if (loading) return <PageLoader />;
 
   return (
     <div className="space-y-5">
       <div>
         <h2 className="text-base font-semibold text-[var(--foreground)]">Integrations</h2>
         <p className="mt-1 text-sm text-[var(--muted)]">
-          Connect Jira, Linear, and more once for the whole workspace, then pick which projects use them.
+          Connect the engineering systems your workspace uses, then map the relevant remote project or repository inside each Tesbo project.
         </p>
       </div>
 
-      {message && (
+      {message ? (
         <p className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2 text-sm text-[var(--foreground)]">
           {message}
         </p>
-      )}
-      {error && (
+      ) : null}
+      {error ? (
         <p className="rounded-lg border border-[var(--error)]/40 bg-[color-mix(in_oklab,var(--error)_8%,white)] px-3 py-2 text-sm text-[var(--error-foreground)]">
           {error}
         </p>
-      )}
+      ) : null}
 
       <Card className="p-4 space-y-4">
         <div>
-          <h3 className="text-sm font-semibold text-[var(--foreground)]">App integrations</h3>
+          <h3 className="text-sm font-semibold text-[var(--foreground)]">Issue & project integrations</h3>
           <p className="mt-1 text-xs text-[var(--muted)]">
-            Once connected, go to a project&apos;s Settings → Integrations tab to pick which remote project/team feeds it.
+            Jira and Linear use OAuth. Microsoft Azure DevOps and GitHub use encrypted workspace credentials in this self-hosted baseline.
           </p>
         </div>
 
         {PROVIDERS.map((provider) => {
           const status = statuses[provider.id];
           const locked = provider.proOnly && !isPro && !status?.connected;
+          const cardClass =
+            "rounded-lg border border-[var(--border)] p-4 flex items-start gap-4 " +
+            (locked ? "opacity-75" : "");
+          const iconClass =
+            "shrink-0 w-10 h-10 rounded-lg flex items-center justify-center " +
+            (locked ? "bg-[var(--surface-tertiary)]" : "bg-[var(--brand-primary)]");
+
           return (
-            <div
-              key={provider.id}
-              className={`rounded-lg border border-[var(--border)] p-4 flex items-start gap-4 ${locked ? "opacity-75" : ""}`}
-            >
-              <div className={`shrink-0 w-10 h-10 rounded-lg flex items-center justify-center ${locked ? "bg-[var(--surface-tertiary)]" : "bg-[var(--brand-primary)]"}`}>
+            <div key={provider.id} className={cardClass}>
+              <div className={iconClass}>
                 {locked ? (
                   <svg viewBox="0 0 24 24" className="w-5 h-5 text-[var(--muted-soft)]" fill="none" stroke="currentColor" strokeWidth={2}>
                     <rect x="4" y="10" width="16" height="10" rx="2" />
@@ -150,54 +196,51 @@ export default function IntegrationsTab() {
                   provider.icon
                 )}
               </div>
+
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2">
                   <h3 className="text-sm font-semibold text-[var(--foreground)]">{provider.name}</h3>
-                  {provider.proOnly && !isPro && (
+                  {provider.proOnly && !isPro ? (
                     <span className="inline-flex items-center rounded-full bg-[var(--brand-soft)] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.04em] text-[var(--accent-light)]">
                       Requires Pro
                     </span>
-                  )}
+                  ) : null}
                 </div>
                 <p className="text-xs text-[var(--muted)] mt-0.5">{provider.description}</p>
-                {status?.connected && (
+                {status?.connected ? (
                   <div className="mt-2 space-y-1">
                     <div className="flex items-center gap-2">
                       <span className="inline-block w-2 h-2 rounded-full bg-[var(--success)]" />
                       <span className="text-xs text-[var(--success-foreground)] font-medium">Connected</span>
-                      {status.siteUrl && (
+                      {status.siteUrl ? (
                         <>
                           <span className="text-xs text-[var(--muted-soft)]">·</span>
-                          <a
-                            href={status.siteUrl}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="text-xs text-[var(--accent-light)] hover:underline truncate"
-                          >
+                          <a href={status.siteUrl} target="_blank" rel="noopener noreferrer" className="text-xs text-[var(--accent-light)] hover:underline truncate">
                             {status.siteUrl}
                           </a>
                         </>
-                      )}
+                      ) : null}
                     </div>
-                    {status.connectedProjects && status.connectedProjects.length > 0 && (
+                    {status.connectedProjects?.length ? (
                       <p className="text-xs text-[var(--muted)]">
                         Used by {status.connectedProjects.length} project{status.connectedProjects.length > 1 ? "s" : ""}:{" "}
-                        {status.connectedProjects.map((p) => p.projectKey).join(", ")}
+                        {status.connectedProjects.map((project) => project.projectKey).join(", ")}
                       </p>
-                    )}
+                    ) : null}
                   </div>
-                )}
+                ) : null}
               </div>
+
               <div className="shrink-0 flex flex-col gap-2">
                 {status?.connected ? (
                   <>
                     <Link
-                      href={`/settings/integrations/${provider.id}`}
+                      href={"/settings/integrations/" + provider.id}
                       className="rounded-lg border border-[var(--border)] px-3 py-1.5 text-xs font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)] transition-colors text-center"
                     >
                       Manage
                     </Link>
-                    {canManage && (
+                    {canManage ? (
                       <Button
                         type="button"
                         variant="secondary"
@@ -208,7 +251,7 @@ export default function IntegrationsTab() {
                       >
                         Disconnect
                       </Button>
-                    )}
+                    ) : null}
                   </>
                 ) : locked ? (
                   <Button type="button" size="sm" onClick={() => setPricingOpen(true)}>
@@ -216,7 +259,7 @@ export default function IntegrationsTab() {
                   </Button>
                 ) : (
                   <Link
-                    href={`/settings/integrations/${provider.id}`}
+                    href={"/settings/integrations/" + provider.id}
                     className="inline-flex h-9 items-center justify-center rounded-[10px] border border-transparent bg-[var(--brand-primary)] px-3.5 text-[13px] font-semibold text-white shadow-sm transition-colors hover:bg-[var(--brand-hover)]"
                   >
                     Configure
@@ -227,11 +270,72 @@ export default function IntegrationsTab() {
           );
         })}
 
-        {!canManage && (
-          <p className="text-xs text-[var(--muted)]">Only the workspace owner can connect or disconnect integrations.</p>
-        )}
+        {ENGINEERING_PROVIDERS.map((provider) => {
+          const status = engineeringStatuses[provider.id];
+          return (
+            <div key={provider.id} className="rounded-lg border border-[var(--border)] p-4 flex items-start gap-4">
+              <div className="shrink-0 w-10 h-10 rounded-lg bg-[var(--brand-primary)] flex items-center justify-center text-xs font-bold text-white">
+                {provider.mark}
+              </div>
+              <div className="flex-1 min-w-0">
+                <h3 className="text-sm font-semibold text-[var(--foreground)]">{provider.name}</h3>
+                <p className="text-xs text-[var(--muted)] mt-0.5">{provider.description}</p>
+                {status?.connected ? (
+                  <div className="mt-2 space-y-1">
+                    <div className="flex items-center gap-2">
+                      <span className="inline-block w-2 h-2 rounded-full bg-[var(--success)]" />
+                      <span className="text-xs text-[var(--success-foreground)] font-medium">Connected</span>
+                      {status.siteUrl ? (
+                        <>
+                          <span className="text-xs text-[var(--muted-soft)]">·</span>
+                          <a href={status.siteUrl} target="_blank" rel="noopener noreferrer" className="text-xs text-[var(--accent-light)] hover:underline truncate">
+                            {status.siteUrl}
+                          </a>
+                        </>
+                      ) : null}
+                    </div>
+                    {status.connectedProjects?.length ? (
+                      <p className="text-xs text-[var(--muted)]">
+                        Used by {status.connectedProjects.length} Tesbo project{status.connectedProjects.length > 1 ? "s" : ""}.
+                      </p>
+                    ) : null}
+                  </div>
+                ) : (
+                  <p className="mt-2 text-xs text-[var(--muted-soft)]">Not connected for this workspace yet.</p>
+                )}
+              </div>
+              <div className="shrink-0 flex flex-col gap-2">
+                <Link
+                  href={"/settings/integrations/" + provider.id}
+                  className={
+                    status?.connected
+                      ? "rounded-lg border border-[var(--border)] px-3 py-1.5 text-xs font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)] transition-colors text-center"
+                      : "inline-flex h-9 items-center justify-center rounded-[10px] border border-transparent bg-[var(--brand-primary)] px-3.5 text-[13px] font-semibold text-white shadow-sm transition-colors hover:bg-[var(--brand-hover)]"
+                  }
+                >
+                  {status?.connected ? "Manage" : "Configure"}
+                </Link>
+                {status?.connected && canManage ? (
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => void handleEngineeringDisconnect(provider.id)}
+                    disabled={disconnectingProvider === provider.id}
+                    className="border-[var(--error)]/50 text-[var(--error-foreground)] hover:bg-[color-mix(in_oklab,var(--error)_8%,white)]"
+                  >
+                    Disconnect
+                  </Button>
+                ) : null}
+              </div>
+            </div>
+          );
+        })}
 
-        {/* Placeholder for future integrations */}
+        {!canManage ? (
+          <p className="text-xs text-[var(--muted)]">Only the workspace owner can connect or disconnect integrations.</p>
+        ) : null}
+
         <div className="rounded-lg border border-dashed border-[var(--border)] p-4 flex items-center gap-4 opacity-60">
           <div className="shrink-0 w-10 h-10 rounded-lg bg-[var(--surface-tertiary)] flex items-center justify-center">
             <svg className="w-5 h-5 text-[var(--muted-soft)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -239,8 +343,8 @@ export default function IntegrationsTab() {
             </svg>
           </div>
           <div>
-            <h3 className="text-sm font-medium text-[var(--muted)]">More integrations coming soon</h3>
-            <p className="text-xs text-[var(--muted-soft)] mt-0.5">Slack, GitHub, Azure DevOps and more.</p>
+            <h3 className="text-sm font-medium text-[var(--muted)]">Next primary integration</h3>
+            <p className="text-xs text-[var(--muted-soft)] mt-0.5">GitLab Issues and Merge Requests; general-purpose PM tools can follow later.</p>
           </div>
         </div>
       </Card>
