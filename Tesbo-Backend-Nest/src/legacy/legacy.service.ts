@@ -14501,6 +14501,195 @@ export class LegacyService implements OnModuleInit {
   // jiraSnapshot()'s return value instead. The audit that flagged this confusion is
   // ZYRA_BINDING_REPORT.md §2 ("jiraStatus() is connection status, not issue status — easy to
   // confuse by name").
+
+  private kpsDevOpsBaseUrl(): string {
+    const raw = String(this.config.kpsBaseUrl || "").trim().replace(/\/+$/, "");
+    if (!raw) throw new BadRequestException({ error: "KPS runtime is not configured." });
+    if (!/^https?:\/\//i.test(raw)) throw new BadRequestException({ error: "KPS runtime URL is invalid." });
+    return raw;
+  }
+
+  private async kpsDevOpsRequest<T = Body>(path: string): Promise<T> {
+    const token = String(this.config.kpsApiToken || "").trim();
+    if (!token) throw new BadRequestException({ error: "KPS API token is not configured." });
+    const response = await fetch(`${this.kpsDevOpsBaseUrl()}${path}`, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/json" }
+    });
+    const text = await response.text();
+    let payload: Body = {};
+    try { payload = text ? JSON.parse(text) : {}; } catch { payload = {}; }
+    if (!response.ok) {
+      const message = String(payload.error || `KPS request failed with HTTP ${response.status}.`);
+      throw new HttpException({ error: message }, response.status);
+    }
+    return payload as T;
+  }
+
+  async kpsDevOpsStatus(projectId: string, userId: string | null | undefined) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    const project = await this.getProject(projectId);
+    const settings = this.parseProjectSettings(project.settings);
+    const mapping = settings.kpsDevOps && typeof settings.kpsDevOps === "object" ? settings.kpsDevOps as Body : null;
+    const configured = Boolean(String(this.config.kpsBaseUrl || "").trim() && String(this.config.kpsApiToken || "").trim());
+    return {
+      connected: configured,
+      siteUrl: configured ? this.kpsDevOpsBaseUrl() : null,
+      mappedProject: mapping?.kpsProjectId ? {
+        id: String(mapping.kpsProjectId),
+        name: String(mapping.kpsProjectName || mapping.kpsProjectId),
+        slug: String(mapping.kpsProjectSlug || ""),
+        organizationName: String(mapping.organizationName || ""),
+      } : null,
+      lastSyncedAt: mapping?.lastSyncedAt || null,
+      lastSyncedCount: Number(mapping?.lastSyncedCount || 0),
+      lastEligibleCount: Number(mapping?.lastEligibleCount || 0),
+    };
+  }
+
+  async kpsDevOpsProjects(projectId: string, userId: string | null | undefined) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    const project = await this.getProject(projectId);
+    const settings = this.parseProjectSettings(project.settings);
+    const current = settings.kpsDevOps && typeof settings.kpsDevOps === "object" ? settings.kpsDevOps as Body : {};
+    const data = await this.kpsDevOpsRequest<{ projects?: Body[] }>("/api/projects");
+    return normalizeJsonArray(data.projects).map((item) => ({
+      id: String(item.id || ""),
+      key: String(item.slug || item.id || ""),
+      name: String(item.name || item.slug || item.id || "KPS project"),
+      slug: String(item.slug || ""),
+      organizationName: String(item.organization?.name || ""),
+      connected: String(current.kpsProjectId || "") === String(item.id || ""),
+    })).filter((item) => item.id);
+  }
+
+  async connectKpsDevOpsProject(projectId: string, userId: string | null | undefined, body: Body) {
+    const uid = this.requireUser(userId);
+    const access = await this.requireProjectAccess(uid, projectId);
+    if (this.normalizeRole(access.caller_role) === "qa_engineer") {
+      throw new ForbiddenException({ error: "QA Engineers cannot change project integrations." });
+    }
+    const kpsProjectId = String(body.kpsProjectId || body.projectId || "").trim();
+    const project = await this.getProject(projectId);
+    const settings = this.parseProjectSettings(project.settings);
+    if (!kpsProjectId) {
+      delete settings.kpsDevOps;
+      await this.db.query("UPDATE projects SET settings = $2::jsonb, updated_at = now() WHERE id = $1", [projectId, JSON.stringify(settings)]);
+      this.requestCache.invalidate(`projectBasics:${projectId}`);
+      this.invalidateProjectAccessCache(projectId);
+      return { linked: 0 };
+    }
+
+    const projectsData = await this.kpsDevOpsRequest<{ projects?: Body[] }>("/api/projects");
+    const remote = normalizeJsonArray(projectsData.projects).find((item) => String(item.id || "") === kpsProjectId);
+    if (!remote) throw new NotFoundException({ error: "KPS project not found." });
+
+    await this.kpsDevOpsRequest(`/api/devops/boards?projectId=${encodeURIComponent(kpsProjectId)}`);
+    const previous = settings.kpsDevOps && typeof settings.kpsDevOps === "object" ? settings.kpsDevOps as Body : {};
+    settings.kpsDevOps = {
+      kpsProjectId,
+      kpsProjectName: String(remote.name || remote.slug || kpsProjectId),
+      kpsProjectSlug: String(remote.slug || ""),
+      organizationName: String(remote.organization?.name || ""),
+      linkedAt: previous.kpsProjectId === kpsProjectId ? previous.linkedAt || new Date().toISOString() : new Date().toISOString(),
+      lastSyncedAt: previous.kpsProjectId === kpsProjectId ? previous.lastSyncedAt || null : null,
+      lastSyncedCount: previous.kpsProjectId === kpsProjectId ? Number(previous.lastSyncedCount || 0) : 0,
+      lastEligibleCount: previous.kpsProjectId === kpsProjectId ? Number(previous.lastEligibleCount || 0) : 0,
+    };
+    await this.db.query("UPDATE projects SET settings = $2::jsonb, updated_at = now() WHERE id = $1", [projectId, JSON.stringify(settings)]);
+    this.requestCache.invalidate(`projectBasics:${projectId}`);
+    this.invalidateProjectAccessCache(projectId);
+    await this.logProjectActivity(projectId, uid, "integration.mapping.updated", "integration", kpsProjectId, `KPS DevOps · ${settings.kpsDevOps.kpsProjectName}`, {
+      provider: "kps-devops",
+      kpsProjectId,
+    });
+    return { linked: 1, mappedProject: settings.kpsDevOps };
+  }
+
+  async syncKpsDevOpsRequirements(projectId: string, userId: string | null | undefined) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const project = await this.getProject(projectId);
+    const settings = this.parseProjectSettings(project.settings);
+    const mapping = settings.kpsDevOps && typeof settings.kpsDevOps === "object" ? settings.kpsDevOps as Body : null;
+    const kpsProjectId = String(mapping?.kpsProjectId || "").trim();
+    if (!kpsProjectId) throw new BadRequestException({ error: "Link a KPS DevOps project before syncing." });
+
+    const data = await this.kpsDevOpsRequest<Body>(`/api/devops/boards?projectId=${encodeURIComponent(kpsProjectId)}`);
+    const requirementTypeKeys = new Set(
+      normalizeJsonArray(data.process?.workItemTypes)
+        .filter((item) => String(item.backlogLevel || "") === "requirement")
+        .map((item) => String(item.key || ""))
+        .filter(Boolean)
+    );
+    const workItems = normalizeJsonArray(data.workItems)
+      .filter((item) => requirementTypeKeys.has(String(item.typeKey || "")));
+
+    const base = this.kpsDevOpsBaseUrl();
+    const sourceUrl = `${base}/devops/boards?projectId=${encodeURIComponent(kpsProjectId)}`;
+    let created = 0;
+    let updated = 0;
+
+    for (const item of workItems) {
+      const remoteId = String(item.id || "").trim();
+      if (!remoteId) continue;
+      const sourceKey = `kps-devops:${kpsProjectId}:${remoteId}`;
+      const priorityNumber = Number(item.priority || 0);
+      const priority = priorityNumber >= 1 && priorityNumber <= 4 ? ([ "P0", "P1", "P2", "P3" ][priorityNumber - 1]) : null;
+      const title = String(item.title || `KPS work item #${item.number || remoteId}`).trim().slice(0, 512);
+      const descriptionParts = [
+        String(item.description || "").trim(),
+        item.number ? `KPS work item #${item.number}` : "",
+        item.typeKey ? `Type: ${item.typeKey}` : "",
+      ].filter(Boolean);
+      const existing = await this.db.query<{ id: string }>(
+        "SELECT id FROM requirements WHERE project_id = $1 AND source_provider = 'other' AND source_key = $2 AND deleted_at IS NULL LIMIT 1",
+        [projectId, sourceKey]
+      );
+      if (existing.rows[0]) {
+        await this.db.query(
+          `UPDATE requirements SET title=$3, description=$4, status=$5, priority=$6, source_url=$7, updated_by=$8, updated_at=now()
+           WHERE id=$1 AND project_id=$2`,
+          [existing.rows[0].id, projectId, title, descriptionParts.join("\n\n"), String(item.state || "Draft"), priority, sourceUrl, uid]
+        );
+        updated += 1;
+      } else {
+        await this.db.query(
+          `INSERT INTO requirements
+           (project_id, title, description, status, priority, source_provider, source_key, source_url, created_by, updated_by)
+           VALUES ($1,$2,$3,$4,$5,'other',$6,$7,$8,$8)`,
+          [projectId, title, descriptionParts.join("\n\n"), String(item.state || "Draft"), priority, sourceKey, sourceUrl, uid]
+        );
+        created += 1;
+      }
+    }
+
+    const nextSettings = this.parseProjectSettings((await this.getProject(projectId)).settings);
+    const current = nextSettings.kpsDevOps && typeof nextSettings.kpsDevOps === "object" ? nextSettings.kpsDevOps as Body : {};
+    nextSettings.kpsDevOps = {
+      ...current,
+      lastSyncedAt: new Date().toISOString(),
+      lastSyncedCount: workItems.length,
+      lastEligibleCount: workItems.length,
+    };
+    await this.db.query("UPDATE projects SET settings = $2::jsonb, updated_at = now() WHERE id = $1", [projectId, JSON.stringify(nextSettings)]);
+    this.requestCache.invalidate(`projectBasics:${projectId}`);
+    this.invalidateProjectAccessCache(projectId);
+    await this.logProjectActivity(projectId, uid, "integration.sync.completed", "integration", kpsProjectId, `KPS DevOps · ${mapping?.kpsProjectName || kpsProjectId}`, {
+      provider: "kps-devops",
+      total: workItems.length,
+      created,
+      updated,
+    });
+    return {
+      ok: true,
+      totalWorkItems: normalizeJsonArray(data.workItems).length,
+      eligibleRequirements: workItems.length,
+      created,
+      updated,
+      syncedAt: nextSettings.kpsDevOps.lastSyncedAt,
+    };
+  }
+
   async jiraStatus(projectId: string, userId: string | null | undefined) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
     return this.jiraStatusForProject(projectId);

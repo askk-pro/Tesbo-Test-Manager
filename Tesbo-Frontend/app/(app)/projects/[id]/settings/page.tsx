@@ -11,6 +11,7 @@ import {
   getJiraStatus,
   getBillingInfo,
   getLinearStatus,
+  getKpsDevOpsStatus,
   listWorkspaceMembers,
   addProjectMember,
   removeProjectMember,
@@ -19,6 +20,7 @@ import {
   listCustomTags,
   type JiraConnection,
   type LinearConnection,
+  type KpsDevOpsStatus,
   type ProjectIcon,
   type TestEnvironmentSetting,
 } from "@/lib/api";
@@ -125,6 +127,7 @@ export default function ProjectSettingsPage() {
   const [message, setMessage] = useState<string | null>(null);
   const [jiraStatus, setJiraStatus] = useState<JiraConnection | null>(null);
   const [linearStatus, setLinearStatus] = useState<LinearConnection | null>(null);
+  const [kpsDevOpsStatus, setKpsDevOpsStatus] = useState<KpsDevOpsStatus | null>(null);
   /*
    * Basecamp 10191178824 — "Linear is restricted behind a Pro upgrade in Workspace Settings, but the
    * same integration is available in Project Settings → Integrations".
@@ -253,6 +256,7 @@ export default function ProjectSettingsPage() {
     setCurrentUserId(currentUser.userId);
     getJiraStatus(projectId).then(setJiraStatus).catch(() => {});
     getLinearStatus(projectId).then(setLinearStatus).catch(() => {});
+    getKpsDevOpsStatus(projectId).then(setKpsDevOpsStatus).catch(() => {});
     getBillingInfo()
       .then((billing) => setLinearIsPro(billing.enabled === false || billing.plan === "pro"))
       .catch(() => setLinearIsPro(null));
@@ -930,9 +934,8 @@ export default function ProjectSettingsPage() {
           <div>
             <h2 className="text-base font-semibold text-[var(--foreground)]">App Integrations</h2>
             <p className="mt-1 text-sm text-[var(--muted)]">
-              Jira and Linear connect once for the whole workspace (Workspace Settings → Integrations).
-              Open a connected integration&apos;s settings to pick which remote project/team feeds <em>this</em>{" "}
-              project, sync tickets, and configure the rest of its options.
+              Jira and Linear connect once for the whole workspace. Azure DevOps uses the trusted KPS DevOps connection already configured on this deployment.
+              Open an integration&apos;s settings to choose which remote project feeds <em>this</em>{" "}project and sync requirements.
             </p>
           </div>
 
@@ -1049,6 +1052,56 @@ export default function ProjectSettingsPage() {
             </div>
           </div>
 
+          {/* Azure DevOps via KPS DevOps */}
+          <div className="rounded-lg border border-[var(--border)] p-4 flex items-start gap-4">
+            <div className="shrink-0 w-10 h-10 rounded-lg bg-[#0078D4] flex items-center justify-center text-xs font-bold text-white">
+              AZ
+            </div>
+            <div className="flex-1 min-w-0">
+              <h3 className="text-sm font-semibold text-[var(--foreground)]">Azure DevOps (KPS)</h3>
+              <p className="text-xs text-[var(--muted)] mt-0.5">
+                Sync requirement-level KPS Boards work items into Tesbo requirements and traceability.
+              </p>
+              {kpsDevOpsStatus?.connected ? (
+                <div className="mt-2 space-y-1">
+                  <div className="flex items-center gap-2">
+                    <span className="inline-block w-2 h-2 rounded-full bg-[var(--success)]" />
+                    <span className="text-xs text-[var(--success-foreground)] font-medium">KPS runtime connected</span>
+                  </div>
+                  {kpsDevOpsStatus.mappedProject ? (
+                    <p className="text-xs text-[var(--muted)]">
+                      Linked KPS project: <span className="font-medium text-[var(--foreground)]">{kpsDevOpsStatus.mappedProject.name}</span>
+                    </p>
+                  ) : (
+                    <p className="text-xs text-[var(--muted-soft)]">No KPS DevOps project linked to this project yet.</p>
+                  )}
+                </div>
+              ) : (
+                <p className="mt-2 text-xs text-[var(--muted-soft)]">KPS runtime connection is not configured on the QA backend.</p>
+              )}
+            </div>
+            <div className="shrink-0">
+              {kpsDevOpsStatus?.connected ? (
+                <Link
+                  href={`/projects/${projectId}/settings/integrations/kps-devops`}
+                  aria-label="Azure DevOps KPS integration settings"
+                  title="Azure DevOps KPS integration settings"
+                  className="inline-flex h-9 w-9 items-center justify-center rounded-[10px] border border-[var(--border)] text-[var(--muted)] transition-colors hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
+                >
+                  <IconSettings size={17} stroke={1.75} />
+                </Link>
+              ) : (
+                <button
+                  type="button"
+                  disabled
+                  className="inline-flex h-9 items-center justify-center rounded-[10px] border border-[var(--border)] px-3.5 text-[13px] font-semibold text-[var(--muted-soft)] opacity-60"
+                >
+                  Not configured
+                </button>
+              )}
+            </div>
+          </div>
+
           {/* Placeholder for future integrations */}
           <div className="rounded-lg border border-dashed border-[var(--border)] p-4 flex items-center gap-4 opacity-60">
             <div className="shrink-0 w-10 h-10 rounded-lg bg-[var(--surface-tertiary)] flex items-center justify-center">
@@ -1058,7 +1111,7 @@ export default function ProjectSettingsPage() {
             </div>
             <div>
               <h3 className="text-sm font-medium text-[var(--muted)]">More integrations coming soon</h3>
-              <p className="text-xs text-[var(--muted-soft)] mt-0.5">Slack, GitHub, Azure DevOps and more.</p>
+              <p className="text-xs text-[var(--muted-soft)] mt-0.5">Slack, GitHub and more.</p>
             </div>
           </div>
         </Card>

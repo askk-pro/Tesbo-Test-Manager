@@ -2269,6 +2269,28 @@ export class LegacyController {
     return this.legacy.integrationStatus(req.userId, provider);
   }
 
+  // ── Project-scoped KPS DevOps / Azure DevOps-compatible Boards integration ──
+
+  @Get("/api/projects/:projectId/kps-devops/status")
+  kpsDevOpsStatus(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.kpsDevOpsStatus(projectId, req.userId);
+  }
+
+  @Get("/api/projects/:projectId/kps-devops/projects")
+  kpsDevOpsProjects(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.kpsDevOpsProjects(projectId, req.userId);
+  }
+
+  @Post("/api/projects/:projectId/kps-devops/project")
+  connectKpsDevOpsProject(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.connectKpsDevOpsProject(projectId, req.userId, body);
+  }
+
+  @Post("/api/projects/:projectId/kps-devops/sync")
+  syncKpsDevOpsRequirements(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.syncKpsDevOpsRequirements(projectId, req.userId);
+  }
+
   // ── Project-scoped Jira mapping/sync/tickets ──
 
   @Get("/api/projects/:projectId/jira/status")

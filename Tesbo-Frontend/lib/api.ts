@@ -4410,6 +4410,64 @@ export async function getIntegrationStatus(provider: IntegrationProvider): Promi
   return api<IntegrationConnectionStatus>(`/api/workspace/integrations/${provider}/status`);
 }
 
+// ── Azure DevOps (KPS DevOps) project mapping / requirement sync ──
+
+export interface KpsDevOpsMappedProject {
+  id: string;
+  name: string;
+  slug: string;
+  organizationName: string;
+}
+
+export interface KpsDevOpsStatus {
+  connected: boolean;
+  siteUrl: string | null;
+  mappedProject: KpsDevOpsMappedProject | null;
+  lastSyncedAt: string | null;
+  lastSyncedCount: number;
+  lastEligibleCount: number;
+}
+
+export interface KpsDevOpsProject {
+  id: string;
+  key: string;
+  name: string;
+  slug: string;
+  organizationName: string;
+  connected: boolean;
+}
+
+export interface KpsDevOpsSyncResult {
+  ok: boolean;
+  totalWorkItems: number;
+  eligibleRequirements: number;
+  created: number;
+  updated: number;
+  syncedAt: string;
+}
+
+export async function getKpsDevOpsStatus(projectId: string): Promise<KpsDevOpsStatus> {
+  return api<KpsDevOpsStatus>(`/api/projects/${projectId}/kps-devops/status`);
+}
+
+export async function listKpsDevOpsProjects(projectId: string): Promise<KpsDevOpsProject[]> {
+  return api<KpsDevOpsProject[]>(`/api/projects/${projectId}/kps-devops/projects`);
+}
+
+export async function connectKpsDevOpsProject(projectId: string, kpsProjectId: string | null): Promise<void> {
+  await api(`/api/projects/${projectId}/kps-devops/project`, {
+    method: "POST",
+    body: { kpsProjectId: kpsProjectId || "" },
+  });
+}
+
+export async function syncKpsDevOpsRequirements(projectId: string): Promise<KpsDevOpsSyncResult> {
+  return api<KpsDevOpsSyncResult>(`/api/projects/${projectId}/kps-devops/sync`, {
+    method: "POST",
+    signal: AbortSignal.timeout(30_000),
+  });
+}
+
 // ── Jira (project-scoped mapping/sync/tickets) ──
 
 export interface JiraConnection {

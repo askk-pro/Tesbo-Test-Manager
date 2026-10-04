@@ -688,7 +688,7 @@ export default function RequirementsPage() {
               <StatusChip tone="neutral">{internalRequirements.length}</StatusChip>
             </div>
             <p className="mt-1 text-xs text-[var(--muted)]">
-              Native REQ-n requirements for projects that do not depend on Jira or Linear.
+              First-class REQ-n requirements created in Tesbo or synchronized from connected engineering sources.
             </p>
           </div>
           <Button size="sm" onClick={() => setCreateRequirementOpen(true)}>
@@ -732,6 +732,25 @@ export default function RequirementsPage() {
                     <td className="px-5 py-3 font-mono text-xs font-semibold text-[var(--accent-light)]">{requirement.humanId}</td>
                     <td className="px-4 py-3">
                       <div className="font-medium text-[var(--foreground)]">{requirement.title}</div>
+                      <div className="mt-1 flex flex-wrap items-center gap-2">
+                        <span className="rounded bg-[var(--surface-secondary)] px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-[var(--muted)]">
+                          {requirement.sourceProvider === "other" && requirement.sourceKey?.startsWith("kps-devops:")
+                            ? "KPS DevOps"
+                            : requirement.sourceProvider === "internal"
+                              ? "Tesbo"
+                              : requirement.sourceProvider}
+                        </span>
+                        {requirement.sourceUrl ? (
+                          <a
+                            href={requirement.sourceUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-[11px] text-[var(--accent-light)] hover:underline"
+                          >
+                            Open source ↗
+                          </a>
+                        ) : null}
+                      </div>
                       {requirement.description ? (
                         <div className="mt-1 line-clamp-1 text-xs text-[var(--muted)]">{requirement.description}</div>
                       ) : null}
