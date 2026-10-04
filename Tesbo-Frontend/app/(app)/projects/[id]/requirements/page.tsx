@@ -4,7 +4,7 @@ import { useParams, useRouter } from "next/navigation";
 import { useEffect, useRef, useState, useCallback } from "react";
 import Link from "next/link";
 import React from "react";
-import { IconRefresh, IconSettings, IconPlug } from "@tabler/icons-react";
+import { IconRefresh, IconSettings, IconPlug, IconPlus, IconFileText } from "@tabler/icons-react";
 import {
   getJiraStatus,
   getLinearStatus,
@@ -16,11 +16,14 @@ import {
   listLinkedLinearKeys,
   getRequirementsSummary,
   getKnowledgeFolderTree,
+  listQaRequirements,
+  createQaRequirement,
+  type QaRequirement,
   type LinkedIssueTaskStatus,
   type RequirementsSummary,
   type TicketSourceStats,
 } from "@/lib/api";
-import { Button, Input, PageLoader, StatusChip } from "@/components/ui";
+import { Button, Input, Modal, PageLoader, StatusChip, Textarea } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import { SyncStatusPanel, useSyncRun } from "@/components/integrations/SyncStatusPanel";
 import { normalizeTaskStatus, taskStatusLabel, taskStatusTone } from "@/components/agents/TaskQuickViewPanel";
@@ -269,6 +272,16 @@ export default function RequirementsPage() {
   // sync has created it, so an entry here can legitimately be absent.
   const [providerFolderIds, setProviderFolderIds] = useState<Partial<Record<TicketSource, string>>>(cached?.providerFolderIds ?? {});
 
+  const [internalRequirements, setInternalRequirements] = useState<QaRequirement[]>([]);
+  const [internalLoading, setInternalLoading] = useState(true);
+  const [createRequirementOpen, setCreateRequirementOpen] = useState(false);
+  const [creatingRequirement, setCreatingRequirement] = useState(false);
+  const [createRequirementError, setCreateRequirementError] = useState("");
+  const [requirementTitle, setRequirementTitle] = useState("");
+  const [requirementDescription, setRequirementDescription] = useState("");
+  const [requirementStatus, setRequirementStatus] = useState("Draft");
+  const [requirementPriority, setRequirementPriority] = useState<"" | "P0" | "P1" | "P2" | "P3">("P2");
+
   // One polled run per provider. Both hooks are called unconditionally (React rules) and gate
   // their own fetching on whether that provider is connected.
   const jiraSync = useSyncRun(projectId, "jira", connectedSources.includes("jira"));
@@ -410,6 +423,50 @@ export default function RequirementsPage() {
     return data;
   }, [projectId]);
 
+  const refreshInternalRequirements = useCallback(async () => {
+    setInternalLoading(true);
+    try {
+      const rows = await listQaRequirements(projectId);
+      setInternalRequirements(rows);
+      return rows;
+    } catch {
+      setInternalRequirements([]);
+      return [];
+    } finally {
+      setInternalLoading(false);
+    }
+  }, [projectId]);
+
+  async function handleCreateRequirement(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const title = requirementTitle.trim();
+    if (!title) {
+      setCreateRequirementError("Requirement title is required.");
+      return;
+    }
+    setCreatingRequirement(true);
+    setCreateRequirementError("");
+    try {
+      await createQaRequirement(projectId, {
+        title,
+        description: requirementDescription.trim(),
+        status: requirementStatus,
+        priority: requirementPriority,
+        sourceProvider: "internal",
+      });
+      setRequirementTitle("");
+      setRequirementDescription("");
+      setRequirementStatus("Draft");
+      setRequirementPriority("P2");
+      setCreateRequirementOpen(false);
+      await refreshInternalRequirements();
+    } catch (error) {
+      setCreateRequirementError(error instanceof Error ? error.message : "Failed to create requirement.");
+    } finally {
+      setCreatingRequirement(false);
+    }
+  }
+
   // Maps the KB root's direct children back to provider ids by name, matching how
   // ensureProviderFolder names them on the backend ("Jira" / "Linear").
   const refreshKbFolders = useCallback(async () => {
@@ -488,6 +545,7 @@ export default function RequirementsPage() {
         refreshLinkedKeys(),
         refreshSummary(),
         refreshKbFolders(),
+        refreshInternalRequirements(),
       ]);
       setLoading(false);
       // refreshHistory above is intentionally not awaited (see its own comment), so this write
@@ -509,7 +567,7 @@ export default function RequirementsPage() {
         providerFolderIds: kbFoldersResult,
       });
     })();
-  }, [projectId, loadTickets, refreshHistory, refreshLinkedKeys, refreshSummary, refreshKbFolders, router, currentUser]);
+  }, [projectId, loadTickets, refreshHistory, refreshLinkedKeys, refreshSummary, refreshKbFolders, refreshInternalRequirements, router, currentUser]);
 
   useEffect(() => {
     if (!loading) loadTickets(source, page, search, { issueType: typeFilter, status: statusFilter, coverage: coverageFilter }, historicalRemoteId ?? undefined);
@@ -604,17 +662,96 @@ export default function RequirementsPage() {
             />
           }
           actions={
-            <Link
-              href={`/projects/${projectId}/settings?tab=integrations`}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-sm font-semibold text-[var(--foreground)] shadow-sm transition-colors hover:bg-[var(--surface-secondary)]"
-            >
-              <IconSettings size={15} stroke={1.75} />
-              Manage integrations
-            </Link>
+            <div className="flex items-center gap-2">
+              <Button onClick={() => setCreateRequirementOpen(true)}>
+                <IconPlus size={16} stroke={1.75} />
+                Create requirement
+              </Button>
+              <Link
+                href={`/projects/${projectId}/settings?tab=integrations`}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-sm font-semibold text-[var(--foreground)] shadow-sm transition-colors hover:bg-[var(--surface-secondary)]"
+              >
+                <IconSettings size={15} stroke={1.75} />
+                Manage integrations
+              </Link>
+            </div>
           }
         />
       }
     >
+      <section className="rounded-xl border border-[var(--border)] bg-[var(--surface)]">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[var(--border-subtle)] px-5 py-4">
+          <div>
+            <div className="flex items-center gap-2">
+              <IconFileText size={18} stroke={1.75} className="text-[var(--accent-light)]" />
+              <h2 className="text-base font-semibold text-[var(--foreground)]">Internal requirements</h2>
+              <StatusChip tone="neutral">{internalRequirements.length}</StatusChip>
+            </div>
+            <p className="mt-1 text-xs text-[var(--muted)]">
+              Native REQ-n requirements for projects that do not depend on Jira or Linear.
+            </p>
+          </div>
+          <Button size="sm" onClick={() => setCreateRequirementOpen(true)}>
+            <IconPlus size={15} stroke={1.75} />
+            Create requirement
+          </Button>
+        </div>
+
+        {internalLoading ? (
+          <div className="px-5 py-8 text-center text-sm text-[var(--muted)]">Loading internal requirements…</div>
+        ) : internalRequirements.length === 0 ? (
+          <div className="px-5 py-10 text-center">
+            <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-[var(--brand-soft)]">
+              <IconFileText size={22} stroke={1.75} className="text-[var(--accent-light)]" />
+            </div>
+            <h3 className="mt-3 text-base font-semibold text-[var(--foreground)]">No internal requirements yet</h3>
+            <p className="mx-auto mt-1 max-w-lg text-sm text-[var(--muted)]">
+              Create requirements directly in Tesbo, then link them to test cases for traceability and coverage.
+            </p>
+            <Button className="mt-4" onClick={() => setCreateRequirementOpen(true)}>
+              <IconPlus size={16} stroke={1.75} />
+              Create first requirement
+            </Button>
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm" style={{ minWidth: 760 }}>
+              <thead>
+                <tr className="bg-[var(--surface-secondary)] border-b border-[var(--border)]">
+                  <th className="px-5 py-2.5 text-left font-medium text-[var(--muted-soft)] w-28">ID</th>
+                  <th className="px-4 py-2.5 text-left font-medium text-[var(--muted-soft)]">Title</th>
+                  <th className="px-4 py-2.5 text-left font-medium text-[var(--muted-soft)] w-28">Status</th>
+                  <th className="px-4 py-2.5 text-left font-medium text-[var(--muted-soft)] w-24">Priority</th>
+                  <th className="px-4 py-2.5 text-left font-medium text-[var(--muted-soft)] w-24">Coverage</th>
+                  <th className="px-5 py-2.5 text-right font-medium text-[var(--muted-soft)] w-32">Updated</th>
+                </tr>
+              </thead>
+              <tbody>
+                {internalRequirements.map((requirement) => (
+                  <tr key={requirement.id} className="border-b border-[var(--border-subtle)] last:border-b-0">
+                    <td className="px-5 py-3 font-mono text-xs font-semibold text-[var(--accent-light)]">{requirement.humanId}</td>
+                    <td className="px-4 py-3">
+                      <div className="font-medium text-[var(--foreground)]">{requirement.title}</div>
+                      {requirement.description ? (
+                        <div className="mt-1 line-clamp-1 text-xs text-[var(--muted)]">{requirement.description}</div>
+                      ) : null}
+                    </td>
+                    <td className="px-4 py-3"><StatusChip tone={jiraStatusTone(requirement.status)}>{requirement.status}</StatusChip></td>
+                    <td className="px-4 py-3"><PriorityIcon priority={requirement.priority || ""} /></td>
+                    <td className="px-4 py-3 text-xs text-[var(--muted)]">
+                      {requirement.testcases?.length ? `${requirement.testcases.length} TC` : "—"}
+                    </td>
+                    <td className="px-5 py-3 text-right text-xs text-[var(--muted)]">
+                      {requirement.updatedAt ? new Date(requirement.updatedAt).toLocaleDateString() : "—"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
       {/* Source tabs + coverage stat strip */}
       {(anyConnected || tickets.length > 0) && (
         <div className="flex flex-wrap items-start justify-between gap-4">
@@ -758,25 +895,19 @@ export default function RequirementsPage() {
       )}
 
       {!sourceConnected && tickets.length === 0 && (
-        <div className="rounded-xl border border-dashed border-[var(--border)] p-12 text-center">
-          <div className="mx-auto w-14 h-14 rounded-full bg-[var(--brand-soft)] flex items-center justify-center">
-            <IconPlug size={26} stroke={1.75} className="text-[var(--accent-light)]" />
+        <div className="rounded-xl border border-dashed border-[var(--border)] p-8 text-center">
+          <div className="mx-auto w-12 h-12 rounded-full bg-[var(--brand-soft)] flex items-center justify-center">
+            <IconPlug size={22} stroke={1.75} className="text-[var(--accent-light)]" />
           </div>
-          <h2 className="mt-4 text-lg font-semibold text-[var(--foreground)]">
-            {source === "all"
-              ? "Connect an Issue Tracker to Get Started"
-              : `Connect ${providerLabel(source)} to Get Started`}
-          </h2>
-          <p className="mt-2 text-sm text-[var(--muted)] max-w-sm mx-auto">
-            Connect an issue tracker in project settings to automatically import tickets as
-            requirements and use them as context for generating test cases.
+          <h2 className="mt-3 text-base font-semibold text-[var(--foreground)]">Optional external requirements</h2>
+          <p className="mt-2 text-sm text-[var(--muted)] max-w-lg mx-auto">
+            Connect Jira or Linear if you also want to import external tickets as requirements. Native requirements above work without any integration.
           </p>
           <Link
             href={`/projects/${projectId}/settings?tab=integrations`}
-            style={{ color: "#fff" }}
-            className="mt-4 inline-flex items-center justify-center rounded-lg bg-[var(--brand-primary)] px-5 py-2 text-sm font-semibold !text-white shadow-sm transition-colors hover:bg-[var(--brand-hover)]"
+            className="mt-4 inline-flex items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm font-semibold text-[var(--foreground)] shadow-sm transition-colors hover:bg-[var(--surface-secondary)]"
           >
-            Go to Project Settings
+            Manage integrations
           </Link>
         </div>
       )}
@@ -1087,6 +1218,76 @@ export default function RequirementsPage() {
           )}
         </>
       )}
+      <Modal
+        open={createRequirementOpen}
+        onClose={() => !creatingRequirement && setCreateRequirementOpen(false)}
+        title="Create requirement"
+        className="max-w-2xl"
+      >
+        <form onSubmit={handleCreateRequirement} className="space-y-4">
+          <div>
+            <label className="mb-1.5 block text-sm font-medium text-[var(--foreground)]">Title *</label>
+            <Input
+              autoFocus
+              value={requirementTitle}
+              onChange={(event) => setRequirementTitle(event.target.value)}
+              placeholder="e.g. User can sign in with valid credentials"
+              maxLength={512}
+            />
+          </div>
+          <div>
+            <label className="mb-1.5 block text-sm font-medium text-[var(--foreground)]">Description</label>
+            <Textarea
+              value={requirementDescription}
+              onChange={(event) => setRequirementDescription(event.target.value)}
+              rows={5}
+              placeholder="Business requirement, acceptance criteria, constraints, or notes."
+            />
+          </div>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div>
+              <label className="mb-1.5 block text-sm font-medium text-[var(--foreground)]">Status</label>
+              <select
+                value={requirementStatus}
+                onChange={(event) => setRequirementStatus(event.target.value)}
+                className="h-10 w-full rounded-md border border-[var(--border)] bg-[var(--background)] px-3 text-sm text-[var(--foreground)] outline-none"
+              >
+                <option value="Draft">Draft</option>
+                <option value="Ready">Ready</option>
+                <option value="Approved">Approved</option>
+                <option value="Deprecated">Deprecated</option>
+              </select>
+            </div>
+            <div>
+              <label className="mb-1.5 block text-sm font-medium text-[var(--foreground)]">Priority</label>
+              <select
+                value={requirementPriority}
+                onChange={(event) => setRequirementPriority(event.target.value as "" | "P0" | "P1" | "P2" | "P3")}
+                className="h-10 w-full rounded-md border border-[var(--border)] bg-[var(--background)] px-3 text-sm text-[var(--foreground)] outline-none"
+              >
+                <option value="">Unprioritized</option>
+                <option value="P0">P0 — Critical</option>
+                <option value="P1">P1 — High</option>
+                <option value="P2">P2 — Medium</option>
+                <option value="P3">P3 — Low</option>
+              </select>
+            </div>
+          </div>
+          {createRequirementError ? (
+            <div className="rounded-lg border border-[var(--error)]/30 bg-[var(--error-soft)] px-3 py-2 text-sm text-[var(--error-foreground)]">
+              {createRequirementError}
+            </div>
+          ) : null}
+          <div className="flex justify-end gap-2 pt-2">
+            <Button type="button" variant="secondary" disabled={creatingRequirement} onClick={() => setCreateRequirementOpen(false)}>
+              Cancel
+            </Button>
+            <Button type="submit" disabled={creatingRequirement || !requirementTitle.trim()}>
+              {creatingRequirement ? "Creating…" : "Create requirement"}
+            </Button>
+          </div>
+        </form>
+      </Modal>
     </StandardPageLayout>
   );
 }

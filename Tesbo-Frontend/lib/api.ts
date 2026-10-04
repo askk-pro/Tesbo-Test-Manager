@@ -4694,6 +4694,56 @@ export async function searchLinearIssuesLive(projectId: string, search: string):
   return api(`/api/projects/${projectId}/linear/search-issues?${sp.toString()}`);
 }
 
+// ── First-class internal QA requirements (REQ-n) ──
+
+export interface QaRequirementTestcaseLink {
+  id: string;
+  humanId?: string | null;
+  externalId?: string | null;
+  title: string;
+  status?: string | null;
+}
+
+export interface QaRequirement {
+  id: string;
+  projectId: string;
+  humanId: string;
+  title: string;
+  description: string;
+  status: string;
+  priority: string | null;
+  sourceProvider: "internal" | "jira" | "linear" | "other";
+  sourceKey: string | null;
+  sourceUrl: string | null;
+  ownerId: string | null;
+  ownerName?: string | null;
+  createdAt: string;
+  updatedAt: string;
+  testcases: QaRequirementTestcaseLink[];
+}
+
+export interface CreateQaRequirementInput {
+  title: string;
+  description?: string;
+  status?: string;
+  priority?: "P0" | "P1" | "P2" | "P3" | "";
+  sourceProvider?: "internal";
+}
+
+export async function listQaRequirements(projectId: string): Promise<QaRequirement[]> {
+  return api<QaRequirement[]>(`/api/projects/${projectId}/qa-requirements`);
+}
+
+export async function createQaRequirement(
+  projectId: string,
+  body: CreateQaRequirementInput,
+): Promise<QaRequirement> {
+  return api<QaRequirement>(`/api/projects/${projectId}/qa-requirements`, {
+    method: "POST",
+    body,
+  });
+}
+
 // ── Requirements page: cross-source (Jira + Linear) aggregates ──
 
 export interface TicketSourceStats {
