@@ -9699,6 +9699,28 @@ export class LegacyService implements OnModuleInit {
     return this.updateInternalRequirement(projectId, requirementRef, uid, body);
   }
 
+  async linkInternalRequirementToTestcaseForUser(
+    userId: string | null | undefined,
+    projectId: string,
+    requirementRef: string,
+    testcaseId: string,
+  ) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    return this.linkInternalRequirementToTestcase(projectId, requirementRef, testcaseId, uid);
+  }
+
+  async unlinkInternalRequirementFromTestcaseForUser(
+    userId: string | null | undefined,
+    projectId: string,
+    requirementRef: string,
+    testcaseId: string,
+  ) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    return this.unlinkInternalRequirementFromTestcase(projectId, requirementRef, testcaseId, uid);
+  }
+
 
   // ── Phase 2: QA ticket workspace, traceability and evidence ────────────────────────────────
 

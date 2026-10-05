@@ -4916,6 +4916,34 @@ export async function createQaRequirement(
   });
 }
 
+export async function getQaRequirement(projectId: string, requirementRef: string): Promise<QaRequirement> {
+  return api<QaRequirement>(
+    `/api/projects/${projectId}/qa-requirements/${encodeURIComponent(requirementRef)}`
+  );
+}
+
+export async function linkQaRequirementTestcase(
+  projectId: string,
+  requirementRef: string,
+  testcaseId: string,
+): Promise<QaRequirement> {
+  return api<QaRequirement>(
+    `/api/projects/${projectId}/qa-requirements/${encodeURIComponent(requirementRef)}/testcases`,
+    { method: "POST", body: { testcaseId } }
+  );
+}
+
+export async function unlinkQaRequirementTestcase(
+  projectId: string,
+  requirementRef: string,
+  testcaseId: string,
+): Promise<{ requirement: QaRequirement; wasLinked: boolean }> {
+  return api(
+    `/api/projects/${projectId}/qa-requirements/${encodeURIComponent(requirementRef)}/testcases/${encodeURIComponent(testcaseId)}`,
+    { method: "DELETE" }
+  );
+}
+
 // ── Requirements page: cross-source (Jira + Linear) aggregates ──
 
 export interface TicketSourceStats {

@@ -4,7 +4,7 @@ import { useParams, useRouter } from "next/navigation";
 import { useEffect, useRef, useState, useCallback } from "react";
 import Link from "next/link";
 import React from "react";
-import { IconRefresh, IconSettings, IconPlug, IconPlus, IconFileText } from "@tabler/icons-react";
+import { IconRefresh, IconSettings, IconPlug, IconPlus, IconFileText, IconChevronDown, IconChevronRight } from "@tabler/icons-react";
 import {
   getJiraStatus,
   getLinearStatus,
@@ -104,11 +104,6 @@ function providerFor(source: TicketSource): ProviderMeta | undefined {
 
 function providerLabel(source: TicketSource): string {
   return providerFor(source)?.label ?? source;
-}
-
-function joinLabels(labels: string[]): string {
-  if (labels.length <= 1) return labels[0] ?? "";
-  return `${labels.slice(0, -1).join(", ")} and ${labels[labels.length - 1]}`;
 }
 
 const EMPTY_STATS: TicketSourceStats = { total: 0, covered: 0, uncovered: 0, types: [], statuses: [] };
@@ -274,6 +269,7 @@ export default function RequirementsPage() {
 
   const [internalRequirements, setInternalRequirements] = useState<QaRequirement[]>([]);
   const [internalLoading, setInternalLoading] = useState(true);
+  const [expandedRequirementId, setExpandedRequirementId] = useState<string | null>(null);
   const [createRequirementOpen, setCreateRequirementOpen] = useState(false);
   const [creatingRequirement, setCreatingRequirement] = useState(false);
   const [createRequirementError, setCreateRequirementError] = useState("");
@@ -300,9 +296,6 @@ export default function RequirementsPage() {
   const sourceConnected = source === "all" ? anyConnected : connectedSources.includes(source);
   const stats = summary?.[source] ?? EMPTY_STATS;
   const coveragePct = stats.total ? Math.round((stats.covered / stats.total) * 100) : 0;
-  const connectedPhrase = anyConnected
-    ? joinLabels(connectedProviders.map((p) => p.label))
-    : "your connected issue tracker";
 
   function tcCountFor(req: Requirement): number {
     return req.source === "jira" ? jiraKeyCounts[req.key] || 0 : linearKeyCounts[req.key] || 0;
@@ -651,7 +644,7 @@ export default function RequirementsPage() {
       header={
         <PageHeader
           title="Requirements"
-          subtitle={`Requirements to be developed, synced from ${connectedPhrase}, and turned into test coverage with Zyra. Full documents live in the Knowledge base's Requirements folder.`}
+          subtitle="Create requirements, synchronize them from engineering tools, and link each requirement to executable test coverage."
           breadcrumb={
             <Breadcrumbs
               items={[
@@ -662,17 +655,24 @@ export default function RequirementsPage() {
             />
           }
           actions={
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <Button onClick={() => setCreateRequirementOpen(true)}>
                 <IconPlus size={16} stroke={1.75} />
                 Create requirement
               </Button>
               <Link
+                href={`/projects/${projectId}/testcases`}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-sm font-semibold text-[var(--foreground)] shadow-sm transition-colors hover:bg-[var(--surface-secondary)]"
+              >
+                Test cases
+                <span aria-hidden="true">→</span>
+              </Link>
+              <Link
                 href={`/projects/${projectId}/settings?tab=integrations`}
                 className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-sm font-semibold text-[var(--foreground)] shadow-sm transition-colors hover:bg-[var(--surface-secondary)]"
               >
                 <IconSettings size={15} stroke={1.75} />
-                Manage integrations
+                Integrations
               </Link>
             </div>
           }
@@ -691,10 +691,6 @@ export default function RequirementsPage() {
               First-class REQ-n requirements created in Tesbo or synchronized from connected engineering sources.
             </p>
           </div>
-          <Button size="sm" onClick={() => setCreateRequirementOpen(true)}>
-            <IconPlus size={15} stroke={1.75} />
-            Create requirement
-          </Button>
         </div>
 
         {internalLoading ? (
@@ -715,60 +711,163 @@ export default function RequirementsPage() {
           </div>
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full text-sm" style={{ minWidth: 760 }}>
+            <table className="w-full text-sm" style={{ minWidth: 980 }}>
               <thead>
                 <tr className="bg-[var(--surface-secondary)] border-b border-[var(--border)]">
-                  <th className="px-5 py-2.5 text-left font-medium text-[var(--muted-soft)] w-28">ID</th>
+                  <th className="w-10 px-3 py-2.5" aria-label="Details" />
+                  <th className="px-2 py-2.5 text-left font-medium text-[var(--muted-soft)] w-24">ID</th>
                   <th className="px-4 py-2.5 text-left font-medium text-[var(--muted-soft)]">Title</th>
                   <th className="px-4 py-2.5 text-left font-medium text-[var(--muted-soft)] w-28">Status</th>
                   <th className="px-4 py-2.5 text-left font-medium text-[var(--muted-soft)] w-24">Priority</th>
-                  <th className="px-4 py-2.5 text-left font-medium text-[var(--muted-soft)] w-24">Coverage</th>
-                  <th className="px-5 py-2.5 text-right font-medium text-[var(--muted-soft)] w-32">Updated</th>
+                  <th className="px-4 py-2.5 text-left font-medium text-[var(--muted-soft)] w-28">Coverage</th>
+                  <th className="px-4 py-2.5 text-left font-medium text-[var(--muted-soft)] w-44">Next action</th>
+                  <th className="px-5 py-2.5 text-right font-medium text-[var(--muted-soft)] w-28">Updated</th>
                 </tr>
               </thead>
               <tbody>
-                {internalRequirements.map((requirement) => (
-                  <tr key={requirement.id} className="border-b border-[var(--border-subtle)] last:border-b-0">
-                    <td className="px-5 py-3 font-mono text-xs font-semibold text-[var(--accent-light)]">{requirement.humanId}</td>
-                    <td className="px-4 py-3">
-                      <div className="font-medium text-[var(--foreground)]">{requirement.title}</div>
-                      <div className="mt-1 flex flex-wrap items-center gap-2">
-                        <span className="rounded bg-[var(--surface-secondary)] px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-[var(--muted)]">
-                          {requirement.sourceProvider === "other" && requirement.sourceKey?.startsWith("azure-devops:")
-                            ? "Azure DevOps"
-                            : requirement.sourceProvider === "other" && requirement.sourceKey?.startsWith("github:")
-                              ? "GitHub"
-                              : requirement.sourceProvider === "other" && requirement.sourceKey?.startsWith("kps-devops:")
-                                ? "KPS DevOps"
-                                : requirement.sourceProvider === "internal"
-                                  ? "Tesbo"
-                                  : requirement.sourceProvider}
-                        </span>
-                        {requirement.sourceUrl ? (
-                          <a
-                            href={requirement.sourceUrl}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="text-[11px] text-[var(--accent-light)] hover:underline"
+                {internalRequirements.map((requirement) => {
+                  const expanded = expandedRequirementId === requirement.id;
+                  const linkedCount = requirement.testcases?.length ?? 0;
+                  const createHref = `/projects/${projectId}/testcases?create=1&requirementRef=${encodeURIComponent(requirement.humanId)}`;
+                  return (
+                    <React.Fragment key={requirement.id}>
+                      <tr className="border-b border-[var(--border-subtle)] transition-colors hover:bg-[var(--surface-secondary)]/60">
+                        <td className="px-3 py-3 text-center">
+                          <button
+                            type="button"
+                            onClick={() => setExpandedRequirementId(expanded ? null : requirement.id)}
+                            aria-label={expanded ? `Collapse ${requirement.humanId}` : `Expand ${requirement.humanId}`}
+                            className="inline-flex h-7 w-7 items-center justify-center rounded-md text-[var(--muted)] hover:bg-[var(--surface-tertiary)] hover:text-[var(--foreground)]"
                           >
-                            Open source ↗
-                          </a>
-                        ) : null}
-                      </div>
-                      {requirement.description ? (
-                        <div className="mt-1 line-clamp-1 text-xs text-[var(--muted)]">{requirement.description}</div>
+                            {expanded ? <IconChevronDown size={15} /> : <IconChevronRight size={15} />}
+                          </button>
+                        </td>
+                        <td className="px-2 py-3">
+                          <button
+                            type="button"
+                            onClick={() => setExpandedRequirementId(expanded ? null : requirement.id)}
+                            className="font-mono text-xs font-semibold text-[var(--accent-light)] hover:underline"
+                          >
+                            {requirement.humanId}
+                          </button>
+                        </td>
+                        <td className="px-4 py-3">
+                          <button
+                            type="button"
+                            onClick={() => setExpandedRequirementId(expanded ? null : requirement.id)}
+                            className="block max-w-full text-left font-medium text-[var(--foreground)] hover:text-[var(--accent-light)]"
+                          >
+                            {requirement.title}
+                          </button>
+                          <div className="mt-1 flex flex-wrap items-center gap-2">
+                            <span className="rounded bg-[var(--surface-secondary)] px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-[var(--muted)]">
+                              {requirement.sourceProvider === "other" && requirement.sourceKey?.startsWith("azure-devops:")
+                                ? "Azure DevOps"
+                                : requirement.sourceProvider === "other" && requirement.sourceKey?.startsWith("github:")
+                                  ? "GitHub"
+                                  : requirement.sourceProvider === "other" && requirement.sourceKey?.startsWith("kps-devops:")
+                                    ? "KPS DevOps"
+                                    : requirement.sourceProvider === "internal"
+                                      ? "Tesbo"
+                                      : requirement.sourceProvider}
+                            </span>
+                            {requirement.sourceUrl ? (
+                              <a
+                                href={requirement.sourceUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-[11px] text-[var(--accent-light)] hover:underline"
+                              >
+                                Open source ↗
+                              </a>
+                            ) : null}
+                          </div>
+                        </td>
+                        <td className="px-4 py-3"><StatusChip tone={jiraStatusTone(requirement.status)}>{requirement.status}</StatusChip></td>
+                        <td className="px-4 py-3"><PriorityIcon priority={requirement.priority || ""} /></td>
+                        <td className="px-4 py-3">
+                          <button
+                            type="button"
+                            onClick={() => setExpandedRequirementId(expanded ? null : requirement.id)}
+                            className={`text-xs font-medium ${linkedCount ? "text-[var(--success-foreground)] hover:underline" : "text-[var(--muted)]"}`}
+                          >
+                            {linkedCount ? `${linkedCount} linked` : "0 linked"}
+                          </button>
+                        </td>
+                        <td className="px-4 py-3">
+                          <Link
+                            href={createHref}
+                            className="inline-flex items-center gap-1 rounded-md bg-[var(--brand-soft)] px-2.5 py-1.5 text-xs font-semibold text-[var(--accent-light)] hover:bg-[var(--surface-tertiary)]"
+                          >
+                            <IconPlus size={13} />
+                            Test case
+                          </Link>
+                        </td>
+                        <td className="px-5 py-3 text-right text-xs text-[var(--muted)]">
+                          {requirement.updatedAt ? new Date(requirement.updatedAt).toLocaleDateString() : "—"}
+                        </td>
+                      </tr>
+                      {expanded ? (
+                        <tr className="border-b border-[var(--border-subtle)] bg-[var(--surface-secondary)]/50">
+                          <td colSpan={8} className="px-14 py-4">
+                            <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(320px,0.8fr)]">
+                              <div>
+                                <div className="text-xs font-semibold uppercase tracking-wide text-[var(--muted-soft)]">Requirement details</div>
+                                <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-[var(--foreground)]">
+                                  {requirement.description || "No description provided."}
+                                </p>
+                              </div>
+                              <div>
+                                <div className="flex items-center justify-between gap-3">
+                                  <div>
+                                    <div className="text-xs font-semibold uppercase tracking-wide text-[var(--muted-soft)]">Linked test cases</div>
+                                    <div className="mt-1 text-xs text-[var(--muted)]">
+                                      {linkedCount ? `${linkedCount} test case${linkedCount === 1 ? "" : "s"} provide coverage.` : "No test coverage linked yet."}
+                                    </div>
+                                  </div>
+                                  <Link
+                                    href={createHref}
+                                    className="inline-flex items-center gap-1 rounded-md border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1.5 text-xs font-semibold text-[var(--foreground)] hover:bg-[var(--surface-tertiary)]"
+                                  >
+                                    <IconPlus size={13} />
+                                    Add
+                                  </Link>
+                                </div>
+                                {linkedCount ? (
+                                  <div className="mt-3 space-y-2">
+                                    {requirement.testcases.map((testcase) => (
+                                      <Link
+                                        key={testcase.id}
+                                        href={`/projects/${projectId}/testcases/${testcase.id}`}
+                                        className="flex items-center justify-between gap-3 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 hover:border-[var(--brand-primary)]"
+                                      >
+                                        <div className="min-w-0">
+                                          <div className="truncate text-sm font-medium text-[var(--foreground)]">{testcase.title}</div>
+                                          <div className="mt-0.5 font-mono text-[11px] text-[var(--muted)]">
+                                            {testcase.humanId || testcase.externalId || testcase.id}
+                                          </div>
+                                        </div>
+                                        <span className="text-xs text-[var(--accent-light)]">Open →</span>
+                                      </Link>
+                                    ))}
+                                  </div>
+                                ) : (
+                                  <Link
+                                    href={createHref}
+                                    className="mt-3 flex items-center justify-center gap-2 rounded-lg border border-dashed border-[var(--border)] bg-[var(--surface)] px-4 py-4 text-sm font-medium text-[var(--accent-light)] hover:border-[var(--brand-primary)]"
+                                  >
+                                    <IconPlus size={15} />
+                                    Create the first linked test case
+                                  </Link>
+                                )}
+                              </div>
+                            </div>
+                          </td>
+                        </tr>
                       ) : null}
-                    </td>
-                    <td className="px-4 py-3"><StatusChip tone={jiraStatusTone(requirement.status)}>{requirement.status}</StatusChip></td>
-                    <td className="px-4 py-3"><PriorityIcon priority={requirement.priority || ""} /></td>
-                    <td className="px-4 py-3 text-xs text-[var(--muted)]">
-                      {requirement.testcases?.length ? `${requirement.testcases.length} TC` : "—"}
-                    </td>
-                    <td className="px-5 py-3 text-right text-xs text-[var(--muted)]">
-                      {requirement.updatedAt ? new Date(requirement.updatedAt).toLocaleDateString() : "—"}
-                    </td>
-                  </tr>
-                ))}
+                    </React.Fragment>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -918,19 +1017,23 @@ export default function RequirementsPage() {
       )}
 
       {!sourceConnected && tickets.length === 0 && (
-        <div className="rounded-xl border border-dashed border-[var(--border)] p-8 text-center">
-          <div className="mx-auto w-12 h-12 rounded-full bg-[var(--brand-soft)] flex items-center justify-center">
-            <IconPlug size={22} stroke={1.75} className="text-[var(--accent-light)]" />
+        <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-[var(--border)] bg-[var(--surface)] px-5 py-4">
+          <div className="flex min-w-0 items-start gap-3">
+            <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-[var(--brand-soft)]">
+              <IconPlug size={18} stroke={1.75} className="text-[var(--accent-light)]" />
+            </div>
+            <div>
+              <h2 className="text-sm font-semibold text-[var(--foreground)]">External requirements are optional</h2>
+              <p className="mt-1 max-w-3xl text-xs leading-5 text-[var(--muted)]">
+                Connect Jira, Linear, Microsoft Azure DevOps, GitHub, or KPS DevOps only when you want requirements synchronized from engineering systems. Native Tesbo requirements work independently.
+              </p>
+            </div>
           </div>
-          <h2 className="mt-3 text-base font-semibold text-[var(--foreground)]">Optional external requirements</h2>
-          <p className="mt-2 text-sm text-[var(--muted)] max-w-lg mx-auto">
-            Connect Jira or Linear if you also want to import external tickets as requirements. Native requirements above work without any integration.
-          </p>
           <Link
             href={`/projects/${projectId}/settings?tab=integrations`}
-            className="mt-4 inline-flex items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm font-semibold text-[var(--foreground)] shadow-sm transition-colors hover:bg-[var(--surface-secondary)]"
+            className="inline-flex shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-xs font-semibold text-[var(--foreground)] transition-colors hover:bg-[var(--surface-secondary)]"
           >
-            Manage integrations
+            Configure integrations
           </Link>
         </div>
       )}

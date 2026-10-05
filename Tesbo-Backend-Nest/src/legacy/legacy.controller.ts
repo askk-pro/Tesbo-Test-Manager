@@ -2407,6 +2407,36 @@ export class LegacyController {
     return this.legacy.updateInternalRequirementForUser(req.userId, projectId, requirementRef, body);
   }
 
+  @Post("/api/projects/:projectId/qa-requirements/:requirementRef/testcases")
+  linkQaRequirementTestcase(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("requirementRef") requirementRef: string,
+    @Body() body: Record<string, any>,
+  ) {
+    return this.legacy.linkInternalRequirementToTestcaseForUser(
+      req.userId,
+      projectId,
+      requirementRef,
+      String(body.testcaseId || ""),
+    );
+  }
+
+  @Delete("/api/projects/:projectId/qa-requirements/:requirementRef/testcases/:testcaseId")
+  unlinkQaRequirementTestcase(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("requirementRef") requirementRef: string,
+    @Param("testcaseId") testcaseId: string,
+  ) {
+    return this.legacy.unlinkInternalRequirementFromTestcaseForUser(
+      req.userId,
+      projectId,
+      requirementRef,
+      testcaseId,
+    );
+  }
+
   // ── Requirements page: cross-source (Jira + Linear) aggregates ──
 
   @Get("/api/projects/:projectId/tickets/summary")

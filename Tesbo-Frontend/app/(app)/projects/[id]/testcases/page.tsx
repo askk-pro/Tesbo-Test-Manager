@@ -37,6 +37,8 @@ import {
   getExportUrl,
   getTemplateUrl,
   getRepositorySummary,
+  getQaRequirement,
+  linkQaRequirementTestcase,
   listCustomFieldDefinitions,
   getCustomFieldValues,
   buildCustomFieldFiltersQueryParam,
@@ -53,6 +55,7 @@ import {
   type BugItem,
   type CustomTag,
   type ZyraSourceRef,
+  type QaRequirement,
 } from "@/lib/api";
 import { ZyraContextDrawer } from "@/components/agents/ZyraContextDrawer";
 
@@ -362,6 +365,8 @@ export default function TestCasesPage() {
   const formSuiteId = isUnfiledView ? null : activeSuiteId;
   const activeJiraIssueKey = searchParams.get("jiraIssueKey") || "";
   const activeLinearIssueKey = searchParams.get("linearIssueKey") || "";
+  const activeRequirementRef = searchParams.get("requirementRef") || "";
+  const createForRequirement = searchParams.get("create") === "1" && Boolean(activeRequirementRef);
 
   // Take over the shared TopBar with this page's breadcrumb + actions (portaled below),
   // and hide the default global "Search projects" search while this page is mounted.
@@ -435,6 +440,8 @@ export default function TestCasesPage() {
   const [panelError, setPanelError] = useState<string | null>(null);
   const [panelSuccess, setPanelSuccess] = useState<string | null>(null);
   const [submitAction, setSubmitAction] = useState<"create" | "create-next">("create");
+  const [createRequirementContext, setCreateRequirementContext] = useState<QaRequirement | null>(null);
+  const requirementAutoOpenRef = useRef<string | null>(null);
 
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
@@ -589,6 +596,23 @@ export default function TestCasesPage() {
     }
     loadData().catch(() => router.replace("/projects")).finally(() => setLoading(false));
   }, [router, loadData, projectId, currentUser]);
+
+  useEffect(() => {
+    if (loading || !createForRequirement || !activeRequirementRef) return;
+    const requestKey = `${projectId}:${activeRequirementRef}`;
+    if (requirementAutoOpenRef.current === requestKey) return;
+    requirementAutoOpenRef.current = requestKey;
+
+    void (async () => {
+      try {
+        const requirement = await getQaRequirement(projectId, activeRequirementRef);
+        await openCreatePanel(requirement);
+      } catch (error) {
+        await openCreatePanel(null);
+        setPanelError(error instanceof Error ? error.message : `Unable to load requirement ${activeRequirementRef}.`);
+      }
+    })();
+  }, [loading, createForRequirement, activeRequirementRef, projectId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   function toggleSuitePanel() {
     setSuitePanelOpen((prev) => {
@@ -991,9 +1015,10 @@ export default function TestCasesPage() {
     setPanelTagIds([]);
   }
 
-  async function openCreatePanel() {
+  async function openCreatePanel(requirementContext: QaRequirement | null = null) {
     setPanelError(null);
     setPanelTestcaseId(null);
+    setCreateRequirementContext(requirementContext);
     setPanelMode("create");
     setPanelTab("overview");
     resetForm(formSuiteId);
@@ -1002,6 +1027,7 @@ export default function TestCasesPage() {
   async function openCreatePanelForSuite(targetSuiteId: string) {
     setPanelError(null);
     setPanelTestcaseId(null);
+    setCreateRequirementContext(null);
     setPanelMode("create");
     setPanelTab("overview");
     resetForm(targetSuiteId);
@@ -1046,6 +1072,7 @@ export default function TestCasesPage() {
     setPanelTestcaseId(null);
     setPanelError(null);
     setSelectedSourceRef(null);
+    setCreateRequirementContext(null);
   }
 
   function clearSuiteFilters() {
@@ -1460,6 +1487,21 @@ export default function TestCasesPage() {
           customFieldValues,
           customTagIds: selectedTagIds,
         });
+
+        if (createRequirementContext) {
+          try {
+            await linkQaRequirementTestcase(projectId, createRequirementContext.humanId, created.id);
+          } catch (linkError) {
+            applyTestCasesPatch(applySingleCaseDelta(suites, repoSummary, status, effectiveSuiteId, 1));
+            await loadSelectedSuiteCases();
+            await openViewPanel(created.id);
+            setPanelError(
+              `Test case ${created.externalId || created.id} was created, but linking it to ${createRequirementContext.humanId} failed: ${linkError instanceof Error ? linkError.message : "unknown error"}`
+            );
+            return;
+          }
+        }
+
         setSuiteCasesPage(1);
         setSuiteSearch("");
         setDebouncedSuiteSearch("");
@@ -1475,12 +1517,19 @@ export default function TestCasesPage() {
         // patched client-side. setSuiteCasesPage(1) above already resets the page it's sliced to.
         applyTestCasesPatch(applySingleCaseDelta(suites, repoSummary, status, effectiveSuiteId, 1));
         await loadSelectedSuiteCases();
-        setPanelSuccess("Test case created successfully.");
+        setPanelSuccess(
+          createRequirementContext
+            ? `Test case created and linked to ${createRequirementContext.humanId}.`
+            : "Test case created successfully."
+        );
         setTimeout(() => setPanelSuccess(null), 4000);
         if (submitAction === "create-next") {
           resetForm(effectiveSuiteId ?? activeSuiteId);
         } else {
           await openViewPanel(created.id);
+          if (createRequirementContext) {
+            router.replace(`/projects/${projectId}/testcases`);
+          }
         }
       } else if (panelMode === "edit" && panelTestcaseId) {
         await updateTestCase(projectId, panelTestcaseId, {
@@ -2330,6 +2379,19 @@ export default function TestCasesPage() {
                 <h3 className="truncate text-lg font-semibold text-[var(--foreground)]">
                   {panelMode === "create" ? "Create Test Case" : (title || "Untitled")}
                 </h3>
+                {panelMode === "create" && createRequirementContext ? (
+                  <div className="mt-2 flex flex-wrap items-center gap-2 rounded-lg border border-[var(--brand-primary)]/20 bg-[var(--brand-soft)] px-3 py-2">
+                    <span className="font-mono text-xs font-semibold text-[var(--accent-light)]">{createRequirementContext.humanId}</span>
+                    <span className="min-w-0 truncate text-xs text-[var(--foreground)]">{createRequirementContext.title}</span>
+                    <button
+                      type="button"
+                      onClick={() => router.push(`/projects/${projectId}/requirements`)}
+                      className="ml-auto shrink-0 text-xs font-semibold text-[var(--accent-light)] hover:underline"
+                    >
+                      Back to requirement
+                    </button>
+                  </div>
+                ) : null}
                 {panelMode === "edit" && (
                   <div className="mt-1.5 flex flex-wrap items-center gap-2">
                     {status && <StatusChip tone={statusTone(status)}>{status}</StatusChip>}
@@ -2420,6 +2482,11 @@ export default function TestCasesPage() {
                   {/* CREATE MODE */}
                   {panelMode === "create" && (
                     <div className="space-y-5 px-6 py-5">
+                      {createRequirementContext ? (
+                        <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2 text-xs text-[var(--muted)]">
+                          This test case will be linked automatically to <span className="font-mono font-semibold text-[var(--foreground)]">{createRequirementContext.humanId}</span> when saved.
+                        </div>
+                      ) : null}
                       <Field>
                         <FieldLabel>Title <span className="text-[var(--error-foreground)]">*</span></FieldLabel>
                         <Input type="text" value={title} onChange={(e) => setTitle(e.target.value)} required placeholder="Describe what this test case validates" />
