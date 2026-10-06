@@ -527,7 +527,7 @@ function ProjectsPageContent() {
       // back-navigation) already includes the new project by the time we leave this page — a
       // fire-and-forget refresh would leave both stale until some unrelated remount refetched them.
       await refetchProjects();
-      router.push(`/projects/${created.id}/dashboard`);
+      router.push(`/projects/${created.slug}/dashboard`);
     } catch (err) {
       setCreateError(err instanceof Error ? err.message : "Failed to create project");
     } finally {
@@ -704,7 +704,7 @@ function ProjectsPageContent() {
               {filteredProjects.map((p) => {
                 const icon = resolveProjectIcon(p.id, p.name, p.icon);
                 return (
-                  <Link key={p.id} href={`/projects/${p.id}/dashboard`} className="group block cursor-pointer">
+                  <Link key={p.id} href={`/projects/${p.slug}/dashboard`} className="group block cursor-pointer">
                     {/* Hover border/shadow live in globals.css (a.group:hover > .tesbo-card) — see
                         the comment there for why this isn't a Tailwind hover: utility. */}
                     <Card className="flex h-full flex-col overflow-hidden p-0 transition">
@@ -784,7 +784,7 @@ function ProjectsPageContent() {
                 // "last sibling under this specific parent". Computed from array position instead.
                 const isLastRow = idx === filteredProjects.length - 1;
                 return (
-                  <Link key={p.id} href={`/projects/${p.id}/dashboard`} className="group block cursor-pointer">
+                  <Link key={p.id} href={`/projects/${p.slug}/dashboard`} className="group block cursor-pointer">
                     <div
                       className={`grid items-center gap-0 px-5 py-3 transition-colors hover:bg-[var(--surface-secondary)] ${isLastRow ? "" : "border-b border-[var(--border-subtle)]"}`}
                       style={{ gridTemplateColumns: "1fr 120px 90px 100px 110px 160px 100px" }}

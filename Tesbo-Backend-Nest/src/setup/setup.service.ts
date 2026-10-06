@@ -111,8 +111,8 @@ export class SetupService {
   private async insertDemoProject(client: PoolClient, organizationId: string, userId: string): Promise<string> {
     const project = await client.query<{ id: string }>(
       `
-      INSERT INTO projects (organization_id, key, name, description)
-      VALUES ($1, 'DEMO', 'HabitNest QA Project', 'Demo project with test cases for the HabitNest habit tracking application.')
+      INSERT INTO projects (organization_id, key, slug, name, description)
+      VALUES ($1, 'DEMO', 'habitnest-qa-project', 'HabitNest QA Project', 'Demo project with test cases for the HabitNest habit tracking application.')
       RETURNING id
       `,
       [organizationId]

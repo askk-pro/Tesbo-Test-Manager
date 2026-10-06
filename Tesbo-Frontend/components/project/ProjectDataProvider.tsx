@@ -1,7 +1,7 @@
 "use client";
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { getProject, listProjectMembers } from "@/lib/api";
 import { PageLoader } from "@/components/ui";
 
@@ -38,6 +38,7 @@ export function useProjectData(): ProjectData {
  */
 export function ProjectDataProvider({ projectId, children }: { projectId: string; children: React.ReactNode }) {
   const router = useRouter();
+  const pathname = usePathname();
   const [project, setProject] = useState<ProjectRecord | null>(null);
   const [projectMembers, setProjectMembers] = useState<ProjectMember[]>([]);
   const [ready, setReady] = useState(false);
@@ -69,6 +70,14 @@ export function ProjectDataProvider({ projectId, children }: { projectId: string
         setProject(p);
         setProjectMembers(m);
         setReady(true);
+
+        const slug = typeof p.slug === "string" ? p.slug : "";
+        const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(projectId);
+        if (slug && isUuid && pathname.startsWith("/projects/" + projectId)) {
+          const nextPath = pathname.replace("/projects/" + projectId, "/projects/" + slug);
+          const query = typeof window !== "undefined" ? window.location.search : "";
+          router.replace(nextPath + query);
+        }
       })
       .catch(() => {
         if (!cancelled) router.replace("/projects");
@@ -76,7 +85,7 @@ export function ProjectDataProvider({ projectId, children }: { projectId: string
     return () => {
       cancelled = true;
     };
-  }, [projectId, router]);
+  }, [pathname, projectId, router]);
 
   const value = useMemo<ProjectData | null>(
     () => (project ? { project, projectMembers, refetchProject, refetchMembers } : null),

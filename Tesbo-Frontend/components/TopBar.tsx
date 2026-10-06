@@ -27,9 +27,10 @@ import { avatarColor } from "@/lib/avatarColors";
  * An unrecognized type, or one missing its id (a malformed/older row), yields null — the caller
  * renders that notification as plain, non-interactive text rather than a link to nowhere.
  */
-function resolveNotificationHref(n: AppNotification): string | null {
+function resolveNotificationHref(n: AppNotification, projects: ProjectSummary[]): string | null {
   if (n.link_entity_type === "zyra_task_board" && n.link_entity_id) {
-    return `/projects/${n.link_entity_id}/agents/tasks`;
+    const project = projects.find((item) => item.id === n.link_entity_id);
+    return `/projects/${project?.slug || n.link_entity_id}/agents/tasks`;
   }
   return null;
 }
@@ -177,7 +178,7 @@ export default function TopBar() {
   function goToProject(p: ProjectSummary) {
     setOpen(false);
     setQuery("");
-    router.push(`/projects/${p.id}/dashboard`);
+    router.push(`/projects/${p.slug}/dashboard`);
   }
 
   function clearQuery() {
@@ -324,7 +325,7 @@ export default function TopBar() {
                 <p className="px-3 py-2 text-[13px] text-[var(--muted-soft)]">No notifications</p>
               ) : (
                 notifItems.map((n) => {
-                  const href = resolveNotificationHref(n);
+                  const href = resolveNotificationHref(n, projects);
                   const body = (
                     <>
                       <p className="font-medium text-[var(--foreground)]">{n.title}</p>

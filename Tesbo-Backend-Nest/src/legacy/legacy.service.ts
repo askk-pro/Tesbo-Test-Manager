@@ -528,6 +528,19 @@ function projectKey(value: string): string {
   return sanitizeKey(value).slice(0, 16) || "TESBO";
 }
 
+const PROJECT_SLUG_MAX_LENGTH = 96;
+
+function projectSlug(value: string): string {
+  const normalized = value
+    .normalize("NFKD")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, PROJECT_SLUG_MAX_LENGTH)
+    .replace(/-+$/g, "");
+  return normalized || "project";
+}
+
 /**
  * An explicitly supplied key used to be silently uppercased, stripped of non-alphanumerics, and
  * cut to 16 characters via projectKey() — so typing a 40-character key succeeded but stored only
@@ -1876,10 +1889,11 @@ export class LegacyService implements OnModuleInit {
         organizationId,
         uid
       ]);
-      const project = await client.query<{ id: string }>(
-        `INSERT INTO projects (organization_id, key, name, description)
-         VALUES ($1, $2, $3, $4) RETURNING id`,
-        [organizationId, key, name, body.projectDescription || body.description || ""]
+      const slug = projectSlug(name);
+      const project = await client.query<{ id: string; slug: string }>(
+        `INSERT INTO projects (organization_id, key, slug, name, description)
+         VALUES ($1, $2, $3, $4, $5) RETURNING id, slug`,
+        [organizationId, key, slug, name, body.projectDescription || body.description || ""]
       );
       await client.query("INSERT INTO project_members (project_id, user_id, role) VALUES ($1, $2, 'owner')", [
         project.rows[0].id,
@@ -1891,7 +1905,7 @@ export class LegacyService implements OnModuleInit {
       // falls back to parent_folder_id = NULL, quietly making a second orphan root.
       await this.seedKnowledgeBaseDefaults(client, organizationId, project.rows[0].id);
       await client.query("UPDATE users SET default_project_id = $1, updated_at = now() WHERE id = $2", [project.rows[0].id, uid]);
-      return { organizationId, projectId: project.rows[0].id, projectKey: key };
+      return { organizationId, projectId: project.rows[0].id, projectKey: key, projectSlug: project.rows[0].slug };
     });
   }
 
@@ -2758,7 +2772,7 @@ export class LegacyService implements OnModuleInit {
     const uid = this.requireUser(userId);
     const workspace = await this.workspace(uid);
     const res = await this.db.query(
-      `SELECT p.id, p.key, p.name, COALESCE(p.description, '') AS description,
+      `SELECT p.id, p.key, p.slug, p.name, COALESCE(p.description, '') AS description,
               COALESCE(p.project_type, 'tesbox') AS project_type,
               COALESCE(pm.role, 'member') AS role, p.created_at, p.settings
        FROM projects p
@@ -2985,17 +2999,19 @@ export class LegacyService implements OnModuleInit {
     // this validation exists to catch. Only the name-derived fallback keeps that shorter budget.
     const explicitKey = body.key != null ? sanitizeKey(String(body.key)) : "";
     const requestedBase = explicitKey || projectKey(name);
+    const requestedSlugBase = projectSlug(name);
     // No icon chosen stores an empty settings object, same as before this field existed, so a
     // project created without one still falls back to the deterministic color + initial on read.
     const settingsJson = icon && (icon.color || icon.glyph) ? JSON.stringify({ icon }) : "{}";
     for (let attempt = 1; ; attempt++) {
       const key = await this.nextFreeProjectKey(organizationId, requestedBase);
+      const slug = await this.nextFreeProjectSlug(organizationId, requestedSlugBase);
       try {
         return await this.db.transaction(async (client) => {
           const project = await client.query(
-            `INSERT INTO projects (organization_id, key, name, description, project_type, settings)
-             VALUES ($1, $2, $3, $4, $5, $6::jsonb) RETURNING id, key, name, project_type, created_at`,
-            [organizationId, key, name, body.description || "", body.projectType || "tesbox", settingsJson]
+            `INSERT INTO projects (organization_id, key, slug, name, description, project_type, settings)
+             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb) RETURNING id, key, slug, name, project_type, created_at`,
+            [organizationId, key, slug, name, body.description || "", body.projectType || "tesbox", settingsJson]
           );
           await client.query("INSERT INTO project_members (project_id, user_id, role) VALUES ($1, $2, 'owner')", [
             project.rows[0].id,
@@ -3005,10 +3021,11 @@ export class LegacyService implements OnModuleInit {
           return project.rows[0];
         });
       } catch (error) {
-        const isKeyCollision =
+        const constraint = String((error as { constraint?: string })?.constraint || "");
+        const isProjectIdentityCollision =
           (error as { code?: string })?.code === "23505" &&
-          String((error as { constraint?: string })?.constraint || "").includes("key");
-        if (!isKeyCollision || attempt >= 3) throw error;
+          (constraint.includes("key") || constraint.includes("slug"));
+        if (!isProjectIdentityCollision || attempt >= 3) throw error;
       }
     }
   }
@@ -3027,6 +3044,21 @@ export class LegacyService implements OnModuleInit {
     // A thousand projects sharing one 16-character prefix is not a case worth refusing a create
     // over — fall back to a random tail rather than raising.
     return `${base.slice(0, PROJECT_KEY_MAX_LENGTH - 6)}${randomBytes(3).toString("hex").toUpperCase()}`;
+  }
+
+  private async nextFreeProjectSlug(organizationId: string, base: string): Promise<string> {
+    const res = await this.db.query<{ slug: string }>(
+      "SELECT slug FROM projects WHERE organization_id = $1",
+      [organizationId]
+    );
+    const taken = new Set(res.rows.map((row) => row.slug));
+    if (!taken.has(base)) return base;
+    for (let n = 2; n <= 9999; n++) {
+      const suffix = "-" + n;
+      const candidate = `${base.slice(0, PROJECT_SLUG_MAX_LENGTH - suffix.length)}${suffix}`;
+      if (!taken.has(candidate)) return candidate;
+    }
+    return `${base.slice(0, PROJECT_SLUG_MAX_LENGTH - 9)}-${randomBytes(4).toString("hex")}`;
   }
 
   private async seedKnowledgeBaseDefaults(client: PoolClient, organizationId: string, projectId: string) {

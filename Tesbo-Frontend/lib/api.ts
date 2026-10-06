@@ -751,6 +751,7 @@ export interface ProjectIcon {
 export interface ProjectSummary {
   id: string;
   key: string;
+  slug: string;
   name: string;
   description: string;
   projectType: ProjectType;
@@ -807,6 +808,7 @@ export async function listProjectsOverview(): Promise<ProjectOverview[]> {
 export interface CreateProjectResponse {
   id: string;
   key: string;
+  slug: string;
   name: string;
   projectType: ProjectType;
   createdAt: string;
