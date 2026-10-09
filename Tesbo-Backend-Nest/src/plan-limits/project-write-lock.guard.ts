@@ -18,7 +18,8 @@ import { PlanLimitsService } from "./plan-limits.service";
  *     projects don't count toward the limit. Without this exemption the advice to "archive another
  *     project" would be impossible to follow — the lock would be inescapable without paying.
  */
-const PROJECT_PATH = /^\/api\/projects\/([0-9a-fA-F-]{36})(\/.*)?$/;
+const PROJECT_PATH = /^\/api\/projects\/[^/]+(\/.*)?$/;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
 @Injectable()
@@ -32,11 +33,17 @@ export class ProjectWriteLockGuard implements CanActivate {
     const req = context.switchToHttp().getRequest<Request>();
     if (SAFE_METHODS.has(req.method)) return true;
 
-    const path = (req.path ?? req.url ?? "").split("?")[0];
+    const path = String(req.originalUrl ?? req.url ?? "").split("?")[0];
     const match = PROJECT_PATH.exec(path);
     if (!match) return true;
 
-    const [, projectId, rest] = match;
+    // ProjectSlugResolverGuard runs before this guard and canonicalizes whichever project route
+    // param this controller uses. Prefer :projectId for nested routes, then :id for /projects/:id.
+    const params = req.params as Record<string, string | undefined>;
+    const projectId = params?.projectId || params?.id || "";
+    if (!UUID_RE.test(projectId)) return true;
+
+    const [, rest] = match;
     // Archiving the project is the documented way out of the lock — never block it.
     if (req.method === "DELETE" && (!rest || rest === "/")) return true;
 
