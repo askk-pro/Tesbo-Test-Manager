@@ -5510,6 +5510,112 @@ export class LegacyService implements OnModuleInit {
     return res.rows.map(toCamel);
   }
 
+  /**
+   * Creating a run FROM A PLAN must materialize the plan's case selection into cycle_items
+   * and executions. The old /from-plan route called createCycleForUser, writing only cycles
+   * and silently producing a 0-case run even when the plan contained cases.
+   *
+   * This path is transactionally all-or-nothing. It expands suite-only plan items (including
+   * nested suites), deduplicates cases also listed directly, checks project ownership, and
+   * captures the V119 execution snapshots. Ordinary blank run creation remains unchanged.
+   */
+  async createCycleFromPlanForUser(userId: string | null | undefined, projectId: string, body: Body) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    if (!isUuid(body.planId)) throw new BadRequestException({ error: "Select a valid test plan" });
+    validateBoundedField(body.name, "Test run name", CYCLE_NAME_MAX_LENGTH);
+    validateBoundedField(body.environment, "Environment", CYCLE_LABEL_MAX_LENGTH);
+    validateBoundedField(body.buildVersion, "Build version", CYCLE_LABEL_MAX_LENGTH);
+    validateBoundedField(body.releaseName, "Release name", CYCLE_LABEL_MAX_LENGTH);
+
+    return this.db.transaction(async (client) => {
+      const planResult = await client.query<{ id: string; name: string; target_release: string | null }>(
+        `SELECT id, name, target_release FROM plans
+          WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL
+          FOR SHARE`,
+        [body.planId, projectId]
+      );
+      const plan = planResult.rows[0];
+      if (!plan) throw new NotFoundException({ error: "Test plan not found in this project" });
+
+      // A suite-only plan item means all cases from that suite/subtree. Direct testcase items
+      // may reference the same case; keep one occurrence with stable plan-first ordering.
+      const selected = await client.query<{ testcase_id: string }>(
+        `WITH RECURSIVE plan_suites AS (
+           SELECT pi.suite_id AS suite_id, pi.position AS plan_position
+             FROM plan_items pi
+            WHERE pi.plan_id = $1 AND pi.deleted_at IS NULL
+              AND pi.testcase_id IS NULL AND pi.suite_id IS NOT NULL
+           UNION ALL
+           SELECT child.id, parent.plan_position
+             FROM suites child
+             JOIN plan_suites parent ON child.parent_id = parent.suite_id
+            WHERE child.deleted_at IS NULL AND child.project_id = $2
+         ), selected_cases AS (
+           SELECT pi.testcase_id, pi.position AS plan_position
+             FROM plan_items pi
+            WHERE pi.plan_id = $1 AND pi.deleted_at IS NULL AND pi.testcase_id IS NOT NULL
+           UNION ALL
+           SELECT tc.id, ps.plan_position
+             FROM plan_suites ps
+             JOIN testcases tc ON tc.suite_id = ps.suite_id
+            WHERE tc.deleted_at IS NULL AND tc.project_id = $2
+         )
+         SELECT chosen.testcase_id
+           FROM (
+             SELECT sc.testcase_id, MIN(sc.plan_position) AS plan_position
+               FROM selected_cases sc
+               JOIN testcases tc ON tc.id = sc.testcase_id
+                AND tc.project_id = $2 AND tc.deleted_at IS NULL
+              GROUP BY sc.testcase_id
+           ) chosen
+          ORDER BY chosen.plan_position, chosen.testcase_id`,
+        [body.planId, projectId]
+      );
+      if (!selected.rows.length) {
+        throw new BadRequestException({ error: "This plan has no active test cases to run" });
+      }
+
+      const created = await client.query<{ id: string }>(
+        `INSERT INTO cycles (project_id, plan_id, name, description, environment, build_version, release_name, owner_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+        [projectId, plan.id, body.name || plan.name, body.description || "",
+         body.environment || null, body.buildVersion || plan.target_release || null,
+         body.releaseName || null, body.ownerId || uid]
+      );
+      const cycleId = created.rows[0].id;
+      const ids = selected.rows.map((row) => row.testcase_id);
+      const inserted = await client.query<{ id: string }>(
+        `WITH selection AS (
+           SELECT testcase_id, ord FROM unnest($2::uuid[]) WITH ORDINALITY AS u(testcase_id, ord)
+         ), ins AS (
+           INSERT INTO cycle_items (
+             cycle_id, testcase_id, snapshot_title, position,
+             snapshot_external_id, snapshot_priority, snapshot_type, snapshot_suite_id,
+             snapshot_description, snapshot_preconditions, snapshot_postconditions, snapshot_steps,
+             snapshot_test_data, snapshot_automation_status, snapshot_automation_tags
+           )
+           SELECT $1, tc.id, tc.title, selection.ord,
+                  tc.external_id, tc.priority, tc.type, tc.suite_id,
+                  tc.description, tc.preconditions, tc.postconditions, tc.steps,
+                  tc.test_data, tc.automation_status, tc.automation_tags
+             FROM selection
+             JOIN testcases tc ON tc.id = selection.testcase_id
+                AND tc.project_id = $3 AND tc.deleted_at IS NULL
+           ON CONFLICT (cycle_id, testcase_id) WHERE deleted_at IS NULL DO NOTHING
+           RETURNING id
+         )
+         INSERT INTO executions (cycle_item_id)
+         SELECT id FROM ins RETURNING id`,
+        [cycleId, ids, projectId]
+      );
+      if (inserted.rows.length !== ids.length) {
+        throw new ConflictException({ error: "Test plan changed during run creation; no run was created" });
+      }
+      return { id: cycleId };
+    });
+  }
+
   async createCycleForUser(userId: string | null | undefined, projectId: string, body: Body) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
     return this.createCycle(projectId, body);

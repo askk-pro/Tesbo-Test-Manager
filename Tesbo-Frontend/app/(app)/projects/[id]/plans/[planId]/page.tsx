@@ -524,7 +524,7 @@ export default function PlanDetailPage() {
                 </section>
               )}
 
-              {progress && total === 0 && (
+              {visibleRuns.length === 0 && (
                 <section className="mb-5 rounded-[10px] border border-dashed border-[var(--border)] p-8 text-center">
                   <IconClipboardList size={36} stroke={1.25} className="mx-auto text-[var(--muted-soft)]" />
                   <p className="mt-3 text-[13px] text-[var(--muted-soft)]">No test runs associated with this plan yet. Create a new run or link an existing one to start tracking progress.</p>
