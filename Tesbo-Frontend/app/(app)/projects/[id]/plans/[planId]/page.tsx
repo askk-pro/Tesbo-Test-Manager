@@ -1,7 +1,7 @@
 "use client";
 
 import { useParams, useRouter } from "next/navigation";
-import { useEffect, useState, useCallback, useMemo } from "react";
+import { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import Link from "next/link";
 import { createPortal } from "react-dom";
 import {
@@ -144,6 +144,7 @@ export default function PlanDetailPage() {
   const [newCycleName, setNewCycleName] = useState("");
   const [showCreateCycle, setShowCreateCycle] = useState(false);
   const [selectedEnvironment, setSelectedEnvironment] = useState("");
+  const createCycleFormRef = useRef<HTMLFormElement | null>(null);
 
   // Associate existing run
   const [showAssociate, setShowAssociate] = useState(false);
@@ -158,10 +159,16 @@ export default function PlanDetailPage() {
   const [editRelease, setEditRelease] = useState("");
 
   function parseProjectSettings(raw: unknown): { testRunEnvironments?: Array<{ name?: string; url?: string }> } {
+    // Project settings may arrive either as parsed JSON (normal backend response) or as a JSON
+    // string (older/cached response shapes). Accept both so configured Test Environments never
+    // disappear from the Create Test Run form.
+    if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+      return raw as { testRunEnvironments?: Array<{ name?: string; url?: string }> };
+    }
     if (typeof raw !== "string" || !raw.trim()) return {};
     try {
       const parsed = JSON.parse(raw) as { testRunEnvironments?: Array<{ name?: string; url?: string }> };
-      return parsed && typeof parsed === "object" ? parsed : {};
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
     } catch {
       return {};
     }
@@ -195,6 +202,17 @@ export default function PlanDetailPage() {
       return environmentOptions[0]?.name ?? "";
     });
   }, [environmentOptions]);
+
+  const openCreateCycle = useCallback(() => {
+    setShowCreateCycle(true);
+    // The plan workspace has its own scroll container. Move the newly mounted form into view so
+    // Create Test Run behaves consistently from the TopBar, inline action, and empty-state CTA.
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        createCycleFormRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      });
+    });
+  }, []);
 
   const loadData = useCallback(async () => {
     try {
@@ -367,7 +385,7 @@ export default function PlanDetailPage() {
                   </button>
                   <button
                     type="button"
-                    onClick={() => setShowCreateCycle(true)}
+                    onClick={openCreateCycle}
                     className="flex h-[30px] cursor-pointer items-center gap-1.5 rounded-[6px] border-0 bg-[var(--cta-primary)] px-3.5 text-[12px] font-medium text-white shadow-sm transition-colors hover:bg-[var(--cta-hover)]"
                   >
                     <IconPlus size={14} stroke={2} />
@@ -515,7 +533,7 @@ export default function PlanDetailPage() {
 
               <section>
                 <div className="mb-4 flex items-center gap-2">
-                  <Button onClick={() => setShowCreateCycle(!showCreateCycle)}>
+                  <Button onClick={() => (showCreateCycle ? setShowCreateCycle(false) : openCreateCycle())}>
                     <IconPlus size={14} stroke={2} className="mr-1.5 inline" />
                     Create test run
                   </Button>
@@ -526,7 +544,7 @@ export default function PlanDetailPage() {
                 </div>
 
                 {showCreateCycle && (
-                  <form onSubmit={handleCreateCycle} className="mb-4 space-y-3 rounded-[10px] border border-[var(--border)] p-4">
+                  <form ref={createCycleFormRef} onSubmit={handleCreateCycle} className="mb-4 space-y-3 rounded-[10px] border border-[var(--border)] p-4">
                     <div>
                       <label className="mb-1 block text-xs font-medium text-[var(--muted)]">Run Name</label>
                       <Input value={newCycleName} onChange={(e) => setNewCycleName(e.target.value)} placeholder={planName || "Test Run"} autoFocus />
@@ -594,7 +612,7 @@ export default function PlanDetailPage() {
                     description="Create one or link an existing run to start tracking progress for this plan."
                     icon={<IconPlayerPlay size={48} stroke={1.25} className="text-[var(--ink-300)]" />}
                     action={
-                      <Button onClick={() => setShowCreateCycle(true)}>
+                      <Button onClick={openCreateCycle}>
                         Create Test Run
                       </Button>
                     }
